@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "bun src/index.tsx",
-    "build": "bun build src/index.tsx --outdir dist --target bun"
+    "build": "bun build src/index.tsx --outdir dist --target bun --external react-devtools-core"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.2.27",
