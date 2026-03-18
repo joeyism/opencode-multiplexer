@@ -2,10 +2,14 @@
 
 A terminal multiplexer for [opencode](https://opencode.ai) AI coding agent sessions. Manage multiple parallel opencode instances across different projects from a single dashboard.
 
+It is instantly responsive to any of your current working sessions, and allows you to attach to existing sessions
 ![OCMux demo](docs/output1.gif)
 
-
+It shows whether your agent is working, idle, or needs response from you. It also shows whether your session is using subagents, and allows you to attach to them as well.
 ![OCMux demo](docs/output2.gif)
+
+You can also start a new session and kill any session, right in OCMux.
+![OCMux demo](docs/output3.gif)
 
 ## Overview
 
