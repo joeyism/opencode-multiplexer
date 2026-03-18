@@ -77,7 +77,8 @@ function getRunningOpencodeProcesses(): RunningProcess[] {
       const trimmed = line.trim()
 
       // Match TUI: "opencode" or "opencode -s {sessionId}"
-      const tuiMatch = trimmed.match(/^(\d+)\s+(?:\S+\s+)*\S*\.?opencode(?:\s+-s\s+(\S+))?$/)
+      // Linux ps shows full paths: "node /path/to/opencode" or "/path/to/.opencode"
+      const tuiMatch = trimmed.match(/^(\d+)\s+(?:\S+\s+)*(?:\S*\/)?\.?opencode(?:\s+-s\s+(\S+))?$/)
       if (tuiMatch) {
         const pid = parseInt(tuiMatch[1]!, 10)
         const sessionId = tuiMatch[2] ?? null
@@ -87,7 +88,8 @@ function getRunningOpencodeProcesses(): RunningProcess[] {
       }
 
       // Match serve: "opencode serve --port {port} ..."
-      const serveMatch = trimmed.match(/^(\d+)\s+(?:\S+\s+)*\S*\.?opencode\s+serve\s+.*--port\s+(\d+)/)
+      // Linux ps shows full paths: "node /path/to/opencode" or "/path/to/.opencode"
+      const serveMatch = trimmed.match(/^(\d+)\s+(?:\S+\s+)*(?:\S*\/)?\.?opencode\s+serve\s+.*--port\s+(\d+)/)
       if (serveMatch) {
         const pid = parseInt(serveMatch[1]!, 10)
         const port = parseInt(serveMatch[2]!, 10)
