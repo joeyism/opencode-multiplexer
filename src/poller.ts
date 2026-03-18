@@ -79,6 +79,7 @@ function getRunningOpencodeProcesses(): RunningProcess[] {
       // Match TUI: "opencode" or "opencode -s {sessionId}"
       // Linux: "node /path/to/opencode" wrapper is 1:1 with real sessions. macOS: bare "opencode".
       // Never match ".opencode" — it's always a child process or orphaned subagent.
+      // NOTE: Does not match standalone binaries ("/usr/local/bin/opencode") — assumes npm/nvm/bun wrapper on Linux.
       const tuiMatch = trimmed.match(/^(\d+)\s+(?:(?:node|bun|deno)\s+\S*\/opencode|opencode)(?:\s+-s\s+(\S+))?$/)
       if (tuiMatch) {
         const pid = parseInt(tuiMatch[1]!, 10)
