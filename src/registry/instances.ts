@@ -110,7 +110,7 @@ function findPidByWorktree(worktree: string): number | null {
     for (const line of psOutput.split("\n")) {
       const trimmed = line.trim()
       // Match both TUI and serve patterns
-      const match = trimmed.match(/^(\d+)\s+opencode(?:\s+serve|\s+-s\s+\S+)?/)
+      const match = trimmed.match(/^(\d+)\s+(?:\S+\s+)*\S*\.?opencode(?:\s+serve|\s+-s\s+\S+)?/)
       if (!match) continue
       const pid = parseInt(match[1]!, 10)
       try {
