@@ -2,8 +2,10 @@
 
 A terminal multiplexer for [opencode](https://opencode.ai) AI coding agent sessions. Manage multiple parallel opencode instances across different projects from a single dashboard.
 
-![OCMux demo](docs/opencode-multiplexer-2026-03-17_21.48.19.gif)
-![OCMux demo](docs/opencode-multiplexer-2026-03-17_21.52.34.gif)
+![OCMux demo](docs/output1.gif)
+
+
+![OCMux demo](docs/output2.gif)
 
 ## Overview
 
