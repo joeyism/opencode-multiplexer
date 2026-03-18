@@ -111,7 +111,7 @@ function findPidByWorktree(worktree: string): number | null {
       const trimmed = line.trim()
       // Match both TUI and serve patterns
       // Linux ps shows full paths: "node /path/to/opencode" or "/path/to/.opencode"
-      const match = trimmed.match(/^(\d+)\s+(?:\S+\s+)*(?:\S*\/)?\.?opencode(?:\s+serve|\s+-s\s+\S+)?/)
+      const match = trimmed.match(/^(\d+)\s+(?:(?:node|bun|deno)\s+)?(?:\S*\/)?\.?opencode(?:\s+serve|\s+-s\s+\S+)?/)
       if (!match) continue
       const pid = parseInt(match[1]!, 10)
       try {
