@@ -1,5 +1,5 @@
 {
-  "name": "ocmux",
+  "name": "opencode-multiplexer",
   "version": "0.1.0",
   "type": "module",
   "description": "Multiplexer for opencode AI coding agent sessions",
