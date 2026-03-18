@@ -1,0 +1,28 @@
+{
+  "name": "ocmux",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Multiplexer for opencode AI coding agent sessions",
+  "keywords": ["opencode", "ai", "agent", "tui", "multiplexer"],
+  "bin": {
+    "ocmux": "./src/index.tsx"
+  },
+  "scripts": {
+    "dev": "bun src/index.tsx",
+    "build": "bun build src/index.tsx --outdir dist --target bun"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.2.27",
+    "ink": "^6.8.0",
+    "ink-text-input": "^6.0.0",
+    "marked": "^15.0.0",
+    "marked-terminal": "^7.3.0",
+    "react": "^19.2.4",
+    "zustand": "^5.0.12"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.10",
+    "@types/react": "^19.2.14",
+    "typescript": "^5.9.3"
+  }
+}
