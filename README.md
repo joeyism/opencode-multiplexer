@@ -43,8 +43,13 @@ When you're juggling several repositories at once, OCMux removes the friction of
 ### Install from npm
 
 ```bash
+# install
 npm install -g opencode-multiplexer
+
+# to run, run
 ocmux
+# or
+opencode-multiplexer
 ```
 
 ### Run from source

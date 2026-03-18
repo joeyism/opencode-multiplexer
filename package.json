@@ -1,11 +1,12 @@
 {
   "name": "opencode-multiplexer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Multiplexer for opencode AI coding agent sessions",
   "keywords": ["opencode", "ai", "agent", "tui", "multiplexer"],
   "bin": {
-    "ocmux": "./src/index.tsx"
+    "ocmux": "./src/index.tsx",
+    "opencode-multiplexer": "./src/index.tsx"
   },
   "scripts": {
     "dev": "bun src/index.tsx",
