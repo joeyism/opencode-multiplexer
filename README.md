@@ -1,4 +1,4 @@
-# OCMux
+# OpenCode Multiplexer a.k.a. OCMux
 
 A terminal multiplexer for [opencode](https://opencode.ai) AI coding agent sessions. Manage multiple parallel opencode instances across different projects from a single dashboard.
 
