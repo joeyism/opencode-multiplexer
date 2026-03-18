@@ -1,6 +1,6 @@
 {
   "name": "opencode-multiplexer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Multiplexer for opencode AI coding agent sessions",
   "keywords": ["opencode", "ai", "agent", "tui", "multiplexer"],
@@ -24,5 +24,6 @@
     "@types/bun": "^1.3.10",
     "@types/react": "^19.2.14",
     "typescript": "^5.9.3"
-  }
+  },
+  "license": "ISC"
 }
