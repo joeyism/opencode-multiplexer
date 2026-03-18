@@ -29,14 +29,14 @@ Key capabilities:
 ## Installation
 
 ```bash
-npm install -g ocmux
+npm install -g opencode-multiplexer
 ```
 
 Or run directly from source:
 
 ```bash
-git clone https://github.com/your-username/ocmux
-cd ocmux
+git clone https://github.com/joeyism/opencode-multiplexer
+cd opencode-multiplexer
 bun install
 bun src/index.tsx
 ```
