@@ -244,8 +244,20 @@ export function getLastMessagePreview(sessionId: string): { text: string; role: 
     )
     .get(sessionId)
 
+  // Strip markdown syntax and collapse to a single line for dashboard preview
+  const raw = row?.text ?? ""
+  const clean = raw
+    .replace(/\*\*(.+?)\*\*/g, "$1")                    // **bold** → bold
+    .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "$1")       // *italic* → italic
+    .replace(/`([^`]+)`/g, "$1")                         // `code` → code
+    .replace(/^#{1,6}\s+/gm, "")                         // ## heading → heading
+    .replace(/^[-*]\s+/gm, "• ")                         // - list → • list
+    .replace(/\n+/g, " ")                                // collapse newlines to spaces
+    .replace(/\s{2,}/g, " ")                             // collapse multiple spaces
+    .trim()
+
   return {
-    text: row?.text ?? "",
+    text: clean,
     role: (row?.role ?? "user") as "user" | "assistant",
   }
 }

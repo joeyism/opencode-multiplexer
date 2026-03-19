@@ -11,6 +11,7 @@ import { yieldToOpencode } from "../hooks/use-attach.js"
 import { config } from "../config.js"
 import { refreshNow, shortenModel } from "../poller.js"
 import { killInstance } from "../registry/instances.js"
+import { statusIcon } from "./helpers.js"
 import {
   getChildSessions,
   countChildSessions,
@@ -27,15 +28,6 @@ const STATUS_ORDER: Record<SessionStatus, number> = {
   error: 1,
   working: 2,
   idle: 3,
-}
-
-function statusIcon(status: SessionStatus): { char: string; color: string } {
-  switch (status) {
-    case "working":     return { char: "▶", color: "green" }
-    case "needs-input": return { char: "●", color: "yellow" }
-    case "idle":        return { char: "✔", color: "gray" }
-    case "error":       return { char: "✖", color: "red" }
-  }
 }
 
 // ─── Child session builder ────────────────────────────────────────────────────
@@ -317,7 +309,7 @@ export function Dashboard() {
     onAttach: () => {
       if (!currentRow) return
       if (currentRow.kind === "instance") {
-        yieldToOpencode(currentRow.instance.sessionId, currentRow.instance.worktree)
+        yieldToOpencode(currentRow.instance.sessionId, currentRow.instance.worktree, currentRow.instance.port)
       } else if (currentRow.kind === "child") {
         yieldToOpencode(currentRow.session.id, currentRow.session.directory)
       }
@@ -370,7 +362,7 @@ export function Dashboard() {
   const kb = config.keybindings.dashboard
 
   // ASCII logo — only show when terminal is tall enough (≥15 rows)
-  const showLogo = (stdout?.rows ?? 24) >= 15
+  const showLogo = (stdout?.rows ?? 24) >= 20
   const LOGO = [
     " █▀▀█ █▀▀▀ █▄▀▄█ █  █ ▄  ▄",
     " █  █ █___ █ ▀ █ █__█ _▀▀_",
@@ -472,7 +464,7 @@ export function Dashboard() {
                   <Text dimColor>{expandChar}</Text>
                   <Text bold={isCursor}>{truncLabel}</Text>
                   {model && <Text color="cyan" dimColor>  {model}</Text>}
-                  <Text dimColor>  {truncPreview}</Text>
+                  <Text dimColor wrap="truncate">  {truncPreview}</Text>
                 </Box>
               )
             }

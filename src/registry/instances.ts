@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "fs"
 import { homedir } from "os"
 import { join } from "path"
-import { execSync } from "child_process"
+import { execSync, spawn } from "child_process"
 
 const CONFIG_DIR = join(homedir(), ".config", "ocmux")
 const INSTANCES_FILE = join(CONFIG_DIR, "instances.json")
@@ -174,4 +174,48 @@ export function killInstance(worktree: string, sessionId: string | null): void {
   if (pid) {
     try { process.kill(pid, "SIGTERM") } catch { /* already dead */ }
   }
+}
+
+/**
+ * Ensure a serve process is running for the given working directory.
+ * If one already exists (in instances.json and responsive), return its port.
+ * Otherwise, spawn a new `opencode serve` process and wait for it to be ready.
+ * Returns the port number.
+ */
+export async function ensureServeProcess(cwd: string): Promise<number> {
+  // 1. Check if we already have a live serve process for this directory
+  const instances = loadSpawnedInstances()
+  for (const inst of instances) {
+    const cwdMatch =
+      inst.cwd === cwd ||
+      inst.cwd.startsWith(cwd + "/") ||
+      cwd.startsWith(inst.cwd + "/")
+    if (cwdMatch && isPidAlive(inst.pid) && (await isPortAlive(inst.port))) {
+      return inst.port
+    }
+  }
+
+  // 2. No live serve process — spawn one
+  const port = await findNextPort()
+  const proc = spawn("opencode", ["serve", "--port", String(port)], {
+    cwd,
+    detached: true,
+    stdio: "ignore",
+  })
+  proc.unref()
+
+  // 3. Wait for it to be ready
+  await waitForServer(port)
+
+  // 4. Persist to instances.json (sessionId is null — auto-spawned, not tied to one session)
+  const updatedInstances = loadSpawnedInstances()
+  updatedInstances.push({
+    port,
+    pid: proc.pid!,
+    cwd,
+    sessionId: null,
+  })
+  saveSpawnedInstances(updatedInstances)
+
+  return port
 }

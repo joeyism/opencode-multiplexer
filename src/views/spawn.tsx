@@ -7,7 +7,6 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import { useStore } from "../store.js"
 import { useSpawnKeys } from "../hooks/use-keybindings.js"
 import { refreshNow } from "../poller.js"
-import { yieldToOpencode } from "../hooks/use-attach.js"
 import {
   findNextPort,
   waitForServer,
@@ -111,12 +110,20 @@ export function Spawn() {
         // 6. Refresh so the dashboard knows about the new instance
         refreshNow()
 
-        // 7. Immediately attach to the new session
+        // 7. Navigate to conversation view for the new session
         if (sessionId) {
-          yieldToOpencode(sessionId, expanded)
-        }
+          const projectId = useStore.getState().instances.find(
+            (i) => i.sessionId === sessionId
+          )?.projectId ?? null
 
-        navigate("dashboard")
+          if (projectId) {
+            navigate("conversation", projectId, sessionId)
+          } else {
+            navigate("dashboard")
+          }
+        } else {
+          navigate("dashboard")
+        }
       } catch (e) {
         setErrorMsg(String(e))
         setStatus("error")

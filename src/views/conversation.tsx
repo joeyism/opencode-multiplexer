@@ -9,7 +9,9 @@ import { useConversationKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode, openInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
 import { getMessages, getSessionById, getSessionStatus, getSessionAgent } from "../db/reader.js"
 import { config } from "../config.js"
-import { shortenModel } from "../poller.js"
+import { shortenModel, refreshNow } from "../poller.js"
+import { ensureServeProcess, killInstance } from "../registry/instances.js"
+import { statusIcon } from "./helpers.js"
 
 // ─── Markdown setup ───────────────────────────────────────────────────────────
 
@@ -56,7 +58,14 @@ function formatTime(ts: number): string {
 
 function getTextFromParts(parts: ConversationMessagePart[]): string {
   return parts
-    .filter((p) => p.type === "text" && p.text && !p.text.trimStart().startsWith("<"))
+    .filter((p) => p.type === "text" && p.text)
+    .map((p) => p.text as string)
+    .join("")
+}
+
+function getThinkingFromParts(parts: ConversationMessagePart[]): string {
+  return parts
+    .filter((p) => p.type === "thinking" && p.text)
     .map((p) => p.text as string)
     .join("")
 }
@@ -69,6 +78,7 @@ function getToolParts(parts: ConversationMessagePart[]) {
 
 type DisplayLine =
   | { kind: "role-header"; role: "user" | "assistant"; time: string }
+  | { kind: "thinking"; text: string }
   | { kind: "text"; text: string }
   | { kind: "tool"; icon: string; color: string; name: string; callId?: string }
   | { kind: "spacer" }
@@ -78,6 +88,15 @@ function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[] {
 
   for (const msg of messages) {
     lines.push({ kind: "role-header", role: msg.role, time: formatTime(msg.timeCreated) })
+
+    // Thinking blocks (full text, dimmed yellow)
+    const thinking = getThinkingFromParts(msg.parts)
+    if (thinking) {
+      lines.push({ kind: "thinking", text: "💭 Thinking" })
+      for (const line of thinking.split("\n")) {
+        lines.push({ kind: "thinking", text: line })
+      }
+    }
 
     const text = getTextFromParts(msg.parts)
     if (text) {
@@ -107,6 +126,95 @@ function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[] {
   return lines
 }
 
+// ─── Sidebar component ────────────────────────────────────────────────────────
+
+const SIDEBAR_WIDTH = 26
+
+function Sidebar({
+  instances,
+  currentSessionId,
+  cursorIndex,
+  focused,
+}: {
+  instances: import("../store.js").OcmInstance[]
+  currentSessionId: string | null
+  cursorIndex: number
+  focused: boolean
+}) {
+  // Inner width: total - 2 border chars
+  const innerWidth = SIDEBAR_WIDTH - 2
+  // Max chars for repo/title after cursor(1) + space(1) + icon(1) + space(1) = 4
+  const maxLabelWidth = innerWidth - 4
+
+  return (
+    <Box
+      flexDirection="column"
+      width={SIDEBAR_WIDTH}
+      flexShrink={0}
+      borderStyle="single"
+      borderColor={focused ? "cyan" : "gray"}
+      flexGrow={1}
+      overflow="hidden"
+    >
+      {/* Header */}
+      <Box paddingX={1} justifyContent="space-between">
+        <Text bold color={focused ? "cyan" : "gray"}>sessions</Text>
+        <Text dimColor>{instances.length}</Text>
+      </Box>
+      <Text dimColor>{"─".repeat(innerWidth)}</Text>
+
+      {/* Instance list */}
+      {instances.length === 0 && (
+        <Box paddingX={1}>
+          <Text dimColor>no instances</Text>
+        </Box>
+      )}
+      {instances.map((inst, i) => {
+        const isCurrent = inst.sessionId === currentSessionId
+        const isCursor = focused && i === cursorIndex
+        const { char, color } = statusIcon(inst.status)
+
+        // Compact single-line: "▸ ▶ repo/title"
+        const sep = "/"
+        const maxTotal = maxLabelWidth
+        const repoMax = Math.min(inst.repoName.length, Math.floor(maxTotal * 0.4))
+        const repo = inst.repoName.length > repoMax
+          ? inst.repoName.slice(0, repoMax - 1) + "…"
+          : inst.repoName
+        const titleMax = maxTotal - repo.length - sep.length
+        const title = inst.sessionTitle.length > titleMax
+          ? inst.sessionTitle.slice(0, Math.max(0, titleMax - 1)) + "…"
+          : inst.sessionTitle
+
+        return (
+          <Box key={inst.id} paddingLeft={1}>
+            <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>
+              {isCursor ? "▸" : isCurrent ? "◆" : " "}
+            </Text>
+            <Text>{" "}</Text>
+            <Text color={color}>{char}</Text>
+            <Text>{" "}</Text>
+            <Text
+              bold={isCurrent || isCursor}
+              color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
+              dimColor={!isCurrent && !isCursor}
+            >
+              {repo}
+            </Text>
+            <Text dimColor>{sep}</Text>
+            <Text
+              dimColor={!isCurrent && !isCursor}
+              color={isCursor ? "cyan" : undefined}
+            >
+              {title}
+            </Text>
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
 // ─── Conversation component ───────────────────────────────────────────────────
 
 export function Conversation() {
@@ -125,6 +233,24 @@ export function Conversation() {
   const [sendError, setSendError] = React.useState<string | null>(null)
   // vim modal: "normal" (navigate) or "insert" (type into input)
   const [mode, setMode] = React.useState<"normal" | "insert">("normal")
+  // Pane focus: "conversation" (default) or "sidebar"
+  const [focus, setFocus] = React.useState<"conversation" | "sidebar">("conversation")
+  // Auto-spawned serve process port (for non-OCMux sessions)
+  const [autoSpawnedPort, setAutoSpawnedPort] = React.useState<number | null>(null)
+  const [autoSpawning, setAutoSpawning] = React.useState(false)
+  // Loading state: covers the gap between promptAsync returning and SSE status arriving
+  const [waitingForResponse, setWaitingForResponse] = React.useState(false)
+  // Kill confirmation
+  const [killConfirm, setKillConfirm] = React.useState<import("../store.js").OcmInstance | null>(null)
+  // Help overlay
+  const [showHelp, setShowHelp] = React.useState(false)
+  // Tick counter to force sessionStatus re-read when SSE session events arrive
+  const [statusTick, setStatusTick] = React.useState(0)
+  // Sidebar cursor (index into instances array)
+  const [sidebarCursor, setSidebarCursor] = React.useState(0)
+  // Ctrl-W combo: track first Ctrl-W press (normal mode only)
+  const [pendingCtrlW, setPendingCtrlW] = React.useState(false)
+  const pendingCtrlWTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Agent/model selection (live instances only)
   type AgentOption = { name: string; model?: { providerID: string; modelID: string } }
@@ -199,7 +325,21 @@ export function Conversation() {
     if (instance) return instance.status
     if (!selectedSessionId) return "idle" as const
     return getSessionStatus(selectedSessionId)
-  }, [instance, selectedSessionId])
+  }, [instance, selectedSessionId, statusTick])
+
+  // Clear waitingForResponse once session status catches up
+  React.useEffect(() => {
+    if (sessionStatus !== "idle") setWaitingForResponse(false)
+  }, [sessionStatus])
+
+  // Spinner animation for working state
+  const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  const [spinnerIdx, setSpinnerIdx] = React.useState(0)
+  React.useEffect(() => {
+    if (sessionStatus !== "working" && !waitingForResponse) return
+    const id = setInterval(() => setSpinnerIdx((i) => (i + 1) % SPINNER_FRAMES.length), 80)
+    return () => clearInterval(id)
+  }, [sessionStatus, waitingForResponse])
 
   const sessionTitle = instance?.sessionTitle ?? sessionInfo?.title ?? selectedSessionId?.slice(0, 20) ?? "session"
   const repoName = instance?.repoName ?? ""
@@ -207,12 +347,15 @@ export function Conversation() {
   const model = instance?.model ?? null
 
   // Determine if this is an SDK-capable live instance
-  const isLive = !!(instance?.port)
-  const instancePort = instance?.port ?? null
+  const isLive = !!(instance?.port || autoSpawnedPort)
+  const instancePort = instance?.port ?? autoSpawnedPort
 
   // Fetch agents + models from SDK (live) or read agent from SQLite (read-only)
   React.useEffect(() => {
     if (!selectedSessionId) return
+
+    // Always read agent from SQLite as fallback (available before SDK loads)
+    setReadOnlyAgent(getSessionAgent(selectedSessionId))
 
     if (instancePort) {
       const client = createOpencodeClient({ baseUrl: `http://localhost:${instancePort}` })
@@ -237,15 +380,110 @@ export function Conversation() {
         }
         setAvailableModels(models)
       }).catch(() => {})
-    } else {
-      setReadOnlyAgent(getSessionAgent(selectedSessionId))
     }
   }, [selectedSessionId, instancePort])
 
+  // Subscribe to SSE events + always-on 1s polling as safety net
+  React.useEffect(() => {
+    if (!instancePort || !selectedSessionId) return
+    const sessionId = selectedSessionId
+
+    let cancelled = false
+
+    // Always-on polling — catches SSE stalls, external TUI writes, and status changes
+    const pollInterval = setInterval(() => {
+      if (cancelled) return
+      try {
+        const dbMessages = getMessages(sessionId)
+        setMessages(dbMessages as ConversationMessage[])
+      } catch {}
+      setStatusTick((t) => t + 1)
+    }, config.conversationPollIntervalMs)
+
+    // SSE for real-time updates (best-effort, faster than polling)
+    const client = createOpencodeClient({ baseUrl: `http://localhost:${instancePort}` })
+
+    async function listen() {
+      try {
+        const { stream } = await (client as any).event.subscribe()
+        for await (const event of stream) {
+          if (cancelled) break
+
+          const type = event?.type
+          const props = event?.properties
+
+          // Filter to events relevant to our session
+          const eventSessionId =
+            props?.info?.sessionID ??
+            props?.sessionID ??
+            null
+
+          if (eventSessionId && eventSessionId !== sessionId) continue
+
+          if (
+            type === "message.updated" ||
+            type === "message.part.updated" ||
+            type === "message.part.delta" ||
+            type === "message.removed"
+          ) {
+            try {
+              const dbMessages = getMessages(sessionId)
+              setMessages(dbMessages as ConversationMessage[])
+            } catch {}
+          }
+
+          if (type === "session.status" || type === "session.idle") {
+            setStatusTick((t) => t + 1)
+          }
+        }
+      } catch {
+        // SSE failed — polling is already running as safety net
+      }
+    }
+
+    listen()
+
+    return () => {
+      cancelled = true
+      clearInterval(pollInterval)
+    }
+  }, [instancePort, selectedSessionId])  // setMessages intentionally omitted — stable Zustand fn
+
+  // Auto-spawn a serve process for non-live instances so we can chat via SDK
+  React.useEffect(() => {
+    if (instance?.port || !selectedSessionId) return  // already has a port
+
+    let cancelled = false
+
+    async function spawn() {
+      try {
+        setAutoSpawning(true)
+        const cwd = sessionCwd
+        if (!cwd) return
+        const port = await ensureServeProcess(cwd)
+        if (cancelled) return
+        setAutoSpawnedPort(port)
+      } catch (e) {
+        // Failed to spawn — instance stays read-only
+      } finally {
+        if (!cancelled) setAutoSpawning(false)
+      }
+    }
+
+    spawn()
+
+    return () => { cancelled = true }
+  }, [instance?.port, selectedSessionId, sessionCwd])
+
+  // Reset auto-spawned port when session changes (new session may need different serve)
+  React.useEffect(() => {
+    setAutoSpawnedPort(null)
+  }, [selectedSessionId])
+
   const openInOpencode = React.useCallback(() => {
     if (!selectedSessionId) return
-    yieldToOpencode(selectedSessionId, sessionCwd)
-  }, [selectedSessionId, sessionCwd])
+    yieldToOpencode(selectedSessionId, sessionCwd, instancePort)
+  }, [selectedSessionId, sessionCwd, instancePort])
 
   // Computed current agent and model
   const currentAgent = availableAgents[selectedAgentIdx]
@@ -264,11 +502,12 @@ export function Conversation() {
   // Send message via SDK
   const sendMessage = React.useCallback(async (text: string) => {
     if (!text.trim() || !selectedSessionId || !instancePort) return
+    const sessionId = selectedSessionId
     setSending(true)
     setSendError(null)
     try {
       const client = createOpencodeClient({ baseUrl: `http://localhost:${instancePort}` })
-      await (client.session as any).prompt({
+      await (client.session as any).promptAsync({
         path: { id: selectedSessionId },
         body: {
           parts: [{ type: "text", text: text.trim() }],
@@ -277,8 +516,12 @@ export function Conversation() {
         },
       })
       setInputText("")
-      const dbMessages = getMessages(selectedSessionId)
-      setMessages(dbMessages as ConversationMessage[])
+      setWaitingForResponse(true)
+      // Show the user's message immediately (SSE will handle assistant updates)
+      try {
+        const dbMessages = getMessages(sessionId)
+        setMessages(dbMessages as ConversationMessage[])
+      } catch {}
     } catch (e) {
       setSendError(String(e))
     } finally {
@@ -295,10 +538,11 @@ export function Conversation() {
   const displayLines = React.useMemo(() => buildDisplayLines(messages), [messages])
   const totalLines = displayLines.length
 
-  // Layout — live instances need 2 extra rows for the input box
-  const HEADER_ROWS = 3
-  const FOOTER_ROWS = isLive ? 5 : 3
-  const msgAreaHeight = Math.max(5, termHeight - HEADER_ROWS - FOOTER_ROWS)
+  // Estimate visible message lines for scroll/slice calculations.
+  // Layout is flexbox-driven; this only controls how many lines we render.
+  // Err on the side of too many — overflow="hidden" clips any excess.
+  const INNER_OVERHEAD = isLive ? 2 : 0  // input divider + input line (live only)
+  const msgAreaHeight = Math.max(5, termHeight - INNER_OVERHEAD)
   const maxScroll = Math.max(0, totalLines - msgAreaHeight)
   const halfPage = Math.max(1, Math.floor(msgAreaHeight / 2))
   const fullPage = Math.max(1, msgAreaHeight - 2)
@@ -309,7 +553,20 @@ export function Conversation() {
     setScrollOffset((o) => clampScroll(o + delta))
   }, [maxScroll])
 
-  // Visible lines
+  const prevMessageCount = React.useRef(messages.length)
+  React.useEffect(() => {
+    if (messages.length > prevMessageCount.current && scrollOffset <= 2) {
+      setScrollOffset(0)
+    }
+    prevMessageCount.current = messages.length
+  }, [messages.length, scrollOffset])
+
+  // Keep sidebar cursor in bounds when instances change
+  React.useEffect(() => {
+    setSidebarCursor((c) => Math.min(c, Math.max(0, instances.length - 1)))
+  }, [instances.length])
+
+  // Visible lines — no padding needed, flexbox + overflow="hidden" handles layout
   const startIdx = Math.max(0, totalLines - msgAreaHeight - scrollOffset)
   const endIdx = Math.max(0, totalLines - scrollOffset)
   const visibleLines = displayLines.slice(startIdx, endIdx)
@@ -360,6 +617,129 @@ export function Conversation() {
 
     // ── NORMAL MODE ──────────────────────────────────────────────────────────
 
+    // Kill confirmation: y to confirm, n/Esc to cancel (captures all keys)
+    if (killConfirm) {
+      if (input === "y") {
+        const killed = killConfirm
+        setKillConfirm(null)
+        killInstance(killed.worktree, killed.sessionId)
+        refreshNow()
+        const remaining = instances.filter((i) => i.sessionId !== killed.sessionId)
+        if (remaining.length > 0) {
+          const next = remaining[0]!
+          navigate("conversation", next.projectId, next.sessionId)
+        } else {
+          navigate("dashboard")
+        }
+      } else if (input === "n" || key.escape) {
+        setKillConfirm(null)
+      }
+      return
+    }
+
+    // Help overlay: any key closes it
+    if (showHelp) {
+      setShowHelp(false)
+      return
+    }
+
+    // ?: toggle help overlay
+    if (input === "?" && key.shift) {
+      setShowHelp(true)
+      return
+    }
+
+    // x: kill session (context-dependent: sidebar cursor or current session)
+    if (input === "x") {
+      if (focus === "sidebar") {
+        const target = instances[sidebarCursor]
+        if (target) setKillConfirm(target)
+      } else {
+        if (instance) setKillConfirm(instance)
+      }
+      return
+    }
+
+    // Ctrl-W Ctrl-W: toggle focus between sidebar and conversation
+    if (key.ctrl && input === "w") {
+      if (pendingCtrlW) {
+        if (pendingCtrlWTimer.current) clearTimeout(pendingCtrlWTimer.current)
+        setPendingCtrlW(false)
+        setFocus((f) => f === "sidebar" ? "conversation" : "sidebar")
+      } else {
+        setPendingCtrlW(true)
+        pendingCtrlWTimer.current = setTimeout(() => setPendingCtrlW(false), 500)
+      }
+      return
+    }
+    // Clear pending Ctrl-W on any other key
+    if (pendingCtrlW) {
+      if (pendingCtrlWTimer.current) clearTimeout(pendingCtrlWTimer.current)
+      setPendingCtrlW(false)
+    }
+
+    // ── SIDEBAR FOCUSED ───────────────────────────────────────────────────────
+    if (focus === "sidebar") {
+      if (input === "j" || key.downArrow) {
+        const maxIdx = Math.max(0, instances.length - 1)
+        setSidebarCursor((c) => Math.min(c + 1, maxIdx))
+        return
+      }
+      if (input === "k" || key.upArrow) {
+        setSidebarCursor((c) => Math.max(c - 1, 0))
+        return
+      }
+      if (key.return) {
+        const target = instances[sidebarCursor]
+        if (target && target.sessionId !== selectedSessionId) {
+          navigate("conversation", target.projectId, target.sessionId)
+        }
+        // Switch focus back to conversation pane regardless
+        setFocus("conversation")
+        return
+      }
+      if (input === "q" || key.escape) {
+        navigate("dashboard")
+        return
+      }
+      // When sidebar is focused, block all other keys
+      return
+    }
+
+    // ── CONVERSATION FOCUSED — session management keys ────────────────────
+
+    // Ctrl-N: jump to next needs-input session (must be before 'n' check)
+    if (key.ctrl && input === "n") {
+      const needsInput = instances.filter((i) => i.status === "needs-input")
+      if (needsInput.length > 0) {
+        const currentIdx = instances.findIndex((i) => i.sessionId === selectedSessionId)
+        const next = needsInput.find((_, j) => {
+          const idx = instances.indexOf(needsInput[j]!)
+          return idx > currentIdx
+        }) ?? needsInput[0]!
+        navigate("conversation", next.projectId, next.sessionId)
+      }
+      return
+    }
+
+    // n: spawn new session
+    if (input === "n") {
+      navigate("spawn")
+      return
+    }
+
+    // r: refresh instances and messages
+    if (input === "r") {
+      refreshNow()
+      if (selectedSessionId) {
+        try {
+          const dbMessages = getMessages(selectedSessionId)
+          setMessages(dbMessages as ConversationMessage[])
+        } catch {}
+      }
+      return
+    }
+
     // Tab: cycle agent (live only), resets model to agent's default
     if (key.tab && !key.shift && isLive && availableAgents.length > 0) {
       setSelectedAgentIdx((prev) => (prev + 1) % availableAgents.length)
@@ -376,6 +756,7 @@ export function Conversation() {
     if (input === "i") {
       if (isLive) {
         setMode("insert")
+        setFocus("conversation")
         setScrollOffset(0)  // auto-scroll to bottom
       } else {
         openInOpencode()  // attach to TUI to reply
@@ -405,7 +786,7 @@ export function Conversation() {
   })
 
   // Normal mode keybindings — all disabled in insert mode
-  useConversationKeys(mode === "normal" ? {
+  useConversationKeys(mode === "normal" && focus === "conversation" ? {
     onBack: () => navigate("dashboard"),
     onAttach: openInOpencode,
     onSend: isLive ? undefined : openInOpencode,  // Enter attaches for read-only
@@ -427,131 +808,204 @@ export function Conversation() {
     return { char: "○", color: "white" }
   })()
 
-  const divider = "─".repeat(termWidth)
+  const contentWidth = Math.max(1, termWidth - SIDEBAR_WIDTH - 1)
+  const fullDivider = "─".repeat(Math.max(1, termWidth))
+  const divider = "─".repeat(contentWidth)
+
 
   return (
-    <Box flexDirection="column">
-      {/* Header */}
+    <Box flexDirection="column" height={termHeight}>
+      {/* Header — full width, outside the sidebar/content row */}
       <Box paddingLeft={1} justifyContent="space-between">
         <Box>
-          <Text bold color="cyan">{repoName}</Text>
+          <Text bold color={focus === "conversation" ? "cyan" : "gray"}>{repoName}</Text>
           <Text dimColor> / </Text>
-          <Text bold>{sessionTitle}</Text>
+          <Text bold color={focus === "conversation" ? undefined : "gray"}>{sessionTitle}</Text>
         </Box>
         <Box>
           <Text color={statusInfo.color as any}>{statusInfo.char}</Text>
-          {/* Agent indicator */}
-          {isLive && currentAgent && (
+          {currentAgent ? (
             <Text color="yellow" dimColor>  [{currentAgent.name}]</Text>
-          )}
-          {!isLive && readOnlyAgent && (
+          ) : readOnlyAgent ? (
             <Text color="yellow" dimColor>  [{readOnlyAgent}]</Text>
-          )}
-          {/* Model indicator: current model override or agent default or dashboard model */}
-          {isLive && currentModel ? (
+          ) : null}
+          {currentModel ? (
             <Text color="cyan" dimColor>  {currentModel.label}</Text>
           ) : model ? (
             <Text color="cyan" dimColor>  {model}</Text>
           ) : null}
-          <Text dimColor>  {isLive ? (mode === "insert" ? "[INSERT]" : "[NORMAL]") : "[read-only]"}  </Text>
+          {isLive && mode === "insert" && <Text bold color="green">  [INSERT]  </Text>}
+          {isLive && mode === "normal" && <Text bold color="gray">  [NORMAL]  </Text>}
+          {!isLive && <Text bold color="yellow">  [read-only]  </Text>}
           <Text dimColor>{scrollIndicator}</Text>
         </Box>
       </Box>
-      <Text dimColor>{divider}</Text>
+      <Text color={focus === "conversation" ? "cyan" : "gray"} dimColor>{fullDivider}</Text>
 
-      {/* Messages area */}
-      {messagesLoading && (
-        <Box paddingLeft={2} marginTop={1}>
-          <Text dimColor>Loading messages...</Text>
-        </Box>
-      )}
-      {!messagesLoading && messages.length === 0 && !error && (
-        <Box paddingLeft={2} marginTop={1}>
-          <Text dimColor>No messages in this session yet.</Text>
-        </Box>
-      )}
-      {error && (
-        <Box paddingLeft={2} marginTop={1}>
-          <Text color="red">Error: {error}</Text>
-        </Box>
-      )}
+      {/* Body row: sidebar + message area side by side */}
+      <Box flexDirection="row" flexGrow={1}>
+        <Sidebar
+          instances={instances}
+          currentSessionId={selectedSessionId}
+          cursorIndex={sidebarCursor}
+          focused={focus === "sidebar"}
+        />
 
-      {visibleLines.map((line, i) => {
-        if (line.kind === "spacer") {
-          return <Box key={`sp-${i}`}><Text> </Text></Box>
-        }
-        if (line.kind === "role-header") {
-          const isUser = line.role === "user"
-          return (
-            <Box key={`rh-${i}`} paddingLeft={1} marginTop={1}>
-              <Text bold color={isUser ? "blue" : "magenta"}>
-                {isUser ? "▶ YOU" : "◆ ASSISTANT"}
-              </Text>
-              <Text dimColor>  {line.time}</Text>
-            </Box>
-          )
-        }
-        if (line.kind === "tool") {
-          return (
-            <Box key={`tool-${i}`} paddingLeft={4}>
-              <Text color={line.color as any}>{line.icon} </Text>
-              <Text dimColor>{line.name}</Text>
-              {line.callId && <Text dimColor>  {line.callId.slice(0, 20)}</Text>}
-            </Box>
-          )
-        }
-        return (
-          <Box key={`txt-${i}`} paddingLeft={3}>
-            <Text>{line.text}</Text>
-          </Box>
-        )
-      })}
-
-      {/* Input area — only for live (SDK-capable) instances */}
-      {isLive && (
-        <>
-          <Text dimColor>{divider}</Text>
-          <Box paddingLeft={1}>
-            {sending ? (
-              <Text dimColor>Sending...</Text>
-            ) : mode === "insert" ? (
-              <Box>
-                <Text color="cyan">❯ </Text>
-                <TextInput
-                  value={inputText}
-                  onChange={(val) => {
-                    if (blockNextInputChange.current) {
-                      blockNextInputChange.current = false
-                      return  // discard the 'x' that TextInput added from Ctrl-X
-                    }
-                    setInputText(val)
-                  }}
-                  onSubmit={(text) => { void sendMessage(text) }}
-                  placeholder="Type a message...  (^X E: editor)"
-                  focus={!pendingCtrlX}
-                />
+        <Box flexDirection="column" flexGrow={1}>
+          {/* Messages area — fixed height, clips any text wrapping */}
+          <Box flexDirection="column" flexGrow={1} overflow="hidden" justifyContent="flex-end">
+            {messagesLoading && (
+              <Box paddingLeft={2}>
+                <Text dimColor>Loading messages...</Text>
               </Box>
-            ) : (
-              <Text dimColor>○ Press <Text color="cyan" bold>i</Text> to type a message</Text>
+            )}
+            {!messagesLoading && messages.length === 0 && !error && (
+              <Box paddingLeft={2}>
+                <Text dimColor>No messages in this session yet.</Text>
+              </Box>
+            )}
+            {error && (
+              <Box paddingLeft={2}>
+                <Text color="red">Error: {error}</Text>
+              </Box>
+            )}
+
+            {visibleLines.map((line, i) => {
+              if (line.kind === "spacer") {
+                return <Box key={`sp-${i}`}><Text> </Text></Box>
+              }
+              if (line.kind === "role-header") {
+                const isUser = line.role === "user"
+                return (
+                  <Box key={`rh-${i}`} paddingLeft={1}>
+                    <Text bold color={isUser ? "blue" : "magenta"}>
+                      {isUser ? "▶ YOU" : "◆ ASSISTANT"}
+                    </Text>
+                    <Text dimColor>  {line.time}</Text>
+                  </Box>
+                )
+              }
+              if (line.kind === "thinking") {
+                return (
+                  <Box key={`th-${i}`} paddingLeft={4}>
+                    <Text dimColor color="yellow" wrap="truncate">{line.text}</Text>
+                  </Box>
+                )
+              }
+              if (line.kind === "tool") {
+                return (
+                  <Box key={`tool-${i}`} paddingLeft={4}>
+                    <Text color={line.color as any}>{line.icon} </Text>
+                    <Text dimColor wrap="truncate">{line.name}</Text>
+                    {line.callId && <Text dimColor>  {line.callId.slice(0, 20)}</Text>}
+                  </Box>
+                )
+              }
+              return (
+                <Box key={`txt-${i}`} paddingLeft={3}>
+                  <Text wrap="truncate">{line.text}</Text>
+                </Box>
+              )
+            })}
+            {(sessionStatus === "working" || waitingForResponse) && scrollOffset === 0 && (
+              <Box paddingLeft={3}>
+                <Text color="green">{SPINNER_FRAMES[spinnerIdx]}</Text>
+              </Box>
             )}
           </Box>
-          {sendError && (
-            <Box paddingLeft={1}>
-              <Text color="red">{sendError}</Text>
-            </Box>
+
+          {/* Input area — pinned below messages, position independent of scroll */}
+          {isLive && (
+            <>
+              <Text dimColor>{divider}</Text>
+              <Box paddingLeft={1}>
+                {sending ? (
+                  <Text dimColor>Sending...</Text>
+                ) : mode === "insert" ? (
+                  <Box>
+                    <Text color={focus === "conversation" ? "cyan" : "gray"}>❯ </Text>
+                    <TextInput
+                      value={inputText}
+                      onChange={(val) => {
+                        if (blockNextInputChange.current) {
+                          blockNextInputChange.current = false
+                          return  // discard the 'x' that TextInput added from Ctrl-X
+                        }
+                        setInputText(val)
+                      }}
+                      onSubmit={(text) => { void sendMessage(text) }}
+                      placeholder="Type a message...  (^X E: editor)"
+                      focus={!pendingCtrlX}
+                    />
+                  </Box>
+                ) : (
+                  <Text dimColor>› Press <Text color={focus === "conversation" ? "cyan" : "gray"} bold>i</Text> to type a message</Text>
+                )}
+              </Box>
+              {sendError && (
+                <Box paddingLeft={1}>
+                  <Text color="red">{sendError}</Text>
+                </Box>
+              )}
+            </>
           )}
-        </>
+          {!isLive && autoSpawning && (
+            <>
+              <Text dimColor>{divider}</Text>
+              <Box paddingLeft={1}>
+                <Text dimColor>Starting background server...</Text>
+              </Box>
+            </>
+          )}
+        </Box>
+      </Box>
+
+      {/* Help overlay */}
+      {showHelp && (
+        <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan">
+          <Box><Text bold color="cyan">Conversation Keybindings</Text></Box>
+          <Box flexDirection="column" paddingLeft={2}>
+            <Box><Box width={16}><Text bold color="white">i</Text></Box><Text dimColor>insert mode (type message)</Text></Box>
+            <Box><Box width={16}><Text bold color="white">Esc</Text></Box><Text dimColor>normal mode</Text></Box>
+            <Box><Box width={16}><Text bold color="white">^W ^W</Text></Box><Text dimColor>toggle sidebar focus</Text></Box>
+            <Box><Box width={16}><Text bold color="white">j/k</Text></Box><Text dimColor>scroll messages</Text></Box>
+            <Box><Box width={16}><Text bold color="white">^U/^D</Text></Box><Text dimColor>half page up/down</Text></Box>
+            <Box><Box width={16}><Text bold color="white">G/gg</Text></Box><Text dimColor>scroll to bottom/top</Text></Box>
+            <Box><Box width={16}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>cycle agent/model</Text></Box>
+            <Box><Box width={16}><Text bold color="white">a</Text></Box><Text dimColor>attach opencode TUI</Text></Box>
+            <Box><Box width={16}><Text bold color="white">n</Text></Box><Text dimColor>spawn new session</Text></Box>
+            <Box><Box width={16}><Text bold color="white">x</Text></Box><Text dimColor>kill session</Text></Box>
+            <Box><Box width={16}><Text bold color="white">r</Text></Box><Text dimColor>refresh</Text></Box>
+            <Box><Box width={16}><Text bold color="white">Ctrl-N</Text></Box><Text dimColor>next needs-input session</Text></Box>
+            <Box><Box width={16}><Text bold color="white">q</Text></Box><Text dimColor>back to dashboard</Text></Box>
+          </Box>
+          <Text dimColor>Press any key to close</Text>
+        </Box>
       )}
 
-      {/* Footer */}
-      <Text dimColor>{divider}</Text>
-      <Box paddingLeft={1}>
+      {/* Kill confirmation */}
+      {killConfirm && (
+        <Box paddingX={1} paddingY={0} borderStyle="single" borderColor="red">
+          <Text color="red">Kill </Text>
+          <Text bold color="red">{killConfirm.repoName} / {killConfirm.sessionTitle.slice(0, 30)}</Text>
+          <Text color="red">? </Text>
+          <Text bold color="white">y</Text>
+          <Text dimColor> confirm  </Text>
+          <Text bold color="white">n</Text>
+          <Text dimColor>/</Text>
+          <Text bold color="white">Esc</Text>
+          <Text dimColor> cancel</Text>
+        </Box>
+      )}
+
+      {/* Footer — full width, outside the sidebar/content row */}
+      <Box paddingX={1} paddingY={0} borderStyle="single" borderColor="gray">
         <Text dimColor wrap="truncate">
           {isLive && mode === "insert"
-            ? `Esc: normal mode  Enter: send  ^XE: editor  [INSERT]  [${scrollIndicator}]`
+            ? `Esc: normal  Enter: send  ^XE: editor`
             : isLive
-            ? `q: back  i: insert  Tab: agent  S-Tab: model  a: attach  j/k: scroll  [NORMAL]  [${scrollIndicator}]`
-            : `q: back  a/i/Enter: open in opencode to reply  j/k: scroll  ^U/^D: ½ page  G/gg: nav  [${scrollIndicator}]`
+            ? `q: back  i: insert  ^W^W: sidebar  Tab: agent  a: attach  j/k: scroll  ? help`
+            : `q: back  a/i/Enter: attach  j/k: scroll  ^U/^D: ½pg  G/gg: nav`
           }
         </Text>
       </Box>

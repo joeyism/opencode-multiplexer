@@ -30,7 +30,7 @@ export function setInkInstance(instance: ReturnType<typeof render>): void {
  * Yield terminal control to opencode for a specific session.
  * Exits alt screen, unmounts Ink, runs opencode, re-enters alt screen and remounts.
  */
-export function yieldToOpencode(sessionId: string, cwd: string): void {
+export function yieldToOpencode(sessionId: string, cwd: string, port?: number | null): void {
   if (!_inkInstance) return
 
   _inkInstance.unmount()
@@ -40,7 +40,10 @@ export function yieldToOpencode(sessionId: string, cwd: string): void {
   if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN)
 
   try {
-    execSync(`opencode -s ${sessionId}`, {
+    const cmd = port
+      ? `opencode attach http://localhost:${port} --session ${sessionId} --dir ${cwd}`
+      : `opencode -s ${sessionId}`
+    execSync(cmd, {
       stdio: "inherit",
       cwd,
     })

@@ -21,6 +21,11 @@ export interface KeybindingsConfig {
     back: string
     attach: string
     send: string
+    spawn: string
+    kill: string
+    refresh: string
+    help: string
+    nextNeedsInput: string
     scrollUp: string
     scrollDown: string
     scrollHalfPageUp: string
@@ -39,6 +44,7 @@ export interface KeybindingsConfig {
 export interface Config {
   keybindings: KeybindingsConfig
   pollIntervalMs: number
+  conversationPollIntervalMs: number
   dbPath: string
 }
 
@@ -62,6 +68,11 @@ const DEFAULTS: Config = {
       back: "escape",
       attach: "a",
       send: "return",
+      spawn: "n",
+      kill: "x",
+      refresh: "r",
+      help: "?",
+      nextNeedsInput: "ctrl-n",
       scrollUp: "k",
       scrollDown: "j",
       scrollHalfPageUp: "ctrl-u",
@@ -77,6 +88,7 @@ const DEFAULTS: Config = {
     },
   },
   pollIntervalMs: 2000,
+  conversationPollIntervalMs: 1000,
   dbPath: join(homedir(), ".local", "share", "opencode", "opencode.db"),
 }
 
