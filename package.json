@@ -3,7 +3,13 @@
   "version": "0.4.0",
   "type": "module",
   "description": "Multiplexer for opencode AI coding agent sessions",
-  "keywords": ["opencode", "ai", "agent", "tui", "multiplexer"],
+  "keywords": [
+    "opencode",
+    "ai",
+    "agent",
+    "tui",
+    "multiplexer"
+  ],
   "bin": {
     "ocmux": "./src/index.tsx",
     "opencode-multiplexer": "./src/index.tsx"
