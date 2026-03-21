@@ -49,6 +49,9 @@ export interface ConversationMessagePart {
   tool?: string
   toolStatus?: string
   callId?: string
+  toolTitle?: string
+  toolInput?: string
+  toolHeader?: string
 }
 
 export interface ConversationMessage {
@@ -59,12 +62,13 @@ export interface ConversationMessage {
   timeCompleted: number | null
   modelId: string | null
   providerId: string | null
+  agent?: string
   parts: ConversationMessagePart[]
 }
 
 // ─── View types ───────────────────────────────────────────────────────────────
 
-export type ViewName = "dashboard" | "conversation" | "spawn"
+export type ViewName = "dashboard" | "conversation" | "spawn" | "worktree"
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 

@@ -219,3 +219,74 @@ export async function ensureServeProcess(cwd: string): Promise<number> {
 
   return port
 }
+
+/**
+ * Create a git worktree for a new feature branch.
+ * Returns the absolute path to the worktree directory.
+ * Worktrees are placed at repoDir/.worktrees/branchName.
+ */
+export function createWorktree(repoDir: string, branchName: string): string {
+  const path = require("path") as typeof import("path")
+  const fs = require("fs") as typeof import("fs")
+
+  const worktreeDir = path.join(repoDir, ".worktrees", branchName)
+
+  // If the worktree directory already exists, just return it
+  if (fs.existsSync(worktreeDir)) {
+    return worktreeDir
+  }
+
+  // Ensure .worktrees directory exists
+  const worktreesRoot = path.join(repoDir, ".worktrees")
+  if (!fs.existsSync(worktreesRoot)) {
+    fs.mkdirSync(worktreesRoot, { recursive: true })
+  }
+
+  // Detect the default branch
+  let baseBranch = "main"
+  try {
+    const ref = execSync("git symbolic-ref refs/remotes/origin/HEAD", {
+      cwd: repoDir,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim()
+    baseBranch = ref.split("/").pop() || "main"
+  } catch {
+    try {
+      execSync("git rev-parse --verify master", {
+        cwd: repoDir,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+      baseBranch = "master"
+    } catch {
+      baseBranch = "main"
+    }
+  }
+
+  // Check if branch already exists
+  let branchExists = false
+  try {
+    execSync(`git rev-parse --verify ${branchName}`, {
+      cwd: repoDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    branchExists = true
+  } catch {
+    branchExists = false
+  }
+
+  // Create the worktree
+  if (branchExists) {
+    execSync(`git worktree add "${worktreeDir}" "${branchName}"`, {
+      cwd: repoDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  } else {
+    execSync(`git worktree add -b "${branchName}" "${worktreeDir}" "${baseBranch}"`, {
+      cwd: repoDir,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  }
+
+  return worktreeDir
+}

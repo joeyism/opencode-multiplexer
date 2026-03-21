@@ -118,7 +118,7 @@ export function openInEditor(currentText: string, onResult: (text: string) => vo
 
   // Remount OCMux
   import("../app.js").then(({ App }) => {
-    _inkInstance = render(React.createElement(App))
+    _inkInstance = render(React.createElement(App), { exitOnCtrlC: false })
     setInkInstance(_inkInstance)
   }).catch(console.error)
 }
@@ -140,7 +140,7 @@ function _remountOcm(): void {
   // Use dynamic import to get App without circular dependency
   import("../app.js")
     .then(({ App }) => {
-      _inkInstance = render(React.createElement(App))
+      _inkInstance = render(React.createElement(App), { exitOnCtrlC: false })
       setInkInstance(_inkInstance)
     })
     .catch(console.error)

@@ -195,6 +195,10 @@ export function Dashboard() {
 
   // Kill confirmation input handler
   useInput((input, key) => {
+    // Ctrl-C: exit app (exitOnCtrlC is disabled globally so we handle it here)
+    if (key.ctrl && input === "c") {
+      process.exit(0)
+    }
     if (!killConfirm) return
     if (input === "y" || input === "Y") {
       killInstance(killConfirm.worktree, killConfirm.sessionId)
@@ -338,6 +342,7 @@ export function Dashboard() {
         collapseSession(currentRow.session.id)
       }
     },
+    onWorktree: () => navigate("worktree"),
     onSpawn: () => navigate("spawn"),
     onNextNeedsInput: () => {
       if (attentionNavIndices.length === 0) return
@@ -380,10 +385,9 @@ export function Dashboard() {
         </Box>
       )}
 
-      {/* Status bar */}
-      <Box paddingX={2} paddingY={0} borderStyle="single" borderColor="gray">
-        <Text bold color="cyan">OCMux</Text>
-        <Text dimColor>  │  </Text>
+      {/* Status bar — top border only, no redundant "OCMux" when logo is visible */}
+      <Box paddingX={1} paddingY={0} borderStyle="single" borderTop={false} borderLeft={false} borderRight={false} borderColor="gray">
+        {!showLogo && <><Text bold color="cyan">OCMux</Text><Text dimColor>  │  </Text></>}
         <Text bold>{instances.length}</Text><Text dimColor> {instances.length === 1 ? "instance" : "instances"}</Text>
         {statusCounts.working > 0 && <Text><Text dimColor>  │  </Text><Text color="green">▶ {statusCounts.working} working</Text></Text>}
         {statusCounts.needsInput > 0 && <Text><Text dimColor>  │  </Text><Text color="yellow">● {statusCounts.needsInput} needs input</Text></Text>}
@@ -401,6 +405,7 @@ export function Dashboard() {
             <Box><Box width={12}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>expand/collapse subagents</Text></Box>
             <Box><Box width={12}><Text bold color="white">Ctrl-N</Text></Box><Text dimColor>jump to next needs-input</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.spawn}</Text></Box><Text dimColor>spawn new opencode (background)</Text></Box>
+            <Box><Box width={12}><Text bold color="white">{kb.worktree}</Text></Box><Text dimColor>create worktree session</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.kill}</Text></Box><Text dimColor>kill selected instance</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.rescan}</Text></Box><Text dimColor>refresh from database</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.help}</Text></Box><Text dimColor>close help</Text></Box>
@@ -444,7 +449,7 @@ export function Dashboard() {
               const isExpanded = expandedSessions.has(row.instance.sessionId)
               const expandChar = !canExpand ? "  " : isExpanded ? "▾ " : "▸ "
 
-              let preview = row.instance.lastPreview
+              let preview = (row.instance.lastPreview || "").replace(/\r?\n/g, " ")
               if (row.instance.status === "working" && !preview) preview = "working..."
 
               // Fixed prefix: paddingLeft(1) + cursor(2) + icon(2) + expand(2) = 7 chars
@@ -515,23 +520,20 @@ export function Dashboard() {
               <Text dimColor> cancel</Text>
             </Box>
           ) : (
-            <Box marginTop={1} paddingX={2} paddingY={0} borderStyle="single" borderColor="gray">
-              <Box flexGrow={1}>
-                <Text dimColor>
-                  <Text bold color="white">{kb.up}/{kb.down}</Text> nav  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">Enter</Text> open  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">Tab</Text> expand  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">{kb.attach}</Text> attach
-                </Text>
+            <Box marginTop={1} paddingX={1} paddingY={0} borderStyle="single" borderBottom={false} borderLeft={false} borderRight={false} borderColor="gray">
+              <Box flexGrow={1} gap={3}>
+                <Text><Text bold color="white">{kb.up}/{kb.down}</Text> <Text dimColor>nav</Text></Text>
+                <Text><Text bold color="white">Enter</Text> <Text dimColor>open</Text></Text>
+                <Text><Text bold color="white">Tab</Text> <Text dimColor>expand</Text></Text>
+                <Text><Text bold color="white">{kb.attach}</Text> <Text dimColor>attach</Text></Text>
               </Box>
-              <Box>
-                <Text dimColor>
-                  <Text bold color="white">{kb.spawn}</Text> new  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">{kb.kill}</Text> kill  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">?</Text> help  <Text dimColor>│</Text>{" "}
-                  <Text bold color="white">{kb.quit}</Text> quit
-                </Text>
-              </Box>
+               <Box gap={3}>
+                 <Text><Text bold color="white">{kb.spawn}</Text> <Text dimColor>new</Text></Text>
+                 <Text><Text bold color="white">{kb.worktree}</Text> <Text dimColor>worktree</Text></Text>
+                 <Text><Text bold color="white">{kb.kill}</Text> <Text dimColor>kill</Text></Text>
+                 <Text><Text bold color="white">?</Text> <Text dimColor>help</Text></Text>
+                 <Text><Text bold color="white">{kb.quit}</Text> <Text dimColor>quit</Text></Text>
+               </Box>
             </Box>
           )}
         </>

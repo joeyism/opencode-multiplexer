@@ -16,6 +16,7 @@ export interface KeybindingsConfig {
     quit: string
     help: string
     rescan: string
+    worktree: string
   }
   conversation: {
     back: string
@@ -34,6 +35,7 @@ export interface KeybindingsConfig {
     scrollPageDown: string
     scrollBottom: string
     scrollTop: string
+    worktree: string
   }
   spawn: {
     cancel: string
@@ -59,11 +61,12 @@ const DEFAULTS: Config = {
       expand: "tab",
       collapse: "shift-tab",
       nextNeedsInput: "ctrl-n",
-      kill: "x",
-      quit: "q",
-      help: "?",
-      rescan: "r",
-    },
+    kill: "x",
+    quit: "q",
+    help: "?",
+    rescan: "r",
+    worktree: "w",
+  },
     conversation: {
       back: "escape",
       attach: "a",
@@ -78,10 +81,11 @@ const DEFAULTS: Config = {
       scrollHalfPageUp: "ctrl-u",
       scrollHalfPageDown: "ctrl-d",
       scrollPageUp: "ctrl-b",
-      scrollPageDown: "ctrl-f",
-      scrollBottom: "G",
-      scrollTop: "g",
-    },
+    scrollPageDown: "ctrl-f",
+    scrollBottom: "G",
+    scrollTop: "g",
+    worktree: "w",
+  },
     spawn: {
       cancel: "escape",
       confirm: "return",

@@ -41,7 +41,7 @@ async function main() {
 
   startPoller(config.pollIntervalMs)
 
-  const inkInstance = render(<App />)
+  const inkInstance = render(<App />, { exitOnCtrlC: false })
   setInkInstance(inkInstance)
 }
 

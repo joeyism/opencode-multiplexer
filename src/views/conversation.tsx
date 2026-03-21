@@ -1,10 +1,8 @@
 import React from "react"
 import { Box, Text, useInput, useStdout } from "ink"
 import TextInput from "ink-text-input"
-import { marked } from "marked"
-import { markedTerminal } from "marked-terminal"
 import { createOpencodeClient } from "@opencode-ai/sdk"
-import { useStore, type ConversationMessage, type ConversationMessagePart } from "../store.js"
+import { useStore, type ConversationMessage } from "../store.js"
 import { useConversationKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode, openInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
 import { getMessages, getSessionById, getSessionStatus, getSessionAgent } from "../db/reader.js"
@@ -13,120 +11,8 @@ import { shortenModel, refreshNow } from "../poller.js"
 import { ensureServeProcess, killInstance } from "../registry/instances.js"
 import { statusIcon } from "./helpers.js"
 
-// ─── Markdown setup ───────────────────────────────────────────────────────────
 
-marked.use(markedTerminal({ reflowText: true }))
-
-// ─── Inline markdown fix ──────────────────────────────────────────────────────
-// marked-terminal has a known bug: inline formatting (**bold**, `code`, *italic*)
-// is not applied inside list items. Post-process to catch remaining raw markers.
-
-const BOLD_RE   = /\*\*(.+?)\*\*/g
-const ITALIC_RE = /(?<!\*)\*([^*\n]+)\*(?!\*)/g
-const CODE_RE   = /(?<!`)`([^`\n]+)`(?!`)/g
-
-function fixInlineMarkdown(text: string): string {
-  return text
-    .replace(BOLD_RE,   "\x1b[1m$1\x1b[22m")
-    .replace(ITALIC_RE, "\x1b[3m$1\x1b[23m")
-    .replace(CODE_RE,   "\x1b[2m$1\x1b[22m")
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function toolIcon(status: string | undefined): string {
-  switch (status) {
-    case "completed": return "✓"
-    case "running":   return "⟳"
-    case "error":     return "✗"
-    default:          return "⏳"
-  }
-}
-
-function toolColor(status: string | undefined): string {
-  switch (status) {
-    case "completed": return "green"
-    case "running":   return "yellow"
-    case "error":     return "red"
-    default:          return "gray"
-  }
-}
-
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-}
-
-function getTextFromParts(parts: ConversationMessagePart[]): string {
-  return parts
-    .filter((p) => p.type === "text" && p.text)
-    .map((p) => p.text as string)
-    .join("")
-}
-
-function getThinkingFromParts(parts: ConversationMessagePart[]): string {
-  return parts
-    .filter((p) => p.type === "thinking" && p.text)
-    .map((p) => p.text as string)
-    .join("")
-}
-
-function getToolParts(parts: ConversationMessagePart[]) {
-  return parts.filter((p) => p.type === "tool" && p.tool)
-}
-
-// ─── Display line types ───────────────────────────────────────────────────────
-
-type DisplayLine =
-  | { kind: "role-header"; role: "user" | "assistant"; time: string }
-  | { kind: "thinking"; text: string }
-  | { kind: "text"; text: string }
-  | { kind: "tool"; icon: string; color: string; name: string; callId?: string }
-  | { kind: "spacer" }
-
-function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[] {
-  const lines: DisplayLine[] = []
-
-  for (const msg of messages) {
-    lines.push({ kind: "role-header", role: msg.role, time: formatTime(msg.timeCreated) })
-
-    // Thinking blocks (full text, dimmed yellow)
-    const thinking = getThinkingFromParts(msg.parts)
-    if (thinking) {
-      lines.push({ kind: "thinking", text: "💭 Thinking" })
-      for (const line of thinking.split("\n")) {
-        lines.push({ kind: "thinking", text: line })
-      }
-    }
-
-    const text = getTextFromParts(msg.parts)
-    if (text) {
-      try {
-        const rendered = fixInlineMarkdown((marked(text) as string).trimEnd())
-        for (const line of rendered.split("\n")) {
-          lines.push({ kind: "text", text: line })
-        }
-      } catch {
-        lines.push({ kind: "text", text })
-      }
-    }
-
-    for (const part of getToolParts(msg.parts)) {
-      lines.push({
-        kind: "tool",
-        icon: toolIcon(part.toolStatus),
-        color: toolColor(part.toolStatus),
-        name: part.tool as string,
-        callId: part.callId,
-      })
-    }
-
-    lines.push({ kind: "spacer" })
-  }
-
-  return lines
-}
-
-// ─── Sidebar component ────────────────────────────────────────────────────────
+import { buildDisplayLines, type DisplayLine } from "./display-lines.js"
 
 const SIDEBAR_WIDTH = 26
 
@@ -135,11 +21,13 @@ function Sidebar({
   currentSessionId,
   cursorIndex,
   focused,
+  height,
 }: {
   instances: import("../store.js").OcmInstance[]
   currentSessionId: string | null
   cursorIndex: number
   focused: boolean
+  height: number
 }) {
   // Inner width: total - 2 border chars
   const innerWidth = SIDEBAR_WIDTH - 2
@@ -153,7 +41,7 @@ function Sidebar({
       flexShrink={0}
       borderStyle="single"
       borderColor={focused ? "cyan" : "gray"}
-      flexGrow={1}
+      height={height}
       overflow="hidden"
     >
       {/* Header */}
@@ -246,6 +134,17 @@ export function Conversation() {
   const [showHelp, setShowHelp] = React.useState(false)
   // Tick counter to force sessionStatus re-read when SSE session events arrive
   const [statusTick, setStatusTick] = React.useState(0)
+  // Only update messages state if content actually changed (avoids expensive re-renders)
+  const updateMessagesIfChanged = React.useCallback((newMessages: ConversationMessage[]) => {
+    const current = useStore.getState().messages
+    if (
+      newMessages.length === current.length &&
+      newMessages[newMessages.length - 1]?.id === current[current.length - 1]?.id &&
+      newMessages[newMessages.length - 1]?.parts.length === current[current.length - 1]?.parts.length
+    ) return  // nothing changed
+    setMessages(newMessages)
+  }, [setMessages])
+
   // Sidebar cursor (index into instances array)
   const [sidebarCursor, setSidebarCursor] = React.useState(0)
   // Ctrl-W combo: track first Ctrl-W press (normal mode only)
@@ -267,10 +166,9 @@ export function Conversation() {
   // Ctrl-X E combo (only active in insert mode)
   const [pendingCtrlX, setPendingCtrlX] = React.useState(false)
   const pendingCtrlXTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Ref (not state) to block the onChange that TextInput fires for the Ctrl-X keystroke.
-  // Must be a ref because TextInput's onChange fires synchronously in the same tick —
-  // React batched state wouldn't be visible yet.
-  const blockNextInputChange = React.useRef(false)
+  // Ref to block TextInput from receiving Ctrl+letter combos.
+  // Set to true whenever ctrl is pressed in insert mode — cleared in onChange.
+  const ctrlPressed = React.useRef(false)
 
   const { stdout } = useStdout()
   const termWidth = stdout?.columns ?? 80
@@ -395,7 +293,7 @@ export function Conversation() {
       if (cancelled) return
       try {
         const dbMessages = getMessages(sessionId)
-        setMessages(dbMessages as ConversationMessage[])
+        updateMessagesIfChanged(dbMessages as ConversationMessage[])
       } catch {}
       setStatusTick((t) => t + 1)
     }, config.conversationPollIntervalMs)
@@ -428,7 +326,7 @@ export function Conversation() {
           ) {
             try {
               const dbMessages = getMessages(sessionId)
-              setMessages(dbMessages as ConversationMessage[])
+              updateMessagesIfChanged(dbMessages as ConversationMessage[])
             } catch {}
           }
 
@@ -535,7 +433,7 @@ export function Conversation() {
   }, [inputText])
 
   // Build display lines
-  const displayLines = React.useMemo(() => buildDisplayLines(messages), [messages])
+  const displayLines = React.useMemo<DisplayLine[]>(() => buildDisplayLines(messages), [messages])
   const totalLines = displayLines.length
 
   // Estimate visible message lines for scroll/slice calculations.
@@ -566,10 +464,13 @@ export function Conversation() {
     setSidebarCursor((c) => Math.min(c, Math.max(0, instances.length - 1)))
   }, [instances.length])
 
-  // Visible lines — no padding needed, flexbox + overflow="hidden" handles layout
+  // Visible lines — padded to constant count so Ink's rendering stays stable
   const startIdx = Math.max(0, totalLines - msgAreaHeight - scrollOffset)
   const endIdx = Math.max(0, totalLines - scrollOffset)
-  const visibleLines = displayLines.slice(startIdx, endIdx)
+  const visibleLines: typeof displayLines = displayLines.slice(startIdx, endIdx)
+  while (visibleLines.length < msgAreaHeight) {
+    visibleLines.unshift({ kind: "spacer" as const })
+  }
 
   // Scroll position indicator
   const scrollPct = totalLines <= msgAreaHeight
@@ -583,8 +484,11 @@ export function Conversation() {
   useInput((input, key) => {
     // ── INSERT MODE ──────────────────────────────────────────────────────────
     if (mode === "insert") {
-      // Esc exits insert mode (does NOT go back to dashboard)
-      if (key.escape) {
+      // Track any Ctrl press — prevents TextInput from receiving the character
+      if (key.ctrl) ctrlPressed.current = true
+
+      // Esc or Ctrl-C exits insert mode (does NOT go back to dashboard)
+      if (key.escape || (key.ctrl && input === "c")) {
         setMode("normal")
         // Clear pending combos
         if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
@@ -594,9 +498,6 @@ export function Conversation() {
 
       // Ctrl-X E: open in editor (only from insert mode)
       if (key.ctrl && input === "x") {
-        // Block synchronously — TextInput's onChange fires in the same tick
-        // before React can re-render with the updated pendingCtrlX state
-        blockNextInputChange.current = true
         if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
         setPendingCtrlX(true)
         pendingCtrlXTimer.current = setTimeout(() => setPendingCtrlX(false), 1000)
@@ -728,6 +629,12 @@ export function Conversation() {
       return
     }
 
+    // w: new worktree session
+    if (input === "w") {
+      navigate("worktree")
+      return
+    }
+
     // r: refresh instances and messages
     if (input === "r") {
       refreshNow()
@@ -746,9 +653,10 @@ export function Conversation() {
       setModelOverrideIdx(null)
       return
     }
-    // Shift-Tab: cycle model override (live only)
-    if (key.tab && key.shift && isLive && availableModels.length > 0) {
-      setModelOverrideIdx((prev) => ((prev ?? -1) + 1) % availableModels.length)
+    // Shift-Tab: cycle agent backward (live only)
+    if (key.tab && key.shift && isLive && availableAgents.length > 0) {
+      setSelectedAgentIdx((prev) => (prev - 1 + availableAgents.length) % availableAgents.length)
+      setModelOverrideIdx(null)
       return
     }
 
@@ -812,6 +720,12 @@ export function Conversation() {
   const fullDivider = "─".repeat(Math.max(1, termWidth))
   const divider = "─".repeat(contentWidth)
 
+  // Explicit layout heights — deterministic, avoids flexGrow + border interactions
+  const HEADER_ROWS = 2   // title line + divider
+  const FOOTER_ROWS = 3   // bordered footer: top border + content + bottom border
+  const KILL_CONFIRM_ROWS = killConfirm ? 3 : 0  // conditional confirmation box
+  const bodyHeight = Math.max(5, termHeight - HEADER_ROWS - FOOTER_ROWS - KILL_CONFIRM_ROWS)
+
 
   return (
     <Box flexDirection="column" height={termHeight}>
@@ -843,15 +757,16 @@ export function Conversation() {
       <Text color={focus === "conversation" ? "cyan" : "gray"} dimColor>{fullDivider}</Text>
 
       {/* Body row: sidebar + message area side by side */}
-      <Box flexDirection="row" flexGrow={1}>
-        <Sidebar
-          instances={instances}
-          currentSessionId={selectedSessionId}
-          cursorIndex={sidebarCursor}
-          focused={focus === "sidebar"}
-        />
+        <Box flexDirection="row" height={bodyHeight}>
+          <Sidebar
+            instances={instances}
+            currentSessionId={selectedSessionId}
+            cursorIndex={sidebarCursor}
+            focused={focus === "sidebar"}
+            height={bodyHeight}
+          />
 
-        <Box flexDirection="column" flexGrow={1}>
+        <Box flexDirection="column" flexGrow={1} height={bodyHeight}>
           {/* Messages area — fixed height, clips any text wrapping */}
           <Box flexDirection="column" flexGrow={1} overflow="hidden" justifyContent="flex-end">
             {messagesLoading && (
@@ -881,6 +796,7 @@ export function Conversation() {
                     <Text bold color={isUser ? "blue" : "magenta"}>
                       {isUser ? "▶ YOU" : "◆ ASSISTANT"}
                     </Text>
+                    {line.agent && <Text color="yellow" dimColor>  [{line.agent}]</Text>}
                     <Text dimColor>  {line.time}</Text>
                   </Box>
                 )
@@ -892,20 +808,45 @@ export function Conversation() {
                   </Box>
                 )
               }
-              if (line.kind === "tool") {
+              if (line.kind === "question") {
+                const isRunning = line.status === "running"
                 return (
-                  <Box key={`tool-${i}`} paddingLeft={4}>
-                    <Text color={line.color as any}>{line.icon} </Text>
-                    <Text dimColor wrap="truncate">{line.name}</Text>
-                    {line.callId && <Text dimColor>  {line.callId.slice(0, 20)}</Text>}
+                  <Box key={`q-${i}`} flexDirection="column" paddingLeft={3}>
+                    <Box>
+                      <Text color="yellow" bold>{isRunning ? "❓ " : "✓ "}</Text>
+                      <Text color={isRunning ? "yellow" : "gray"} bold>{line.header}</Text>
+                    </Box>
+                    <Box paddingLeft={3}>
+                      <Text color={isRunning ? "yellow" : "gray"} wrap="truncate">{line.question}</Text>
+                    </Box>
+                    {isRunning && (
+                      <Box paddingLeft={3}>
+                        <Text dimColor>press </Text>
+                        <Text color="cyan" bold>a</Text>
+                        <Text dimColor> to attach and answer</Text>
+                      </Box>
+                    )}
                   </Box>
                 )
               }
-              return (
-                <Box key={`txt-${i}`} paddingLeft={3}>
-                  <Text wrap="truncate">{line.text}</Text>
-                </Box>
-              )
+              if (line.kind === "tool") {
+                const detail = line.title || line.input || ""
+                return (
+                  <Box key={`tool-${i}`} paddingLeft={4}>
+                    <Text color={line.color as any}>{line.icon} </Text>
+                    <Text dimColor>{line.name}</Text>
+                    {detail && <Text dimColor wrap="truncate">  {detail}</Text>}
+                  </Box>
+                )
+              }
+              if (line.kind === "text") {
+                return (
+                  <Box key={`txt-${i}`} paddingLeft={3}>
+                    <Text wrap="truncate">{line.text}</Text>
+                  </Box>
+                )
+              }
+              return null
             })}
             {(sessionStatus === "working" || waitingForResponse) && scrollOffset === 0 && (
               <Box paddingLeft={3}>
@@ -927,9 +868,9 @@ export function Conversation() {
                     <TextInput
                       value={inputText}
                       onChange={(val) => {
-                        if (blockNextInputChange.current) {
-                          blockNextInputChange.current = false
-                          return  // discard the 'x' that TextInput added from Ctrl-X
+                        if (ctrlPressed.current) {
+                          ctrlPressed.current = false
+                          return  // discard any character added by a Ctrl combo
                         }
                         setInputText(val)
                       }}
@@ -974,6 +915,7 @@ export function Conversation() {
             <Box><Box width={16}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>cycle agent/model</Text></Box>
             <Box><Box width={16}><Text bold color="white">a</Text></Box><Text dimColor>attach opencode TUI</Text></Box>
             <Box><Box width={16}><Text bold color="white">n</Text></Box><Text dimColor>spawn new session</Text></Box>
+            <Box><Box width={16}><Text bold color="white">w</Text></Box><Text dimColor>worktree session</Text></Box>
             <Box><Box width={16}><Text bold color="white">x</Text></Box><Text dimColor>kill session</Text></Box>
             <Box><Box width={16}><Text bold color="white">r</Text></Box><Text dimColor>refresh</Text></Box>
             <Box><Box width={16}><Text bold color="white">Ctrl-N</Text></Box><Text dimColor>next needs-input session</Text></Box>
@@ -1004,7 +946,7 @@ export function Conversation() {
           {isLive && mode === "insert"
             ? `Esc: normal  Enter: send  ^XE: editor`
             : isLive
-            ? `q: back  i: insert  ^W^W: sidebar  Tab: agent  a: attach  j/k: scroll  ? help`
+            ? `q: back  i: insert  ^W^W: sidebar  Tab: agent  a: attach  j/k: scroll  w: worktree  ? help`
             : `q: back  a/i/Enter: attach  j/k: scroll  ^U/^D: ½pg  G/gg: nav`
           }
         </Text>

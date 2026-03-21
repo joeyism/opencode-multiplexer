@@ -7,6 +7,7 @@ type DashboardActions = {
   onOpen?: () => void
   onAttach?: () => void
   onSpawn?: () => void
+  onWorktree?: () => void
   onExpand?: () => void
   onCollapse?: () => void
   onNextNeedsInput?: () => void
@@ -55,7 +56,7 @@ function matchKey(key: string, input: string, inkKey: any): boolean {
         const letter = key.slice(5)
         return inkKey.ctrl && !inkKey.tab && !inkKey.return && !inkKey.escape && input === letter
       }
-      return input === key
+      return input === key && !inkKey.ctrl && !inkKey.meta
   }
 }
 
@@ -66,6 +67,7 @@ export function useDashboardKeys(actions: DashboardActions) {
     else if (matchKey(kb.down, input, key) || key.downArrow) actions.onDown?.()
     else if (matchKey(kb.open, input, key)) actions.onOpen?.()
     else if (matchKey(kb.attach, input, key)) actions.onAttach?.()
+    else if (matchKey(kb.worktree, input, key)) actions.onWorktree?.()
     else if (matchKey(kb.spawn, input, key)) actions.onSpawn?.()
     else if (matchKey(kb.expand, input, key)) actions.onExpand?.()
     else if (matchKey(kb.collapse, input, key)) actions.onCollapse?.()

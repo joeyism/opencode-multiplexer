@@ -48,6 +48,9 @@ export interface DbMessagePart {
   tool?: string
   toolStatus?: string
   callId?: string
+  toolTitle?: string    // human-readable title from $.state.title
+  toolInput?: string    // first meaningful input value (command, filePath, question, etc.)
+  toolHeader?: string   // question header text
 }
 
 export interface DbMessage {
@@ -275,6 +278,7 @@ export function getMessages(sessionId: string): DbMessage[] {
         completed: number | null
         model_id: string | null
         provider_id: string | null
+        agent: string | null
       },
       [string]
     >(
@@ -283,7 +287,8 @@ export function getMessages(sessionId: string): DbMessage[] {
               time_created,
               json_extract(data, '$.time.completed') as completed,
               json_extract(data, '$.modelID') as model_id,
-              json_extract(data, '$.providerID') as provider_id
+              json_extract(data, '$.providerID') as provider_id,
+              json_extract(data, '$.agent') as agent
        FROM message
        WHERE session_id = ?
        ORDER BY time_created ASC`,
@@ -303,6 +308,9 @@ export function getMessages(sessionId: string): DbMessage[] {
         tool: string | null
         tool_status: string | null
         call_id: string | null
+        tool_title: string | null
+        tool_input: string | null
+        tool_header: string | null
       },
       [string]
     >(
@@ -312,7 +320,22 @@ export function getMessages(sessionId: string): DbMessage[] {
               json_extract(p.data, '$.text') as text,
               json_extract(p.data, '$.tool') as tool,
               json_extract(p.data, '$.state.status') as tool_status,
-              json_extract(p.data, '$.callID') as call_id
+              json_extract(p.data, '$.callID') as call_id,
+              json_extract(p.data, '$.state.title') as tool_title,
+              COALESCE(
+                json_extract(p.data, '$.state.input.question'),
+                json_extract(p.data, '$.state.input.questions[0].question'),
+                json_extract(p.data, '$.state.input.command'),
+                json_extract(p.data, '$.state.input.filePath'),
+                json_extract(p.data, '$.state.input.pattern'),
+                json_extract(p.data, '$.state.input.query'),
+                json_extract(p.data, '$.state.input.description'),
+                json_extract(p.data, '$.state.input.url')
+              ) as tool_input,
+              COALESCE(
+                json_extract(p.data, '$.state.input.header'),
+                json_extract(p.data, '$.state.input.questions[0].header')
+              ) as tool_header
        FROM part p
        WHERE p.session_id = ?
        ORDER BY p.time_created ASC`,
@@ -330,6 +353,9 @@ export function getMessages(sessionId: string): DbMessage[] {
       tool: p.tool ?? undefined,
       toolStatus: p.tool_status ?? undefined,
       callId: p.call_id ?? undefined,
+      toolTitle: p.tool_title ?? undefined,
+      toolInput: p.tool_input ?? undefined,
+      toolHeader: p.tool_header ?? undefined,
     })
     partsByMessage.set(p.message_id, list)
   }
@@ -342,6 +368,7 @@ export function getMessages(sessionId: string): DbMessage[] {
     timeCompleted: m.completed ?? null,
     modelId: m.model_id,
     providerId: m.provider_id,
+    agent: m.agent ?? undefined,
     parts: partsByMessage.get(m.id) ?? [],
   }))
 }

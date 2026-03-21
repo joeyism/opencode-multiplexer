@@ -3,6 +3,7 @@ import { useStore } from "./store.js"
 import { Dashboard } from "./views/dashboard.js"
 import { Conversation } from "./views/conversation.js"
 import { Spawn } from "./views/spawn.js"
+import { Worktree } from "./views/worktree.js"
 
 export function App() {
   const view = useStore((s) => s.view)
@@ -14,5 +15,7 @@ export function App() {
       return <Conversation />
     case "spawn":
       return <Spawn />
+    case "worktree":
+      return <Worktree />
   }
 }
