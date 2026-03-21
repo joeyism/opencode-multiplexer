@@ -2,10 +2,9 @@ import { describe, test, expect } from "bun:test"
 import React from "react"
 import { render } from "ink-testing-library"
 import { Text, Box } from "ink"
+import { computeConversationLayout, APP_BORDER_ROWS, APP_BORDER_COLS } from "../views/layout.js"
 
 const SIDEBAR_WIDTH = 26
-const HEADER_ROWS = 2   // title line + divider line
-const FOOTER_ROWS = 3   // bordered box: top border + content + bottom border
 
 function ConversationLayoutHarness({
   termHeight,
@@ -22,13 +21,13 @@ function ConversationLayoutHarness({
   messageCount: number
   isLive: boolean
 }) {
-  const bodyHeight = Math.max(5, termHeight - HEADER_ROWS - FOOTER_ROWS)
-  const fullDivider = "─".repeat(termWidth)
-  const contentWidth = Math.max(1, termWidth - SIDEBAR_WIDTH - 1)
+  const { innerHeight, effectiveWidth, bodyHeight } = computeConversationLayout(termHeight, termWidth)
+  const fullDivider = "─".repeat(effectiveWidth)
+  const contentWidth = Math.max(1, effectiveWidth - SIDEBAR_WIDTH - 1)
   const divider = "─".repeat(contentWidth)
 
   return (
-    <Box flexDirection="column" height={termHeight}>
+    <Box flexDirection="column" height={innerHeight}>
       {/* Header */}
       <Box paddingLeft={1}>
         <Text bold color="cyan">{headerText}</Text>
@@ -80,6 +79,46 @@ function ConversationLayoutHarness({
     </Box>
   )
 }
+
+describe("computeConversationLayout formula", () => {
+  test("innerHeight accounts for App border", () => {
+    const layout = computeConversationLayout(24, 80)
+    expect(layout.innerHeight).toBe(24 - APP_BORDER_ROWS)
+  })
+
+  test("effectiveWidth accounts for App border", () => {
+    const layout = computeConversationLayout(24, 80)
+    expect(layout.effectiveWidth).toBe(80 - APP_BORDER_COLS)
+  })
+
+  test("header + body + footer fit within innerHeight", () => {
+    for (const h of [12, 15, 20, 24, 30, 40, 50]) {
+      const layout = computeConversationLayout(h, 80)
+      const total = layout.bodyHeight + layout.HEADER_ROWS + layout.FOOTER_ROWS
+      expect(total).toBeLessThanOrEqual(layout.innerHeight)
+    }
+  })
+
+  test("header + body + footer + killConfirm fit within innerHeight", () => {
+    for (const h of [15, 20, 24, 30]) {
+      const layout = computeConversationLayout(h, 80, { killConfirm: true })
+      const total = layout.bodyHeight + layout.HEADER_ROWS + layout.FOOTER_ROWS + 3
+      expect(total).toBeLessThanOrEqual(layout.innerHeight)
+    }
+  })
+
+  test("bodyHeight never goes below minimum of 5", () => {
+    const layout = computeConversationLayout(10, 80)
+    expect(layout.bodyHeight).toBeGreaterThanOrEqual(5)
+  })
+
+  test("very small terminal still produces valid layout", () => {
+    const layout = computeConversationLayout(8, 40)
+    expect(layout.innerHeight).toBe(6)
+    expect(layout.bodyHeight).toBeGreaterThanOrEqual(5)
+    expect(layout.effectiveWidth).toBe(38)
+  })
+})
 
 describe("conversation layout", () => {
   test("header is visible with few messages", () => {

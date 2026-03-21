@@ -11,6 +11,7 @@ import { cleanDeadInstances } from "./registry/instances.js"
 // On resize, we clear the alternate screen so Ink always redraws from a clean slate.
 const ENTER_ALT_SCREEN = "\x1b[?1049h"
 const EXIT_ALT_SCREEN  = "\x1b[?1049l"
+const DISABLE_FOCUS_REPORTING = "\x1b[?1004l"
 const CLEAR_SCREEN     = "\x1b[2J\x1b[H"
 
 function enterAltScreen() {
@@ -23,6 +24,7 @@ function exitAltScreen() {
 
 function cleanup() {
   stopPoller()
+  process.stdout.write(DISABLE_FOCUS_REPORTING)
   exitAltScreen()
 }
 

@@ -39,6 +39,10 @@ export interface DbSession {
   timeUpdated: number
 }
 
+export interface DbSessionWithProject extends DbSession {
+  projectWorktree: string
+}
+
 // ─── Message / Part types ─────────────────────────────────────────────────────
 
 export interface DbMessagePart {
@@ -51,6 +55,8 @@ export interface DbMessagePart {
   toolTitle?: string    // human-readable title from $.state.title
   toolInput?: string    // first meaningful input value (command, filePath, question, etc.)
   toolHeader?: string   // question header text
+  toolOptions?: string  // JSON string of options array for question tools
+  toolCustom?: string   // JSON boolean from $.state.input.questions[0].custom
 }
 
 export interface DbMessage {
@@ -122,6 +128,50 @@ export function getSessionsForProject(projectId: string): DbSession[] {
   }))
 }
 
+/**
+ * Get all top-level sessions across all projects, sorted by most recently updated.
+ * Excludes archived sessions and child sessions (subagent tasks).
+ * Sessions with no matching project row are excluded (inner join).
+ */
+export function getAllSessions(limit = 500): DbSessionWithProject[] {
+  const db = getDb()
+  const rows = db
+    .query<
+      {
+        id: string
+        project_id: string
+        title: string
+        directory: string
+        permission: string | null
+        time_created: number
+        time_updated: number
+        project_worktree: string
+      },
+      [number]
+    >(
+      `SELECT s.id, s.project_id, s.title, s.directory, s.permission,
+              s.time_created, s.time_updated,
+              p.worktree as project_worktree
+       FROM session s
+       JOIN project p ON s.project_id = p.id
+       WHERE s.time_archived IS NULL AND s.parent_id IS NULL
+       ORDER BY s.time_updated DESC
+       LIMIT ?`,
+    )
+    .all(limit)
+
+  return rows.map((r) => ({
+    id: r.id,
+    projectId: r.project_id,
+    title: r.title,
+    directory: r.directory,
+    permission: r.permission,
+    timeCreated: r.time_created,
+    timeUpdated: r.time_updated,
+    projectWorktree: r.project_worktree,
+  }))
+}
+
 export function countSessionsForProject(projectId: string): number {
   const db = getDb()
   const row = db
@@ -185,6 +235,23 @@ export function getSessionStatus(sessionId: string): SessionStatus {
     )
     .get(sessionId, sessionId)
   if ((questionRow?.cnt ?? 0) > 0) return "needs-input"
+
+  // Also check DIRECT child sessions for running questions → needs-input
+  // (a subagent/task dispatched by this session is asking a question)
+  const childQuestionRow = db
+    .query<{ cnt: number }, [string]>(
+      `SELECT COUNT(*) as cnt
+       FROM part p
+       JOIN message m ON m.id = p.message_id
+       JOIN session s ON s.id = m.session_id
+       WHERE s.parent_id = ?
+         AND s.time_archived IS NULL
+         AND json_extract(p.data, '$.type') = 'tool'
+         AND json_extract(p.data, '$.tool') = 'question'
+         AND json_extract(p.data, '$.state.status') = 'running'`,
+    )
+    .get(sessionId)
+  if ((childQuestionRow?.cnt ?? 0) > 0) return "needs-input"
 
   // Check for error tool parts in latest message → error
   const errorRow = db
@@ -311,6 +378,8 @@ export function getMessages(sessionId: string): DbMessage[] {
         tool_title: string | null
         tool_input: string | null
         tool_header: string | null
+        tool_options: string | null
+        tool_custom: string | null
       },
       [string]
     >(
@@ -335,8 +404,10 @@ export function getMessages(sessionId: string): DbMessage[] {
               COALESCE(
                 json_extract(p.data, '$.state.input.header'),
                 json_extract(p.data, '$.state.input.questions[0].header')
-              ) as tool_header
-       FROM part p
+              ) as tool_header,
+              json_extract(p.data, '$.state.input.questions[0].options') as tool_options,
+              json_extract(p.data, '$.state.input.questions[0].custom') as tool_custom
+        FROM part p
        WHERE p.session_id = ?
        ORDER BY p.time_created ASC`,
     )
@@ -356,6 +427,8 @@ export function getMessages(sessionId: string): DbMessage[] {
       toolTitle: p.tool_title ?? undefined,
       toolInput: p.tool_input ?? undefined,
       toolHeader: p.tool_header ?? undefined,
+      toolOptions: p.tool_options ?? undefined,
+      toolCustom: p.tool_custom ?? undefined,
     })
     partsByMessage.set(p.message_id, list)
   }
@@ -442,6 +515,73 @@ export function getChildSessions(parentSessionId: string, limit = 10, offset = 0
   }))
 }
 
+/**
+ * Get running question tool parts from direct child sessions.
+ * These are questions asked by subagents that need the user's attention.
+ */
+export function getChildSessionQuestions(parentSessionId: string): Array<{
+  sessionId: string
+  sessionTitle: string
+  agent: string | null
+  question: string
+  header: string
+  status: string
+  options: Array<{ label: string; description?: string }>
+  custom: boolean
+}> {
+  const db = getDb()
+  const rows = db
+    .query<
+      {
+        session_id: string
+        session_title: string
+        agent: string | null
+        question: string | null
+        header: string | null
+        status: string
+        options: string | null
+        custom: unknown
+      },
+      [string]
+    >(
+      `SELECT s.id as session_id,
+              s.title as session_title,
+              json_extract(m.data, '$.agent') as agent,
+              COALESCE(
+                json_extract(p.data, '$.state.input.question'),
+                json_extract(p.data, '$.state.input.questions[0].question')
+              ) as question,
+              COALESCE(
+                json_extract(p.data, '$.state.input.header'),
+                json_extract(p.data, '$.state.input.questions[0].header')
+              ) as header,
+              json_extract(p.data, '$.state.status') as status,
+              json_extract(p.data, '$.state.input.questions[0].options') as options,
+              json_extract(p.data, '$.state.input.questions[0].custom') as custom
+       FROM part p
+       JOIN message m ON m.id = p.message_id
+       JOIN session s ON s.id = m.session_id
+       WHERE s.parent_id = ?
+         AND s.time_archived IS NULL
+         AND json_extract(p.data, '$.type') = 'tool'
+         AND json_extract(p.data, '$.tool') = 'question'
+         AND json_extract(p.data, '$.state.status') = 'running'
+       ORDER BY p.time_created DESC`,
+    )
+    .all(parentSessionId)
+
+  return rows.map((r) => ({
+    sessionId: r.session_id,
+    sessionTitle: r.session_title,
+    agent: r.agent,
+    question: r.question ?? "Question from subagent",
+    header: r.header ?? "Subagent Question",
+    status: r.status,
+    options: r.options ? (() => { try { return JSON.parse(r.options!) } catch { return [] } })() : [],
+    custom: r.custom === true || r.custom === 1 || r.custom === "true",
+  }))
+}
+
 export function countChildSessions(parentSessionId: string): number {
   const db = getDb()
   const row = db
@@ -492,6 +632,38 @@ export function getSessionAgent(sessionId: string): string | null {
     )
     .get(sessionId)
   return row?.agent ?? null
+}
+
+/**
+ * Get all files modified in a session by collecting file paths from patch parts.
+ * Returns a deduplicated array of absolute file paths.
+ */
+export function getSessionModifiedFiles(sessionId: string): string[] {
+  const db = getDb()
+  const rows = db
+    .query<{ files: string }, [string]>(
+      `SELECT json_extract(data, '$.files') as files
+       FROM part
+       WHERE session_id = ?
+         AND json_extract(data, '$.type') = 'patch'
+         AND json_extract(data, '$.files') IS NOT NULL
+       ORDER BY time_created ASC`,
+    )
+    .all(sessionId)
+
+  const allFiles = new Set<string>()
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.files) as string[]
+      for (const f of parsed) {
+        allFiles.add(f)
+      }
+    } catch {
+      // Malformed JSON — skip
+    }
+  }
+
+  return [...allFiles]
 }
 
 // Close DB on process exit to avoid WAL lock issues

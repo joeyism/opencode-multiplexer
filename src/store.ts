@@ -23,6 +23,7 @@ export interface OcmInstance {
   hasChildren: boolean
   model: string | null    // last model used in this session (shortened)
   port: number | null     // only set for opencode serve instances (spawned via OCMux)
+  timeUpdated: number     // session.time_updated from SQLite — used for sorting and display
 }
 
 // ─── Session type (for subagent tree children) ────────────────────────────────
@@ -52,6 +53,8 @@ export interface ConversationMessagePart {
   toolTitle?: string
   toolInput?: string
   toolHeader?: string
+  toolOptions?: string  // JSON string of options array for question tools
+  toolCustom?: string
 }
 
 export interface ConversationMessage {
@@ -99,6 +102,10 @@ interface Store {
   messagesLoading: boolean
   setMessages: (messages: ConversationMessage[]) => void
   setMessagesLoading: (loading: boolean) => void
+
+  // Window focus
+  windowFocused: boolean
+  setWindowFocused: (focused: boolean) => void
 }
 
 export const useStore = create<Store>((set) => ({
@@ -160,4 +167,8 @@ export const useStore = create<Store>((set) => ({
   messagesLoading: false,
   setMessages: (messages) => set({ messages }),
   setMessagesLoading: (messagesLoading) => set({ messagesLoading }),
+
+  // Window focus
+  windowFocused: true,
+  setWindowFocused: (focused) => set({ windowFocused: focused }),
 }))

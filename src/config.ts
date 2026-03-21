@@ -17,6 +17,8 @@ export interface KeybindingsConfig {
     help: string
     rescan: string
     worktree: string
+    renameTitle: string
+    sessions: string
   }
   conversation: {
     back: string
@@ -61,12 +63,14 @@ const DEFAULTS: Config = {
       expand: "tab",
       collapse: "shift-tab",
       nextNeedsInput: "ctrl-n",
-    kill: "x",
-    quit: "q",
-    help: "?",
-    rescan: "r",
-    worktree: "w",
-  },
+      kill: "x",
+      quit: "q",
+      help: "?",
+      rescan: "r",
+      worktree: "w",
+      renameTitle: "t",
+      sessions: "s",
+    },
     conversation: {
       back: "escape",
       attach: "a",

@@ -4,17 +4,16 @@ import TextInput from "ink-text-input"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { useStore, type ConversationMessage } from "../store.js"
 import { useConversationKeys } from "../hooks/use-keybindings.js"
-import { yieldToOpencode, openInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
-import { getMessages, getSessionById, getSessionStatus, getSessionAgent } from "../db/reader.js"
+import { yieldToOpencode, openInEditor, openFileInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
+import { getMessages, getSessionById, getSessionStatus, getSessionAgent, getSessionModifiedFiles, getSessionModel, getChildSessionQuestions } from "../db/reader.js"
 import { config } from "../config.js"
 import { shortenModel, refreshNow } from "../poller.js"
 import { ensureServeProcess, killInstance } from "../registry/instances.js"
-import { statusIcon } from "./helpers.js"
+import { statusIcon, relativeTime } from "./helpers.js"
+import { computeConversationLayout, APP_BORDER_COLS } from "./layout.js"
 
 
 import { buildDisplayLines, type DisplayLine } from "./display-lines.js"
-
-const SIDEBAR_WIDTH = 26
 
 function Sidebar({
   instances,
@@ -22,34 +21,44 @@ function Sidebar({
   cursorIndex,
   focused,
   height,
+  width,
+  compact,
 }: {
   instances: import("../store.js").OcmInstance[]
   currentSessionId: string | null
   cursorIndex: number
   focused: boolean
   height: number
+  width: number
+  compact: boolean
 }) {
   // Inner width: total - 2 border chars
-  const innerWidth = SIDEBAR_WIDTH - 2
+  const innerWidth = Math.max(0, width - 2)
   // Max chars for repo/title after cursor(1) + space(1) + icon(1) + space(1) = 4
-  const maxLabelWidth = innerWidth - 4
+  const maxLabelWidth = Math.max(0, innerWidth - 4)
+  const timeFieldWidth = Math.max(0, innerWidth - 4)
+  const separatorLine = "─".repeat(innerWidth)
 
   return (
     <Box
       flexDirection="column"
-      width={SIDEBAR_WIDTH}
+      width={width}
       flexShrink={0}
       borderStyle="single"
       borderColor={focused ? "cyan" : "gray"}
       height={height}
       overflow="hidden"
     >
-      {/* Header */}
-      <Box paddingX={1} justifyContent="space-between">
-        <Text bold color={focused ? "cyan" : "gray"}>sessions</Text>
-        <Text dimColor>{instances.length}</Text>
-      </Box>
-      <Text dimColor>{"─".repeat(innerWidth)}</Text>
+      {!compact && (
+        <>
+          {/* Header */}
+          <Box paddingX={1} justifyContent="space-between">
+            <Text bold color={focused ? "cyan" : "gray"}>sessions</Text>
+            <Text dimColor>{instances.length}</Text>
+          </Box>
+          <Text dimColor>{separatorLine}</Text>
+        </>
+      )}
 
       {/* Instance list */}
       {instances.length === 0 && (
@@ -61,13 +70,33 @@ function Sidebar({
         const isCurrent = inst.sessionId === currentSessionId
         const isCursor = focused && i === cursorIndex
         const { char, color } = statusIcon(inst.status)
+        const cursorChar = isCursor ? "▸" : isCurrent ? "◆" : " "
 
-        // Compact single-line: "▸ ▶ repo/title"
+        if (compact) {
+          const rawTime = relativeTime(inst.timeUpdated)
+          const timeLabel = timeFieldWidth > 0 ? rawTime.slice(0, timeFieldWidth) : ""
+          return (
+        <Box key={inst.id} paddingLeft={1} overflow="hidden">
+              <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
+              <Text>{" "}</Text>
+              <Text color={color}>{char}</Text>
+              <Text>{" "}</Text>
+              <Text
+                bold={isCurrent || isCursor}
+                color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
+                dimColor={!isCurrent && !isCursor}
+              >
+                {timeLabel}
+              </Text>
+            </Box>
+          )
+        }
+
         const sep = "/"
         const maxTotal = maxLabelWidth
         const repoMax = Math.min(inst.repoName.length, Math.floor(maxTotal * 0.4))
         const repo = inst.repoName.length > repoMax
-          ? inst.repoName.slice(0, repoMax - 1) + "…"
+          ? inst.repoName.slice(0, Math.max(0, repoMax - 1)) + "…"
           : inst.repoName
         const titleMax = maxTotal - repo.length - sep.length
         const title = inst.sessionTitle.length > titleMax
@@ -76,9 +105,7 @@ function Sidebar({
 
         return (
           <Box key={inst.id} paddingLeft={1}>
-            <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>
-              {isCursor ? "▸" : isCurrent ? "◆" : " "}
-            </Text>
+            <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
             <Text>{" "}</Text>
             <Text color={color}>{char}</Text>
             <Text>{" "}</Text>
@@ -96,6 +123,7 @@ function Sidebar({
             >
               {title}
             </Text>
+            <Text dimColor wrap="truncate"> {relativeTime(inst.timeUpdated)}</Text>
           </Box>
         )
       })}
@@ -132,6 +160,83 @@ export function Conversation() {
   const [killConfirm, setKillConfirm] = React.useState<import("../store.js").OcmInstance | null>(null)
   // Help overlay
   const [showHelp, setShowHelp] = React.useState(false)
+  // Commit mode
+  const [commitMode, setCommitMode] = React.useState(false)
+  const [commitText, setCommitText] = React.useState("")
+  const [commitStatus, setCommitStatus] = React.useState<string | null>(null)
+  // Title rename mode
+  const [titleMode, setTitleMode] = React.useState(false)
+  const [titleText, setTitleText] = React.useState("")
+  // For sidebar-initiated renames: which session/port/worktree to target
+  const [titleRenameSessionId, setTitleRenameSessionId] = React.useState<string | null>(null)
+  const [titleRenamePort, setTitleRenamePort] = React.useState<number | null>(null)
+  const [titleRenameWorktree, setTitleRenameWorktree] = React.useState<string | null>(null)
+  // Inline question answering
+type QuestionOption = { label: string; description?: string }
+type PendingQuestion = {
+  questions: Array<{ question: string; header: string; options: QuestionOption[]; custom?: boolean }>
+}
+  const [pendingQuestion, setPendingQuestion] = React.useState<PendingQuestion | null>(null)
+  const [questionCursor, setQuestionCursor] = React.useState(0)
+  const [questionCustomMode, setQuestionCustomMode] = React.useState(false)
+  const [questionCustomText, setQuestionCustomText] = React.useState("")
+  // Prevents the auto-open useEffect from re-opening the overlay immediately after
+  // submitAnswer closes it — the serve process needs time to update question status in DB.
+  const questionAnswered = React.useRef(false)
+  // Tracks pendingQuestion + questionAnswered for the setInterval closure (can't see React state)
+  const pendingQuestionRef = React.useRef(false)
+  const questionOpts = React.useMemo(() => {
+    if (!pendingQuestion) return []
+    const raw = pendingQuestion.questions[0]?.options ?? []
+    return [...raw, { label: "Type your own answer", description: "" }]
+  }, [pendingQuestion])
+  pendingQuestionRef.current = !!pendingQuestion || questionAnswered.current
+  React.useEffect(() => {
+    if (questionOpts.length === 0) {
+      setQuestionCursor(0)
+      return
+    }
+    setQuestionCursor((c) => Math.min(c, questionOpts.length - 1))
+  }, [questionOpts.length])
+
+  // Auto-open/close question overlay from DB-sourced options (handles child session questions
+  // which the tui.control.next() serve API doesn't surface)
+  React.useEffect(() => {
+    const lines = buildDisplayLines(messages)
+    const runningQ = lines.find(
+      (l): l is Extract<DisplayLine, { kind: "question" }> =>
+        l.kind === "question" && l.status === "running" && l.options.length > 0
+    )
+    if (runningQ && !pendingQuestion && !questionAnswered.current) {
+      setPendingQuestion({
+        questions: [{
+          question: runningQ.question,
+          header: runningQ.header,
+          options: runningQ.options,
+          custom: runningQ.custom,
+        }],
+      })
+      setQuestionCursor(0)
+    } else if (!runningQ) {
+      // Question completed in DB — reset answered flag and clear overlay if open
+      questionAnswered.current = false
+      if (pendingQuestion) {
+        setPendingQuestion(null)
+        setQuestionCustomMode(false)
+        setQuestionCustomText("")
+      }
+    }
+  }, [messages, pendingQuestion])
+
+  // Model picker overlay
+  const [modelPickerOpen, setModelPickerOpen] = React.useState(false)
+  const [modelPickerCursor, setModelPickerCursor] = React.useState(0)
+  const [modelPickerScroll, setModelPickerScroll] = React.useState(0)
+  // File picker overlay
+  const [filePickerOpen, setFilePickerOpen] = React.useState(false)
+  const [filePickerCursor, setFilePickerCursor] = React.useState(0)
+  const [filePickerScroll, setFilePickerScroll] = React.useState(0)
+  const [filePickerFiles, setFilePickerFiles] = React.useState<string[]>([])
   // Tick counter to force sessionStatus re-read when SSE session events arrive
   const [statusTick, setStatusTick] = React.useState(0)
   // Only update messages state if content actually changed (avoids expensive re-renders)
@@ -169,10 +274,20 @@ export function Conversation() {
   // Ref to block TextInput from receiving Ctrl+letter combos.
   // Set to true whenever ctrl is pressed in insert mode — cleared in onChange.
   const ctrlPressed = React.useRef(false)
+  // Ref to synchronously block TextInput during multi-key chords (Ctrl-X E, Ctrl-X M).
+  // Unlike pendingCtrlX (React state, async), this ref is set immediately in the same
+  // tick as the keystroke, preventing the character from leaking into TextInput's onChange.
+  const pendingChord = React.useRef(false)
 
   const { stdout } = useStdout()
   const termWidth = stdout?.columns ?? 80
   const termHeight = stdout?.rows ?? 24
+  const effectiveWidth = termWidth - APP_BORDER_COLS   // account for App border (left + right)
+  const [sidebarCompact, setSidebarCompact] = React.useState(false)
+
+  const sidebarWidthWide = Math.max(20, Math.floor(termWidth * 0.25))
+  const sidebarWidthCompact = 10
+  const sidebarWidth = sidebarCompact ? sidebarWidthCompact : sidebarWidthWide
 
   // Track whether this mount was triggered by the editor returning
   const hadEditorResult = React.useRef(false)
@@ -225,10 +340,19 @@ export function Conversation() {
     return getSessionStatus(selectedSessionId)
   }, [instance, selectedSessionId, statusTick])
 
-  // Clear waitingForResponse once session status catches up
+  // Clear waitingForResponse when status catches up OR when new messages arrive
+  // (handles case where agent responds so fast the poll never catches "working")
   React.useEffect(() => {
     if (sessionStatus !== "idle") setWaitingForResponse(false)
   }, [sessionStatus])
+  React.useEffect(() => {
+    if (waitingForResponse && messages.length > 0) {
+      const lastMsg = messages[messages.length - 1]
+      if (lastMsg && lastMsg.role === "assistant") {
+        setWaitingForResponse(false)
+      }
+    }
+  }, [messages.length, waitingForResponse])
 
   // Spinner animation for working state
   const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -262,8 +386,10 @@ export function Conversation() {
         const all = (result?.data ?? []) as Array<{ name: string; mode: string; model?: { providerID: string; modelID: string } }>
         const primary = all.filter((a) => a.mode === "primary" || a.mode === "all")
         setAvailableAgents(primary)
-        setSelectedAgentIdx(0)
-        setModelOverrideIdx(null)
+        // Default to last-used agent from this session, fall back to first
+        const lastAgent = getSessionAgent(selectedSessionId!)
+        const agentIdx = lastAgent ? primary.findIndex((a) => a.name === lastAgent) : 0
+        setSelectedAgentIdx(agentIdx >= 0 ? agentIdx : 0)
       }).catch(() => {})
 
       ;(client as any).provider.list().then((result: any) => {
@@ -277,6 +403,14 @@ export function Conversation() {
           }
         }
         setAvailableModels(models)
+        // Default to last-used model from this session
+        const lastModel = getSessionModel(selectedSessionId!)
+        if (lastModel) {
+          const modelIdx = models.findIndex((m) => m.modelID === lastModel)
+          setModelOverrideIdx(modelIdx >= 0 ? modelIdx : null)
+        } else {
+          setModelOverrideIdx(null)
+        }
       }).catch(() => {})
     }
   }, [selectedSessionId, instancePort])
@@ -287,6 +421,9 @@ export function Conversation() {
     const sessionId = selectedSessionId
 
     let cancelled = false
+
+    // Client used for both polling and SSE
+    const client = createOpencodeClient({ baseUrl: `http://localhost:${instancePort}` })
 
     // Always-on polling — catches SSE stalls, external TUI writes, and status changes
     const pollInterval = setInterval(() => {
@@ -299,7 +436,6 @@ export function Conversation() {
     }, config.conversationPollIntervalMs)
 
     // SSE for real-time updates (best-effort, faster than polling)
-    const client = createOpencodeClient({ baseUrl: `http://localhost:${instancePort}` })
 
     async function listen() {
       try {
@@ -380,7 +516,12 @@ export function Conversation() {
 
   const openInOpencode = React.useCallback(() => {
     if (!selectedSessionId) return
-    yieldToOpencode(selectedSessionId, sessionCwd, instancePort)
+    // Smart attach: if a child session has a running question, attach there instead
+    const childQuestions = getChildSessionQuestions(selectedSessionId)
+    const targetSessionId = childQuestions.length > 0
+      ? childQuestions[0]!.sessionId
+      : selectedSessionId
+    yieldToOpencode(targetSessionId, sessionCwd, instancePort)
   }, [selectedSessionId, sessionCwd, instancePort])
 
   // Computed current agent and model
@@ -427,10 +568,109 @@ export function Conversation() {
     }
   }, [selectedSessionId, instancePort, currentAgent, currentModel, setMessages])
 
+  // Commit session-modified files
+  const doCommit = React.useCallback(async (message: string) => {
+    if (!message.trim() || !selectedSessionId) return
+    setCommitStatus("committing...")
+
+    try {
+      const { getSessionModifiedFiles } = await import("../db/reader.js")
+      const { execSync: exec } = await import("child_process")
+      const { existsSync } = await import("fs")
+      const cwd = sessionCwd
+
+      const files = getSessionModifiedFiles(selectedSessionId)
+      if (files.length === 0) {
+        setCommitStatus("✗ no files modified in this session")
+        setTimeout(() => { setCommitStatus(null); setCommitMode(false); setMode("normal") }, 2500)
+        return
+      }
+
+      const existingFiles = files.filter((f) => existsSync(f))
+      if (existingFiles.length > 0) {
+        exec(`git add ${existingFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
+      }
+      const deletedFiles = files.filter((f) => !existsSync(f))
+      if (deletedFiles.length > 0) {
+        try {
+          exec(`git add ${deletedFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
+        } catch { /* not tracked — ignore */ }
+      }
+
+      exec(`git commit -m ${JSON.stringify(message.trim())}`, { cwd, stdio: "pipe" })
+
+      let pushOk = true
+      try {
+        exec("git push origin HEAD", { cwd, stdio: "pipe" })
+      } catch { pushOk = false }
+
+      const n = files.length
+      const noun = `${n} file${n === 1 ? "" : "s"}`
+      setCommitStatus(pushOk
+        ? `✓ committed ${noun} and pushed`
+        : `✓ committed ${noun} (push failed — run manually)`)
+
+      setTimeout(() => {
+        setCommitStatus(null); setCommitMode(false); setCommitText(""); setMode("normal")
+      }, 2500)
+    } catch (e) {
+      setCommitStatus(`✗ ${String(e)}`)
+      setTimeout(() => { setCommitStatus(null); setCommitMode(false); setMode("normal") }, 3000)
+    }
+  }, [selectedSessionId, sessionCwd])
+
+  // Rename session title via SDK
+  const doRenameTitle = React.useCallback(async (newTitle: string) => {
+    if (!newTitle.trim()) return
+    // Use sidebar-targeted session/port, or fall back to current conversation session
+    const targetId = titleRenameSessionId ?? selectedSessionId
+    if (!targetId) return
+    try {
+      let port: number | null = titleRenamePort ?? instancePort
+      if (!port && titleRenameWorktree) {
+        // Need to spin up a serve process for this session's directory
+        port = await ensureServeProcess(titleRenameWorktree)
+      }
+      if (!port) return
+      const client = createOpencodeClient({ baseUrl: `http://localhost:${port}` })
+      await (client.session as any).update({
+        path: { id: targetId },
+        body: { title: newTitle.trim() },
+      })
+      setCommitStatus("✓ title updated")
+      setTimeout(() => setCommitStatus(null), 1500)
+      refreshNow()
+    } catch (e) {
+      setCommitStatus(`✗ ${String(e)}`)
+      setTimeout(() => setCommitStatus(null), 2500)
+    } finally {
+      setTitleMode(false)
+      setTitleText("")
+      setTitleRenameSessionId(null)
+      setTitleRenamePort(null)
+      setTitleRenameWorktree(null)
+      setMode("normal")
+    }
+  }, [selectedSessionId, instancePort, titleRenameSessionId, titleRenamePort, titleRenameWorktree])
+
   // Open in $EDITOR (Ctrl-X E)
   const handleEditorOpen = React.useCallback(() => {
     openInEditor(inputText, (edited) => setInputText(edited))
   }, [inputText])
+
+  const openModelPicker = React.useCallback(() => {
+    if (!isLive || availableModels.length === 0) return
+    const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
+    const currentIdx = modelOverrideIdx !== null
+      ? modelOverrideIdx
+      : availableModels.findIndex((m) =>
+          currentModel && m.providerID === currentModel.providerID && m.modelID === currentModel.modelID
+        )
+    const idx = Math.max(0, currentIdx)
+    setModelPickerCursor(idx)
+    setModelPickerScroll(Math.max(0, idx - Math.floor(MAX_VISIBLE / 2)))
+    setModelPickerOpen(true)
+  }, [isLive, availableModels, modelOverrideIdx, currentModel, termHeight])
 
   // Build display lines
   const displayLines = React.useMemo<DisplayLine[]>(() => buildDisplayLines(messages), [messages])
@@ -468,9 +708,7 @@ export function Conversation() {
   const startIdx = Math.max(0, totalLines - msgAreaHeight - scrollOffset)
   const endIdx = Math.max(0, totalLines - scrollOffset)
   const visibleLines: typeof displayLines = displayLines.slice(startIdx, endIdx)
-  while (visibleLines.length < msgAreaHeight) {
-    visibleLines.unshift({ kind: "spacer" as const })
-  }
+
 
   // Scroll position indicator
   const scrollPct = totalLines <= msgAreaHeight
@@ -482,43 +720,101 @@ export function Conversation() {
 
   // Combined useInput: mode switching + gg + Ctrl-X E
   useInput((input, key) => {
-    // ── INSERT MODE ──────────────────────────────────────────────────────────
-    if (mode === "insert") {
-      // Track any Ctrl press — prevents TextInput from receiving the character
-      if (key.ctrl) ctrlPressed.current = true
+    // ── OVERLAYS (capture all keys regardless of mode) ────────────────────────
+      if (pendingQuestion) {
+        const opts = questionOpts
+        const submitAnswer = async (label: string) => {
+          let port = instancePort
+          if (!port) {
+            try {
+              port = await ensureServeProcess(sessionCwd)
+            } catch {
+              setPendingQuestion(null)
+              setQuestionCustomMode(false)
+              setQuestionCustomText("")
+              return
+            }
+          }
 
-      // Esc or Ctrl-C exits insert mode (does NOT go back to dashboard)
-      if (key.escape || (key.ctrl && input === "c")) {
-        setMode("normal")
-        // Clear pending combos
-        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
-        setPendingCtrlX(false)
-        return
-      }
+          try {
+            const listRes = await fetch(`http://localhost:${port}/question`)
+            if (!listRes.ok) {
+              console.error("[DEBUG] question list failed:", listRes.status)
+              return
+            }
+            const questions = await listRes.json() as Array<{ id: string; sessionID: string }>
+            console.error("[DEBUG] pending questions:", JSON.stringify(questions.map((q) => ({ id: q.id, sessionID: q.sessionID }))))
 
-      // Ctrl-X E: open in editor (only from insert mode)
-      if (key.ctrl && input === "x") {
-        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
-        setPendingCtrlX(true)
-        pendingCtrlXTimer.current = setTimeout(() => setPendingCtrlX(false), 1000)
-        return
-      }
-      if (pendingCtrlX) {
-        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
-        setPendingCtrlX(false)
-        if ((input === "e" || input === "E") && !key.ctrl) {
-          handleEditorOpen()
+            if (questions.length === 0) {
+              console.error("[DEBUG] no pending questions found")
+              return
+            }
+
+            const requestID = questions[0]!.id
+            const replyRes = await fetch(`http://localhost:${port}/question/${requestID}/reply`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ answers: [[label]] }),
+            })
+            console.error("[DEBUG] reply result:", replyRes.status, await replyRes.text())
+          } catch (e) {
+            console.error("[DEBUG] submitAnswer error:", String(e))
+          }
+
+          questionAnswered.current = true
+          setPendingQuestion(null)
+          setQuestionCustomMode(false)
+          setQuestionCustomText("")
+        }
+      if (questionCustomMode) {
+        if (key.return) {
+          if (questionCustomText.trim()) {
+            void submitAnswer(questionCustomText.trim())
+            setQuestionCustomMode(false)
+            setQuestionCustomText("")
+          }
+        } else if (key.escape) {
+          setQuestionCustomMode(false)
+          setQuestionCustomText("")
+        } else if (key.backspace || key.delete) {
+          setQuestionCustomText((t) => t.slice(0, -1))
+        } else if (input && !key.ctrl && !key.meta) {
+          setQuestionCustomText((t) => t + input)
         }
         return
       }
-
-      // All other keys in insert mode go to TextInput — don't intercept
+      if (input === "j" || key.downArrow) {
+        setQuestionCursor((c) => Math.min(c + 1, Math.max(opts.length - 1, 0)))
+      } else if (input === "k" || key.upArrow) {
+        setQuestionCursor((c) => Math.max(c - 1, 0))
+      } else if (key.return) {
+        const isCustomEntry = questionCursor === opts.length - 1
+        if (isCustomEntry) {
+          setQuestionCustomMode(true)
+          setQuestionCustomText("")
+        } else {
+          const selected = opts[questionCursor]
+          if (selected) void submitAnswer(selected.label)
+        }
+      } else if (key.escape) {
+        setPendingQuestion(null)
+        setQuestionCustomMode(false)
+        setQuestionCustomText("")
+      } else {
+        const num = parseInt(input, 10)
+        if (!isNaN(num) && num >= 1 && num <= opts.length) {
+          const idx = num - 1
+          const isCustomEntry = idx === opts.length - 1
+          if (isCustomEntry) {
+            setQuestionCustomMode(true)
+            setQuestionCustomText("")
+          } else {
+            void submitAnswer(opts[idx]!.label)
+          }
+        }
+      }
       return
     }
-
-    // ── NORMAL MODE ──────────────────────────────────────────────────────────
-
-    // Kill confirmation: y to confirm, n/Esc to cancel (captures all keys)
     if (killConfirm) {
       if (input === "y") {
         const killed = killConfirm
@@ -537,6 +833,127 @@ export function Conversation() {
       }
       return
     }
+    if (modelPickerOpen) {
+      const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
+      if (input === "j" || key.downArrow) {
+        setModelPickerCursor((c) => {
+          const next = Math.min(c + 1, availableModels.length - 1)
+          setModelPickerScroll((s) => next >= s + MAX_VISIBLE ? next - MAX_VISIBLE + 1 : s)
+          return next
+        })
+      } else if (input === "k" || key.upArrow) {
+        setModelPickerCursor((c) => {
+          const next = Math.max(c - 1, 0)
+          setModelPickerScroll((s) => next < s ? next : s)
+          return next
+        })
+      } else if (key.return) {
+        setModelOverrideIdx(modelPickerCursor)
+        setModelPickerOpen(false)
+      } else if (key.escape) {
+        setModelPickerOpen(false)
+      } else {
+        const num = parseInt(input, 10)
+        if (!isNaN(num) && num >= 1 && num <= availableModels.length) {
+          setModelOverrideIdx(num - 1)
+          setModelPickerOpen(false)
+        }
+      }
+      return
+    }
+    if (filePickerOpen) {
+      const MAX_VISIBLE_F = Math.min(20, Math.max(5, termHeight - 10))
+      if (input === "j" || key.downArrow) {
+        setFilePickerCursor((c) => {
+          const next = Math.min(c + 1, filePickerFiles.length - 1)
+          setFilePickerScroll((s) => next >= s + MAX_VISIBLE_F ? next - MAX_VISIBLE_F + 1 : s)
+          return next
+        })
+      } else if (input === "k" || key.upArrow) {
+        setFilePickerCursor((c) => {
+          const next = Math.max(c - 1, 0)
+          setFilePickerScroll((s) => next < s ? next : s)
+          return next
+        })
+      } else if (key.return) {
+        const file = filePickerFiles[filePickerCursor]
+        setFilePickerOpen(false)
+        if (file) openFileInEditor(file)
+      } else if (input === "a") {
+        setFilePickerOpen(false)
+        openFileInEditor(filePickerFiles)
+      } else if (key.escape) {
+        setFilePickerOpen(false)
+      } else {
+        const num = parseInt(input, 10)
+        if (!isNaN(num) && num >= 1 && num <= filePickerFiles.length) {
+          setFilePickerOpen(false)
+          openFileInEditor(filePickerFiles[num - 1]!)
+        }
+      }
+      return
+    }
+    // ── INSERT MODE ──────────────────────────────────────────────────────────
+    if (mode === "insert") {
+      // Track any Ctrl press — prevents TextInput from receiving the character
+      if (key.ctrl) ctrlPressed.current = true
+
+      // Esc or Ctrl-C exits insert mode (does NOT go back to dashboard)
+      if (key.escape || (key.ctrl && input === "c")) {
+        pendingChord.current = false
+        setMode("normal")
+        setCommitMode(false)
+        setCommitText("")
+        setTitleMode(false)
+        setTitleText("")
+        setTitleRenameSessionId(null)
+        setTitleRenamePort(null)
+        setTitleRenameWorktree(null)
+        // Clear pending combos
+        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
+        setPendingCtrlX(false)
+        return
+      }
+
+      // Ctrl-X E: open in editor (only from insert mode)
+      if (key.ctrl && input === "x") {
+        pendingChord.current = true
+        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
+        setPendingCtrlX(true)
+        pendingCtrlXTimer.current = setTimeout(() => { setPendingCtrlX(false); pendingChord.current = false }, 1000)
+        return
+      }
+      if (pendingCtrlX) {
+        pendingChord.current = false
+        if (pendingCtrlXTimer.current) clearTimeout(pendingCtrlXTimer.current)
+        setPendingCtrlX(false)
+        if ((input === "e" || input === "E") && !key.ctrl) {
+          handleEditorOpen()
+        } else if ((input === "m" || input === "M") && !key.ctrl) {
+          openModelPicker()
+        }
+        return
+      }
+
+      // Tab: cycle agent (insert mode)
+      if (key.tab && !key.shift && isLive && availableAgents.length > 0) {
+        setSelectedAgentIdx((prev) => (prev + 1) % availableAgents.length)
+        setModelOverrideIdx(null)
+        return
+      }
+      // Shift-Tab: cycle agent backward (insert mode)
+      if (key.tab && key.shift && isLive && availableAgents.length > 0) {
+        setSelectedAgentIdx((prev) => (prev - 1 + availableAgents.length) % availableAgents.length)
+        setModelOverrideIdx(null)
+        return
+      }
+
+      // All other keys in insert mode go to TextInput — don't intercept
+      return
+    }
+
+    // ── NORMAL MODE ──────────────────────────────────────────────────────────
+
 
     // Help overlay: any key closes it
     if (showHelp) {
@@ -544,8 +961,8 @@ export function Conversation() {
       return
     }
 
-    // ?: toggle help overlay
-    if (input === "?" && key.shift) {
+    // ?: toggle help overlay (don't require key.shift — some terminals don't set it for printable chars)
+    if (input === "?") {
       setShowHelp(true)
       return
     }
@@ -603,7 +1020,30 @@ export function Conversation() {
         navigate("dashboard")
         return
       }
+      if (input === "s") {
+        setSidebarCompact((c) => !c)
+        return
+      }
+      if (input === "t") {
+        const target = instances[sidebarCursor]
+        if (target) {
+          setTitleMode(true)
+          setTitleText(target.sessionTitle)
+          setTitleRenameSessionId(target.sessionId)
+          setTitleRenamePort(target.port)
+          setTitleRenameWorktree(target.worktree)
+          setMode("insert")
+          setFocus("conversation")
+        }
+        return
+      }
       // When sidebar is focused, block all other keys
+      return
+    }
+
+    // s: toggle sidebar compact mode
+    if (input === "s") {
+      setSidebarCompact((c) => !c)
       return
     }
 
@@ -626,6 +1066,54 @@ export function Conversation() {
     // n: spawn new session
     if (input === "n") {
       navigate("spawn")
+      return
+    }
+
+    // e: open editor with current input (shortcut for i + Ctrl-X E)
+    if (input === "e" && isLive) {
+      handleEditorOpen()
+      setMode("insert")
+      setFocus("conversation")
+      return
+    }
+
+    // c: enter commit mode
+    if (input === "c" && isLive) {
+      setCommitMode(true)
+      setCommitText("")
+      setCommitStatus(null)
+      setMode("insert")
+      setFocus("conversation")
+      return
+    }
+
+    // t: rename session title (live sessions only)
+    if (input === "t" && isLive && selectedSessionId) {
+      setTitleMode(true)
+      setTitleText(sessionTitle)
+      setMode("insert")
+      setFocus("conversation")
+      return
+    }
+
+    // m: open model picker
+    if (input === "m") {
+      openModelPicker()
+      return
+    }
+
+    // f: open file picker (session-modified files)
+    if (input === "f" && selectedSessionId) {
+      const files = getSessionModifiedFiles(selectedSessionId)
+      if (files.length === 0) {
+        setCommitStatus("no files modified in this session")
+        setTimeout(() => setCommitStatus(null), 2000)
+        return
+      }
+      setFilePickerFiles(files)
+      setFilePickerCursor(0)
+      setFilePickerScroll(0)
+      setFilePickerOpen(true)
       return
     }
 
@@ -693,8 +1181,11 @@ export function Conversation() {
     }
   })
 
+  // When any overlay is open, hide the body entirely — prevents background bleed-through in Ink
+  const anyOverlayOpen = showHelp || modelPickerOpen || filePickerOpen || !!pendingQuestion
+
   // Normal mode keybindings — all disabled in insert mode
-  useConversationKeys(mode === "normal" && focus === "conversation" ? {
+  useConversationKeys(mode === "normal" && focus === "conversation" && !anyOverlayOpen ? {
     onBack: () => navigate("dashboard"),
     onAttach: openInOpencode,
     onSend: isLive ? undefined : openInOpencode,  // Enter attaches for read-only
@@ -716,19 +1207,17 @@ export function Conversation() {
     return { char: "○", color: "white" }
   })()
 
-  const contentWidth = Math.max(1, termWidth - SIDEBAR_WIDTH - 1)
-  const fullDivider = "─".repeat(Math.max(1, termWidth))
+  const contentWidth = Math.max(1, effectiveWidth - sidebarWidth - 1)
+  const fullDivider = "─".repeat(Math.max(1, effectiveWidth))
   const divider = "─".repeat(contentWidth)
-
-  // Explicit layout heights — deterministic, avoids flexGrow + border interactions
-  const HEADER_ROWS = 2   // title line + divider
-  const FOOTER_ROWS = 3   // bordered footer: top border + content + bottom border
-  const KILL_CONFIRM_ROWS = killConfirm ? 3 : 0  // conditional confirmation box
-  const bodyHeight = Math.max(5, termHeight - HEADER_ROWS - FOOTER_ROWS - KILL_CONFIRM_ROWS)
+  // Explicit layout heights — single source of truth in src/views/layout.ts
+  const { innerHeight, bodyHeight } = computeConversationLayout(
+    termHeight, termWidth, { killConfirm: !!killConfirm }
+  )
 
 
   return (
-    <Box flexDirection="column" height={termHeight}>
+    <Box flexDirection="column" height={innerHeight}>
       {/* Header — full width, outside the sidebar/content row */}
       <Box paddingLeft={1} justifyContent="space-between">
         <Box>
@@ -756,14 +1245,16 @@ export function Conversation() {
       </Box>
       <Text color={focus === "conversation" ? "cyan" : "gray"} dimColor>{fullDivider}</Text>
 
-      {/* Body row: sidebar + message area side by side */}
-        <Box flexDirection="row" height={bodyHeight}>
+      {/* Body row: sidebar + message area — hidden when any overlay is open */}
+      {!anyOverlayOpen && <Box flexDirection="row" height={bodyHeight}>
           <Sidebar
             instances={instances}
             currentSessionId={selectedSessionId}
             cursorIndex={sidebarCursor}
             focused={focus === "sidebar"}
             height={bodyHeight}
+            width={sidebarWidth}
+            compact={sidebarCompact}
           />
 
         <Box flexDirection="column" flexGrow={1} height={bodyHeight}>
@@ -819,7 +1310,7 @@ export function Conversation() {
                     <Box paddingLeft={3}>
                       <Text color={isRunning ? "yellow" : "gray"} wrap="truncate">{line.question}</Text>
                     </Box>
-                    {isRunning && (
+                    {isRunning && line.options.length === 0 && (
                       <Box paddingLeft={3}>
                         <Text dimColor>press </Text>
                         <Text color="cyan" bold>a</Text>
@@ -864,25 +1355,61 @@ export function Conversation() {
                   <Text dimColor>Sending...</Text>
                 ) : mode === "insert" ? (
                   <Box>
-                    <Text color={focus === "conversation" ? "cyan" : "gray"}>❯ </Text>
-                    <TextInput
-                      value={inputText}
-                      onChange={(val) => {
-                        if (ctrlPressed.current) {
-                          ctrlPressed.current = false
-                          return  // discard any character added by a Ctrl combo
-                        }
-                        setInputText(val)
-                      }}
-                      onSubmit={(text) => { void sendMessage(text) }}
-                      placeholder="Type a message...  (^X E: editor)"
-                      focus={!pendingCtrlX}
-                    />
+                    {titleMode ? (
+                      <>
+                        <Text color="cyan" bold>title {">"} </Text>
+                        <TextInput
+                          value={titleText}
+                          onChange={(val) => {
+                            if (ctrlPressed.current) { ctrlPressed.current = false; return }
+                            setTitleText(val)
+                          }}
+                          onSubmit={(text) => { void doRenameTitle(text) }}
+                          placeholder="new session title..."
+                          focus={true}
+                        />
+                      </>
+                    ) : commitMode ? (
+                      <>
+                        <Text color="yellow" bold>commit {">"} </Text>
+                        <TextInput
+                          value={commitText}
+                          onChange={(val) => {
+                            if (ctrlPressed.current) { ctrlPressed.current = false; return }
+                            setCommitText(val)
+                          }}
+                          onSubmit={(text) => { void doCommit(text) }}
+                          placeholder="commit message..."
+                          focus={true}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <><Text color="yellow">{currentAgent?.name ?? "agent"}</Text><Text color={focus === "conversation" ? "cyan" : "gray"}> [{currentModel?.label ?? "model"}] ❯ </Text></>
+                        <TextInput
+                          value={inputText}
+                          onChange={(val) => {
+                            if (ctrlPressed.current || pendingChord.current) { ctrlPressed.current = false; return }
+                            setInputText(val)
+                          }}
+                          onSubmit={(text) => { void sendMessage(text) }}
+                          placeholder="Type a message...  (^X E: editor  ^X M: model)"
+                          focus={!pendingCtrlX && !modelPickerOpen}
+                        />
+                      </>
+                    )}
                   </Box>
                 ) : (
-                  <Text dimColor>› Press <Text color={focus === "conversation" ? "cyan" : "gray"} bold>i</Text> to type a message</Text>
+                  <><Text color="yellow" dimColor>{currentAgent?.name ?? "agent"}</Text><Text dimColor> [{currentModel?.label ?? "model"}] › Press <Text color={focus === "conversation" ? "cyan" : "gray"} bold>i</Text> to type a message</Text></>
                 )}
               </Box>
+              {commitStatus && (
+                <Box paddingLeft={1}>
+                  <Text color={commitStatus.startsWith("✓") ? "green" : commitStatus.startsWith("✗") ? "red" : "yellow"}>
+                    {commitStatus}
+                  </Text>
+                </Box>
+              )}
               {sendError && (
                 <Box paddingLeft={1}>
                   <Text color="red">{sendError}</Text>
@@ -899,20 +1426,29 @@ export function Conversation() {
             </>
           )}
         </Box>
-      </Box>
+      </Box>}
+
+      {/* Overlays — rendered instead of body when open */}
+      {anyOverlayOpen && <Box flexDirection="column" height={bodyHeight} overflow="hidden">
 
       {/* Help overlay */}
       {showHelp && (
-        <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan">
+        <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan" width={effectiveWidth}>
           <Box><Text bold color="cyan">Conversation Keybindings</Text></Box>
           <Box flexDirection="column" paddingLeft={2}>
             <Box><Box width={16}><Text bold color="white">i</Text></Box><Text dimColor>insert mode (type message)</Text></Box>
+            <Box><Box width={16}><Text bold color="white">e</Text></Box><Text dimColor>open editor (normal mode)</Text></Box>
+            <Box><Box width={16}><Text bold color="white">c</Text></Box><Text dimColor>commit session files + push</Text></Box>
+            <Box><Box width={16}><Text bold color="white">t</Text></Box><Text dimColor>rename session title</Text></Box>
             <Box><Box width={16}><Text bold color="white">Esc</Text></Box><Text dimColor>normal mode</Text></Box>
             <Box><Box width={16}><Text bold color="white">^W ^W</Text></Box><Text dimColor>toggle sidebar focus</Text></Box>
             <Box><Box width={16}><Text bold color="white">j/k</Text></Box><Text dimColor>scroll messages</Text></Box>
             <Box><Box width={16}><Text bold color="white">^U/^D</Text></Box><Text dimColor>half page up/down</Text></Box>
             <Box><Box width={16}><Text bold color="white">G/gg</Text></Box><Text dimColor>scroll to bottom/top</Text></Box>
-            <Box><Box width={16}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>cycle agent/model</Text></Box>
+            <Box><Box width={16}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>cycle agent</Text></Box>
+            <Box><Box width={16}><Text bold color="white">m</Text></Box><Text dimColor>select model</Text></Box>
+            <Box><Box width={16}><Text bold color="white">^X M</Text></Box><Text dimColor>model picker (insert)</Text></Box>
+            <Box><Box width={16}><Text bold color="white">f</Text></Box><Text dimColor>edit session files</Text></Box>
             <Box><Box width={16}><Text bold color="white">a</Text></Box><Text dimColor>attach opencode TUI</Text></Box>
             <Box><Box width={16}><Text bold color="white">n</Text></Box><Text dimColor>spawn new session</Text></Box>
             <Box><Box width={16}><Text bold color="white">w</Text></Box><Text dimColor>worktree session</Text></Box>
@@ -924,6 +1460,114 @@ export function Conversation() {
           <Text dimColor>Press any key to close</Text>
         </Box>
       )}
+
+      {/* Inline question answering overlay */}
+      {pendingQuestion && pendingQuestion.questions[0] && (() => {
+        const q = pendingQuestion.questions[0]!
+        return (
+          <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="yellow" width={effectiveWidth}>
+            <Box><Text bold color="yellow">❓ {q.header}</Text></Box>
+            <Box paddingLeft={2}><Text color="yellow">{q.question}</Text></Box>
+            <Box><Text> </Text></Box>
+            {questionCustomMode ? (
+              <Box paddingLeft={3} marginTop={1}>
+                <Text color="cyan">› </Text>
+                <Text>{questionCustomText}</Text>
+                <Text color="cyan" dimColor>│</Text>
+              </Box>
+            ) : (
+              questionOpts.map((opt, i) => {
+                const isCursor = i === questionCursor
+                return (
+                  <Box key={`opt-${i}`} paddingLeft={1}>
+                    <Text color={isCursor ? "yellow" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                    <Text dimColor>{String(i + 1)}. </Text>
+                    <Text bold={isCursor} color={isCursor ? "yellow" : undefined} dimColor={!isCursor}>{opt.label}</Text>
+                    {opt.description && <Text dimColor>  {opt.description}</Text>}
+                  </Box>
+                )
+              })
+            )}
+            <Text dimColor>
+              {questionCustomMode
+                ? "Enter: submit  Esc: back"
+                : `j/k: nav  Enter: select  1-${questionOpts.length}: quick  Esc: dismiss`}
+            </Text>
+          </Box>
+        )
+      })()}
+
+      {/* Model picker overlay */}
+      {modelPickerOpen && (() => {
+        const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
+        const visibleModels = availableModels.slice(modelPickerScroll, modelPickerScroll + MAX_VISIBLE)
+        const showScrollUp = modelPickerScroll > 0
+        const showScrollDown = modelPickerScroll + MAX_VISIBLE < availableModels.length
+        return (
+          <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan" width={effectiveWidth}>
+            <Box>
+              <Text bold color="cyan">Select Model</Text>
+              <Text dimColor>  {availableModels.length} available</Text>
+            </Box>
+            {showScrollUp && <Box paddingLeft={1}><Text dimColor>  ↑ {modelPickerScroll} more</Text></Box>}
+            {visibleModels.map((m, vi) => {
+              const i = vi + modelPickerScroll
+              const isCursor = i === modelPickerCursor
+              const isCurrent = currentModel &&
+                m.providerID === currentModel.providerID &&
+                m.modelID === currentModel.modelID
+              return (
+                <Box key={`model-${i}`} paddingLeft={1}>
+                  <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                  <Text dimColor>{String(i + 1).padStart(3)}. </Text>
+                  <Text bold={!!isCurrent} color={isCursor ? "cyan" : isCurrent ? "white" : undefined} dimColor={!isCursor && !isCurrent}>
+                    {m.label}
+                  </Text>
+                  <Text dimColor>  {m.providerID}</Text>
+                  {isCurrent && <Text color="green" dimColor>  ✓</Text>}
+                </Box>
+              )
+            })}
+            {showScrollDown && <Box paddingLeft={1}><Text dimColor>  ↓ {availableModels.length - modelPickerScroll - MAX_VISIBLE} more</Text></Box>}
+            <Text dimColor>j/k: nav  Enter: select  Esc: cancel</Text>
+          </Box>
+        )
+      })()}
+
+      {/* File picker overlay */}
+      {filePickerOpen && (() => {
+        const MAX_VISIBLE_F = Math.min(20, Math.max(5, termHeight - 10))
+        const visibleFiles = filePickerFiles.slice(filePickerScroll, filePickerScroll + MAX_VISIBLE_F)
+        const showScrollUpF = filePickerScroll > 0
+        const showScrollDownF = filePickerScroll + MAX_VISIBLE_F < filePickerFiles.length
+        return (
+          <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan" width={effectiveWidth}>
+            <Box>
+              <Text bold color="cyan">Session Files</Text>
+              <Text dimColor>  {filePickerFiles.length} modified</Text>
+            </Box>
+            {showScrollUpF && <Box paddingLeft={1}><Text dimColor>  ↑ {filePickerScroll} more</Text></Box>}
+            {visibleFiles.map((f, vi) => {
+              const i = vi + filePickerScroll
+              const isCursor = i === filePickerCursor
+              const display = f.startsWith(sessionCwd + "/")
+                ? f.slice(sessionCwd.length + 1)
+                : f
+              return (
+                <Box key={`file-${i}`} paddingLeft={1}>
+                  <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                  <Text dimColor>{String(i + 1)}. </Text>
+                  <Text color={isCursor ? "cyan" : undefined} dimColor={!isCursor} wrap="truncate">{display}</Text>
+                </Box>
+              )
+            })}
+            {showScrollDownF && <Box paddingLeft={1}><Text dimColor>  ↓ {filePickerFiles.length - filePickerScroll - MAX_VISIBLE_F} more</Text></Box>}
+            <Text dimColor>j/k: nav  Enter: open  a: open all  Esc: cancel</Text>
+          </Box>
+        )
+      })()}
+
+      </Box>}
 
       {/* Kill confirmation */}
       {killConfirm && (
@@ -944,9 +1588,9 @@ export function Conversation() {
       <Box paddingX={1} paddingY={0} borderStyle="single" borderColor="gray">
         <Text dimColor wrap="truncate">
           {isLive && mode === "insert"
-            ? `Esc: normal  Enter: send  ^XE: editor`
+            ? (titleMode ? `Esc: cancel  Enter: rename` : commitMode ? `Esc: cancel  Enter: commit and push` : `Esc: normal  Enter: send  ^XE: editor`)
             : isLive
-            ? `q: back  i: insert  ^W^W: sidebar  Tab: agent  a: attach  j/k: scroll  w: worktree  ? help`
+            ? `q: back  i: insert  e: edit  c: commit  t: title  m: model  f: files  s: sidebar  ^W^W: focus  Tab: agent  a: attach  j/k: scroll  ? help`
             : `q: back  a/i/Enter: attach  j/k: scroll  ^U/^D: ½pg  G/gg: nav`
           }
         </Text>

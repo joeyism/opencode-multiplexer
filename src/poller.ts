@@ -12,6 +12,17 @@ import {
   getMostRecentSessionForProject,
 } from "./db/reader.js"
 
+/**
+ * Derive a display-friendly repo name from a directory path.
+ * For ocmux-created worktrees at `<repo>/.worktrees/<branch>`, returns
+ * the repo directory name instead of the branch directory name.
+ */
+export function deriveRepoName(dir: string): string {
+  const idx = dir.indexOf("/.worktrees/")
+  if (idx !== -1) return basename(dir.slice(0, idx))
+  return basename(dir)
+}
+
 export function shortenModel(model: string): string {
   let s = model
   // Strip org prefix e.g. "deepseek-ai/deepseek-v3.2" → "deepseek-v3.2"
@@ -195,24 +206,19 @@ function loadFromDb(): void {
         sessionTitle: session.title || sessionId.slice(0, 20),
         projectId: project.id,
         worktree: instanceWorktree,
-        repoName: basename(instanceWorktree),
+        repoName: deriveRepoName(instanceWorktree),
         status,
         lastPreview: preview.text,
         lastPreviewRole: preview.role,
         hasChildren: hasChildSessions(sessionId),
         model: rawModel ? shortenModel(rawModel) : null,
         port: proc.port ?? null,
+        timeUpdated: session.timeUpdated,
       })
     }
 
-    // Sort: needs-input first, then working, then idle, then error
-    ocmInstances.sort((a, b) => {
-      const pa = STATUS_PRIORITY[a.status]
-      const pb = STATUS_PRIORITY[b.status]
-      if (pa !== pb) return pa - pb
-      // Secondary sort: repo name alphabetically
-      return a.repoName.localeCompare(b.repoName)
-    })
+    // Sort: most recently updated first
+    ocmInstances.sort((a, b) => b.timeUpdated - a.timeUpdated)
 
     useStore.getState().setInstances(ocmInstances)
 

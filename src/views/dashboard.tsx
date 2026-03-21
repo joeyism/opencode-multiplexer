@@ -1,5 +1,6 @@
 import React from "react"
 import { Box, Text, useStdout, useInput } from "ink"
+import TextInput from "ink-text-input"
 import {
   type OcmInstance,
   type OcmSession,
@@ -9,10 +10,14 @@ import {
 import { useDashboardKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode } from "../hooks/use-attach.js"
 import { config } from "../config.js"
-import { refreshNow, shortenModel } from "../poller.js"
-import { killInstance } from "../registry/instances.js"
-import { statusIcon } from "./helpers.js"
+import { refreshNow, shortenModel, deriveRepoName } from "../poller.js"
+import { createOpencodeClient } from "@opencode-ai/sdk"
+import { ensureServeProcess, killInstance } from "../registry/instances.js"
+import { statusIcon, relativeTime } from "./helpers.js"
+import { APP_BORDER_COLS } from "./layout.js"
 import {
+  getAllSessions,
+  type DbSessionWithProject,
   getChildSessions,
   countChildSessions,
   hasChildSessions,
@@ -49,17 +54,6 @@ function buildChildOcmSession(c: { id: string; projectId: string; title: string;
 }
 
 // ─── Time helpers ─────────────────────────────────────────────────────────────
-
-function relativeTime(ts: number): string {
-  const seconds = Math.floor((Date.now() - ts) / 1000)
-  if (seconds < 60) return "just now"
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m ago`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours}h ago`
-  const days = Math.floor(hours / 24)
-  return `${days}d ago`
-}
 
 // ─── Agent type extraction ────────────────────────────────────────────────────
 
@@ -189,15 +183,59 @@ export function Dashboard() {
   const setChildScrollOffset = useStore((s) => s.setChildScrollOffset)
   const { stdout } = useStdout()
   const termWidth = stdout?.columns ?? 80
+  const effectiveWidth = termWidth - APP_BORDER_COLS   // account for App border (left + right)
 
   const [showHelp, setShowHelp] = React.useState(false)
   const [killConfirm, setKillConfirm] = React.useState<OcmInstance | null>(null)
+  const [titleRenameTarget, setTitleRenameTarget] = React.useState<{
+    sessionId: string
+    port: number | null
+    worktree: string
+    currentTitle: string
+  } | null>(null)
+  const [titleText, setTitleText] = React.useState("")
+  const [titleStatus, setTitleStatus] = React.useState<string | null>(null)
+  // Session picker overlay
+  const [sessionPickerOpen, setSessionPickerOpen] = React.useState(false)
+  const [sessionPickerCursor, setSessionPickerCursor] = React.useState(0)
+  const [sessionPickerScroll, setSessionPickerScroll] = React.useState(0)
+  const [sessionPickerFilter, setSessionPickerFilter] = React.useState("")
+  const [sessionPickerSessions, setSessionPickerSessions] = React.useState<DbSessionWithProject[]>([])
+  const [sessionPickerLoading, setSessionPickerLoading] = React.useState(false)
+  const sessionPickerMaxVisible = Math.min(20, Math.max(5, (stdout?.rows ?? 24) - 10))
+  const filteredSessions = React.useMemo(() => {
+    if (!sessionPickerFilter.trim()) return sessionPickerSessions
+    const lower = sessionPickerFilter.toLowerCase()
+    return sessionPickerSessions.filter((s) => {
+      const repo = deriveRepoName(s.projectWorktree).toLowerCase()
+      const title = s.title.toLowerCase()
+      const dir = s.directory.toLowerCase()
+      return title.includes(lower) || repo.includes(lower) || dir.includes(lower)
+    })
+  }, [sessionPickerSessions, sessionPickerFilter])
+  React.useEffect(() => {
+    setSessionPickerCursor((c) => {
+      const maxIdx = Math.max(filteredSessions.length - 1, 0)
+      return Math.max(0, Math.min(c, maxIdx))
+    })
+    setSessionPickerScroll((s) => {
+      const maxScroll = Math.max(filteredSessions.length - sessionPickerMaxVisible, 0)
+      return Math.min(s, maxScroll)
+    })
+  }, [filteredSessions.length, sessionPickerMaxVisible])
 
   // Kill confirmation input handler
   useInput((input, key) => {
     // Ctrl-C: exit app (exitOnCtrlC is disabled globally so we handle it here)
     if (key.ctrl && input === "c") {
       process.exit(0)
+    }
+    if (titleRenameTarget) {
+      if (key.escape || (key.ctrl && input === "c")) {
+        setTitleRenameTarget(null)
+        setTitleText("")
+      }
+      return
     }
     if (!killConfirm) return
     if (input === "y" || input === "Y") {
@@ -208,6 +246,78 @@ export function Dashboard() {
       setKillConfirm(null)
     }
   })
+
+  useInput((input, key) => {
+    if (!sessionPickerOpen) return
+
+    if (key.downArrow || (key.ctrl && input === "n")) {
+      const next = Math.min(sessionPickerCursor + 1, Math.max(filteredSessions.length - 1, 0))
+      setSessionPickerCursor(next)
+      setSessionPickerScroll((s) => next >= s + sessionPickerMaxVisible ? next - sessionPickerMaxVisible + 1 : s)
+    } else if (key.upArrow || (key.ctrl && input === "p")) {
+      const next = Math.max(sessionPickerCursor - 1, 0)
+      setSessionPickerCursor(next)
+      setSessionPickerScroll((s) => (next < s ? next : s))
+    } else if (key.return) {
+      const session = filteredSessions[sessionPickerCursor]
+      if (session && !sessionPickerLoading) {
+        setSessionPickerOpen(false)
+        setSessionPickerLoading(true)
+        ensureServeProcess(session.projectWorktree)
+          .then(() => {
+            navigate("conversation", session.projectId, session.id)
+          })
+          .catch((e) => {
+            setTitleStatus(`✗ Failed to start session: ${String(e)}`)
+            setTimeout(() => setTitleStatus(null), 2500)
+          })
+          .finally(() => {
+            setSessionPickerLoading(false)
+          })
+      }
+    } else if (key.escape) {
+      if (sessionPickerFilter) {
+        setSessionPickerFilter("")
+        setSessionPickerCursor(0)
+        setSessionPickerScroll(0)
+      } else {
+        setSessionPickerOpen(false)
+      }
+    } else if (key.backspace || key.delete) {
+      setSessionPickerFilter((f) => f.slice(0, -1))
+      setSessionPickerCursor(0)
+      setSessionPickerScroll(0)
+    } else if (input && !key.ctrl && !key.meta) {
+      setSessionPickerFilter((f) => f + input)
+      setSessionPickerCursor(0)
+      setSessionPickerScroll(0)
+    }
+  })
+
+  const doRenameTitle = React.useCallback(async (newTitle: string) => {
+    if (!titleRenameTarget || !newTitle.trim()) return
+    try {
+      let port = titleRenameTarget.port
+      if (!port) {
+        port = await ensureServeProcess(titleRenameTarget.worktree)
+      }
+      if (!port) throw new Error("unable to determine serve port")
+      const client = createOpencodeClient({ baseUrl: `http://localhost:${port}` })
+      await (client.session as any).update({
+        path: { id: titleRenameTarget.sessionId },
+        body: { title: newTitle.trim() },
+      })
+      setTitleStatus("✓ title updated")
+      setTimeout(() => setTitleStatus(null), 1500)
+      refreshNow()
+    } catch (e) {
+      setTitleStatus(`✗ ${String(e)}`)
+      setTimeout(() => setTitleStatus(null), 2500)
+    } finally {
+      setTitleRenameTarget(null)
+      setTitleText("")
+    }
+  }, [titleRenameTarget])
 
   const visibleRows = React.useMemo(
     () => buildRows(instances, expandedSessions, childSessions, childScrollOffsets),
@@ -355,14 +465,52 @@ export function Dashboard() {
         setKillConfirm(currentRow.instance)
       }
     },
+    onRenameTitle: () => {
+      if (!currentRow) return
+      if (currentRow.kind === "instance") {
+        setTitleRenameTarget({
+          sessionId: currentRow.instance.sessionId,
+          port: currentRow.instance.port,
+          worktree: currentRow.instance.worktree,
+          currentTitle: currentRow.instance.sessionTitle,
+        })
+        setTitleText(currentRow.instance.sessionTitle)
+      } else if (currentRow.kind === "child") {
+        const parentInst = (() => {
+          for (let i = safeRowIndex; i >= 0; i--) {
+            const row = visibleRows[i]
+            if (row?.kind === "instance") {
+              return row.instance
+            }
+          }
+          return undefined
+        })()
+        if (!parentInst) return
+        setTitleRenameTarget({
+          sessionId: currentRow.session.id,
+          port: parentInst.port,
+          worktree: parentInst.worktree,
+          currentTitle: currentRow.session.title,
+        })
+        setTitleText(currentRow.session.title)
+      }
+    },
     onRescan: () => { refreshNow() },
     onHelp: () => setShowHelp((v) => !v),
+    onSessions: () => {
+      const sessions = getAllSessions(500)
+      setSessionPickerSessions(sessions)
+      setSessionPickerCursor(0)
+      setSessionPickerScroll(0)
+      setSessionPickerFilter("")
+      setSessionPickerOpen(true)
+    },
     onQuit: () => {
       if (showHelp) { setShowHelp(false); return }
       if (killConfirm) { setKillConfirm(null); return }
       process.exit(0)
     },
-  })
+  }, !titleRenameTarget && !sessionPickerOpen)
 
   const kb = config.keybindings.dashboard
 
@@ -394,7 +542,7 @@ export function Dashboard() {
         {statusCounts.error > 0 && <Text><Text dimColor>  │  </Text><Text color="red">✖ {statusCounts.error} error</Text></Text>}
       </Box>
 
-      {/* Help overlay */}
+      {/* Help overlay and session picker */}
       {showHelp ? (
         <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor="cyan" marginX={2} marginY={1}>
           <Box marginBottom={1}><Text bold color="cyan">Dashboard Keybindings</Text></Box>
@@ -408,12 +556,64 @@ export function Dashboard() {
             <Box><Box width={12}><Text bold color="white">{kb.worktree}</Text></Box><Text dimColor>create worktree session</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.kill}</Text></Box><Text dimColor>kill selected instance</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.rescan}</Text></Box><Text dimColor>refresh from database</Text></Box>
+            <Box><Box width={12}><Text bold color="white">t</Text></Box><Text dimColor>rename title</Text></Box>
+            <Box><Box width={12}><Text bold color="white">s</Text></Box><Text dimColor>browse past sessions</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.help}</Text></Box><Text dimColor>close help</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.quit}</Text></Box><Text dimColor>quit</Text></Box>
           </Box>
           <Box marginTop={1}>
             <Text dimColor>Press </Text><Text bold color="white">{kb.help}</Text><Text dimColor> or </Text><Text bold color="white">{kb.quit}</Text><Text dimColor> to close</Text>
           </Box>
+        </Box>
+      ) : sessionPickerOpen ? (
+        <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor="cyan" marginX={2} marginY={1}>
+          <Box>
+            <Text bold color="cyan">Sessions</Text>
+            <Text dimColor>  {filteredSessions.length} of {sessionPickerSessions.length}</Text>
+          </Box>
+          <Box>
+            <Text color="cyan">› </Text>
+            <Text>{sessionPickerFilter}</Text>
+            <Text color="cyan" dimColor>│</Text>
+          </Box>
+          {(() => {
+            const visibleSessions = filteredSessions.slice(sessionPickerScroll, sessionPickerScroll + sessionPickerMaxVisible)
+            const showScrollUp = sessionPickerScroll > 0
+            const showScrollDown = sessionPickerScroll + sessionPickerMaxVisible < filteredSessions.length
+            return (
+              <>
+                {showScrollUp && <Box paddingLeft={1}><Text dimColor>  ↑ {sessionPickerScroll} more</Text></Box>}
+                {visibleSessions.map((session, vi) => {
+                  const i = vi + sessionPickerScroll
+                  const isCursor = i === sessionPickerCursor
+                  const repo = deriveRepoName(session.projectWorktree)
+                  const timeAgo = relativeTime(session.timeUpdated)
+                  const isRunning = instances.some((inst) => inst.sessionId === session.id)
+                  const label = `${repo} / ${session.title}`
+                   const maxLabelLen = Math.max(20, effectiveWidth - 16 - timeAgo.length)
+                  const truncLabel = label.length > maxLabelLen
+                    ? label.slice(0, maxLabelLen - 1) + "…"
+                    : label
+                  return (
+                    <Box key={session.id} paddingLeft={1}>
+                      <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                      {isRunning
+                        ? <Text color="green">▶ </Text>
+                        : <Text dimColor>○ </Text>}
+                      <Text bold={isCursor} dimColor={!isCursor}>{truncLabel}</Text>
+                      <Text dimColor>  {timeAgo}</Text>
+                    </Box>
+                  )
+                })}
+                {showScrollDown && (
+                  <Box paddingLeft={1}>
+                    <Text dimColor>  ↓ {filteredSessions.length - sessionPickerScroll - sessionPickerMaxVisible} more</Text>
+                  </Box>
+                )}
+              </>
+            )
+          })()}
+          <Text dimColor>↑↓/Ctrl-N/P: nav  Enter: open  Esc: {sessionPickerFilter ? "clear filter" : "close"}  type to filter</Text>
         </Box>
       ) : (
         <>
@@ -454,12 +654,14 @@ export function Dashboard() {
 
               // Fixed prefix: paddingLeft(1) + cursor(2) + icon(2) + expand(2) = 7 chars
               const model = row.instance.model
+              const timeAgoStr = relativeTime(row.instance.timeUpdated)
               const modelStr = model ? model + "  " : ""
               const modelLen = modelStr.length
-              const labelLen = Math.min(36, Math.floor((termWidth - 7 - modelLen - 2) * 0.55))
+              const timeLen = timeAgoStr.length + 2  // "  2m"
+                 const labelLen = Math.min(36, Math.floor((effectiveWidth - 7 - modelLen - timeLen - 2) * 0.55))
               const label = `${row.instance.repoName} / ${row.instance.sessionTitle}`
               const truncLabel = label.length > labelLen ? label.slice(0, labelLen - 1) + "…" : label.padEnd(labelLen)
-              const previewLen = Math.max(0, termWidth - 7 - labelLen - modelLen - 2)
+                 const previewLen = Math.max(0, effectiveWidth - 7 - labelLen - modelLen - timeLen - 2)
               const truncPreview = preview.length > previewLen ? preview.slice(0, Math.max(0, previewLen - 1)) + (previewLen > 1 ? "…" : "") : preview
 
               return (
@@ -469,6 +671,7 @@ export function Dashboard() {
                   <Text dimColor>{expandChar}</Text>
                   <Text bold={isCursor}>{truncLabel}</Text>
                   {model && <Text color="cyan" dimColor>  {model}</Text>}
+                  <Text dimColor>  {timeAgoStr}</Text>
                   <Text dimColor wrap="truncate">  {truncPreview}</Text>
                 </Box>
               )
@@ -505,6 +708,24 @@ export function Dashboard() {
             return null
           })}
 
+          {titleRenameTarget && (
+            <Box paddingX={1} borderStyle="single" borderColor="yellow" marginTop={1}>
+              <Text color="yellow" bold>rename › </Text>
+              <TextInput
+                value={titleText}
+                onChange={setTitleText}
+                onSubmit={(text) => { void doRenameTitle(text) }}
+                placeholder="new title..."
+                focus={true}
+              />
+            </Box>
+          )}
+          {titleStatus && (
+            <Box paddingX={1}>
+              <Text color={titleStatus.startsWith("✓") ? "green" : "red"}>{titleStatus}</Text>
+            </Box>
+          )}
+
           {killConfirm ? (
             <Box marginTop={1} paddingX={2} paddingY={0} borderStyle="single" borderColor="red">
               <Text color="red">Kill </Text>
@@ -530,8 +751,10 @@ export function Dashboard() {
                <Box gap={3}>
                  <Text><Text bold color="white">{kb.spawn}</Text> <Text dimColor>new</Text></Text>
                  <Text><Text bold color="white">{kb.worktree}</Text> <Text dimColor>worktree</Text></Text>
+                 <Text><Text bold color="white">s</Text> <Text dimColor>sessions</Text></Text>
                  <Text><Text bold color="white">{kb.kill}</Text> <Text dimColor>kill</Text></Text>
-                 <Text><Text bold color="white">?</Text> <Text dimColor>help</Text></Text>
+                  <Text><Text bold color="white">t</Text> <Text dimColor>rename</Text></Text>
+                  <Text><Text bold color="white">?</Text> <Text dimColor>help</Text></Text>
                  <Text><Text bold color="white">{kb.quit}</Text> <Text dimColor>quit</Text></Text>
                </Box>
             </Box>

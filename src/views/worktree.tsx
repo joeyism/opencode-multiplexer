@@ -44,7 +44,8 @@ function runFzf(): string | undefined {
       .join(" ")
 
     // Search for .git directories and strip the /.git suffix to get repo roots
-    const cmd = `find ${searchPaths} -maxdepth 4 -name .git -type d 2>/dev/null | sed 's/\/.git$//' | sort -u | fzf --prompt="Select repo: " --height=40%`
+    // Use # as sed delimiter to avoid escaping issues with /
+    const cmd = `find ${searchPaths} -maxdepth 4 -name .git -type d 2>/dev/null | sed 's#/.git$##' | sort -u | fzf --prompt="Select repo: " --height=40%`
     const result = execSync(cmd, {
       stdio: ["inherit", "pipe", "inherit"],
       encoding: "utf-8",

@@ -12,9 +12,11 @@ type DashboardActions = {
   onCollapse?: () => void
   onNextNeedsInput?: () => void
   onKill?: () => void
+  onRenameTitle?: () => void
   onQuit?: () => void
   onHelp?: () => void
   onRescan?: () => void
+  onSessions?: () => void
 }
 
 type ConversationActions = {
@@ -60,23 +62,28 @@ function matchKey(key: string, input: string, inkKey: any): boolean {
   }
 }
 
-export function useDashboardKeys(actions: DashboardActions) {
+export function useDashboardKeys(actions: DashboardActions, isActive = true) {
   const kb = config.keybindings.dashboard
-  useInput((input, key) => {
-    if (matchKey(kb.up, input, key) || key.upArrow) actions.onUp?.()
-    else if (matchKey(kb.down, input, key) || key.downArrow) actions.onDown?.()
-    else if (matchKey(kb.open, input, key)) actions.onOpen?.()
-    else if (matchKey(kb.attach, input, key)) actions.onAttach?.()
-    else if (matchKey(kb.worktree, input, key)) actions.onWorktree?.()
-    else if (matchKey(kb.spawn, input, key)) actions.onSpawn?.()
-    else if (matchKey(kb.expand, input, key)) actions.onExpand?.()
-    else if (matchKey(kb.collapse, input, key)) actions.onCollapse?.()
-    else if (matchKey(kb.nextNeedsInput, input, key)) actions.onNextNeedsInput?.()
-    else if (matchKey(kb.kill, input, key)) actions.onKill?.()
-    else if (matchKey(kb.quit, input, key)) actions.onQuit?.()
-    else if (matchKey(kb.help, input, key)) actions.onHelp?.()
-    else if (matchKey(kb.rescan, input, key)) actions.onRescan?.()
-  })
+  useInput(
+    (input, key) => {
+      if (matchKey(kb.up, input, key) || key.upArrow) actions.onUp?.()
+      else if (matchKey(kb.down, input, key) || key.downArrow) actions.onDown?.()
+      else if (matchKey(kb.open, input, key)) actions.onOpen?.()
+      else if (matchKey(kb.attach, input, key)) actions.onAttach?.()
+      else if (matchKey(kb.worktree, input, key)) actions.onWorktree?.()
+      else if (matchKey(kb.spawn, input, key)) actions.onSpawn?.()
+      else if (matchKey(kb.expand, input, key)) actions.onExpand?.()
+      else if (matchKey(kb.collapse, input, key)) actions.onCollapse?.()
+      else if (matchKey(kb.nextNeedsInput, input, key)) actions.onNextNeedsInput?.()
+      else if (matchKey(kb.kill, input, key)) actions.onKill?.()
+      else if (matchKey(kb.renameTitle, input, key)) actions.onRenameTitle?.()
+      else if (matchKey(kb.quit, input, key)) actions.onQuit?.()
+      else if (matchKey(kb.help, input, key)) actions.onHelp?.()
+      else if (matchKey(kb.rescan, input, key)) actions.onRescan?.()
+      else if (matchKey(kb.sessions, input, key)) actions.onSessions?.()
+    },
+    { isActive },
+  )
 }
 
 export function useConversationKeys(actions: ConversationActions) {

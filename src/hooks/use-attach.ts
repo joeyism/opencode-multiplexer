@@ -124,6 +124,35 @@ export function openInEditor(currentText: string, onResult: (text: string) => vo
 }
 
 /**
+ * Open one or more project files in $EDITOR, unmounting Ink during the edit.
+ * Unlike openInEditor, this opens actual file paths — no temp file or content capture.
+ */
+export function openFileInEditor(filePaths: string | string[]): void {
+  if (!_inkInstance) return
+
+  const editor = process.env.EDITOR || process.env.VISUAL || "vi"
+  const paths = Array.isArray(filePaths) ? filePaths : [filePaths]
+  const quotedPaths = paths.map((p) => JSON.stringify(p)).join(" ")
+
+  _inkInstance.unmount()
+  _inkInstance = null
+
+  if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN)
+
+  try {
+    execSync(`${editor} ${quotedPaths}`, { stdio: "inherit" })
+  } catch { /* non-zero exit is fine */ }
+
+  if (process.stdout.isTTY) process.stdout.write(ENTER_ALT_SCREEN + CLEAR_SCREEN)
+
+  // Remount OCMux
+  import("../app.js").then(({ App }) => {
+    _inkInstance = render(React.createElement(App), { exitOnCtrlC: false })
+    setInkInstance(_inkInstance)
+  }).catch(console.error)
+}
+
+/**
  * Check if opencode binary is available on PATH.
  */
 export function isOpencodeAvailable(): boolean {
