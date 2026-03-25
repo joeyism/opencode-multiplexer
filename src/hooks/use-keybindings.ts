@@ -31,6 +31,7 @@ type ConversationActions = {
   onScrollPageDown?: () => void
   onScrollBottom?: () => void
   onScrollTop?: () => void
+  onShell?: () => void
 }
 
 type SpawnActions = {
@@ -100,6 +101,7 @@ export function useConversationKeys(actions: ConversationActions) {
     else if (matchKey(kb.scrollPageDown, input, key)) actions.onScrollPageDown?.()
     else if (matchKey(kb.scrollBottom, input, key) && key.shift) actions.onScrollBottom?.()
     else if (matchKey(kb.scrollTop, input, key) && !key.shift) actions.onScrollTop?.()
+    else if (matchKey(kb.shell, input, key)) actions.onShell?.()
   })
 }
 

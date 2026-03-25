@@ -6,6 +6,10 @@ import type { SessionStatus } from "../store.js"
 
 const DB_PATH = join(homedir(), ".local", "share", "opencode", "opencode.db")
 
+/** Tool names that indicate the session needs user input */
+export const NEEDS_INPUT_TOOLS = ["question", "plan_exit"] as const
+const NEEDS_INPUT_SQL = NEEDS_INPUT_TOOLS.map((t) => `'${t}'`).join(", ")
+
 let _db: Database | null = null
 
 function getDb(): Database {
@@ -219,7 +223,7 @@ export function getMostRecentSessionForProject(projectId: string, offset = 0): D
 export function getSessionStatus(sessionId: string): SessionStatus {
   const db = getDb()
 
-  // Check for a running question tool in the latest message → needs-input
+  // Check for a running question/plan_exit tool in the latest message → needs-input
   // (agent is showing a question/multiselect prompt to the user)
   const questionRow = db
     .query<{ cnt: number }, [string, string]>(
@@ -227,16 +231,16 @@ export function getSessionStatus(sessionId: string): SessionStatus {
        FROM part p
        WHERE p.session_id = ?
          AND json_extract(p.data, '$.type') = 'tool'
-         AND json_extract(p.data, '$.tool') = 'question'
-         AND json_extract(p.data, '$.state.status') = 'running'
-         AND p.message_id = (
+          AND json_extract(p.data, '$.tool') IN (${NEEDS_INPUT_SQL})
+          AND json_extract(p.data, '$.state.status') = 'running'
+          AND p.message_id = (
            SELECT id FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 1
          )`,
     )
     .get(sessionId, sessionId)
   if ((questionRow?.cnt ?? 0) > 0) return "needs-input"
 
-  // Also check DIRECT child sessions for running questions → needs-input
+  // Also check DIRECT child sessions for running questions/plan_exit → needs-input
   // (a subagent/task dispatched by this session is asking a question)
   const childQuestionRow = db
     .query<{ cnt: number }, [string]>(
@@ -247,8 +251,8 @@ export function getSessionStatus(sessionId: string): SessionStatus {
        WHERE s.parent_id = ?
          AND s.time_archived IS NULL
          AND json_extract(p.data, '$.type') = 'tool'
-         AND json_extract(p.data, '$.tool') = 'question'
-         AND json_extract(p.data, '$.state.status') = 'running'`,
+          AND json_extract(p.data, '$.tool') IN (${NEEDS_INPUT_SQL})
+          AND json_extract(p.data, '$.state.status') = 'running'`,
     )
     .get(sessionId)
   if ((childQuestionRow?.cnt ?? 0) > 0) return "needs-input"
@@ -564,9 +568,9 @@ export function getChildSessionQuestions(parentSessionId: string): Array<{
        WHERE s.parent_id = ?
          AND s.time_archived IS NULL
          AND json_extract(p.data, '$.type') = 'tool'
-         AND json_extract(p.data, '$.tool') = 'question'
-         AND json_extract(p.data, '$.state.status') = 'running'
-       ORDER BY p.time_created DESC`,
+           AND json_extract(p.data, '$.tool') IN (${NEEDS_INPUT_SQL})
+           AND json_extract(p.data, '$.state.status') = 'running'
+        ORDER BY p.time_created DESC`,
     )
     .all(parentSessionId)
 
@@ -638,28 +642,49 @@ export function getSessionAgent(sessionId: string): string | null {
  * Get all files modified in a session by collecting file paths from patch parts.
  * Returns a deduplicated array of absolute file paths.
  */
+/**
+ * Get all files modified in this session OR any of its descendant sessions (subagents).
+ * Capture changes from both 'patch' parts and 'edit'/'write'/'apply_patch' tool parts.
+ */
 export function getSessionModifiedFiles(sessionId: string): string[] {
   const db = getDb()
   const rows = db
-    .query<{ files: string }, [string]>(
-      `SELECT json_extract(data, '$.files') as files
-       FROM part
-       WHERE session_id = ?
-         AND json_extract(data, '$.type') = 'patch'
-         AND json_extract(data, '$.files') IS NOT NULL
-       ORDER BY time_created ASC`,
+    .query<{ file_raw: string | null }, [string]>(
+      `WITH RECURSIVE session_tree(id) AS (
+         SELECT ?
+         UNION ALL
+         SELECT s.id FROM session s JOIN session_tree st ON s.parent_id = st.id
+       )
+       SELECT 
+         COALESCE(
+           json_extract(p.data, '$.files'),
+           json_extract(p.data, '$.state.input.filePath')
+         ) as file_raw
+       FROM part p
+       JOIN session_tree st ON p.session_id = st.id
+       WHERE (
+         (json_extract(p.data, '$.type') = 'patch' AND json_extract(p.data, '$.files') IS NOT NULL)
+         OR
+         (json_extract(p.data, '$.tool') IN ('edit', 'write', 'apply_patch') AND json_extract(p.data, '$.state.status') = 'completed')
+       )`,
     )
     .all(sessionId)
 
   const allFiles = new Set<string>()
   for (const row of rows) {
-    try {
-      const parsed = JSON.parse(row.files) as string[]
-      for (const f of parsed) {
-        allFiles.add(f)
+    if (!row.file_raw) continue
+    const val = row.file_raw
+    if (val.startsWith("[") && val.endsWith("]")) {
+      // Looks like a JSON array from a patch part
+      try {
+        const parsed = JSON.parse(val) as string[]
+        for (const f of parsed) allFiles.add(f)
+      } catch {
+        allFiles.add(val)
       }
-    } catch {
-      // Malformed JSON — skip
+    } else {
+      // Single file path string
+      allFiles.add(val)
     }
   }
 

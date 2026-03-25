@@ -38,6 +38,7 @@ export interface KeybindingsConfig {
     scrollBottom: string
     scrollTop: string
     worktree: string
+    shell: string
   }
   spawn: {
     cancel: string
@@ -88,8 +89,9 @@ const DEFAULTS: Config = {
     scrollPageDown: "ctrl-f",
     scrollBottom: "G",
     scrollTop: "g",
-    worktree: "w",
-  },
+      worktree: "w",
+      shell: "!",
+    },
     spawn: {
       cancel: "escape",
       confirm: "return",

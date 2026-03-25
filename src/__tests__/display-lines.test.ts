@@ -236,6 +236,22 @@ describe("agent name", () => {
     const header = lines.find((l) => l.kind === "role-header")!
     expect(header.agent).toBeUndefined()
   })
+
+  test("plan_exit tool renders as question display line", () => {
+    const msg = mockMessage({
+      parts: [mockPart({
+        type: "tool",
+        tool: "plan_exit",
+        toolStatus: "running",
+        toolTitle: "Switching to build agent",
+      })],
+    })
+    const lines = buildDisplayLines([msg])
+    const questionLines = lines.filter((l) => l.kind === "question")
+    expect(questionLines.length).toBe(1)
+    expect(questionLines[0]!.question).toBe("Switching to build agent")
+    expect(questionLines[0]!.status).toBe("running")
+  })
 })
 
 // ─── Message structure ────────────────────────────────────────────────────────
@@ -332,5 +348,28 @@ describe("child session question format", () => {
     }
     expect(q.options.length).toBe(2)
     expect(q.options[0]!.label).toBe("Yes, use skill tool")
+  })
+})
+
+describe("text wrapping with width", () => {
+  test("long text lines are wrapped when width is provided", () => {
+    const longText = "A".repeat(200)
+    const msg = mockMessage({
+      parts: [mockPart({ type: "text", text: longText })],
+    })
+    const lines = buildDisplayLines([msg], 80)
+    const textLines = lines.filter((l) => l.kind === "text")
+    // 200 chars at width 80 - 4 padding = 76 chars per line → at least 2 lines
+    expect(textLines.length).toBeGreaterThanOrEqual(2)
+  })
+
+  test("text lines are not wrapped when width is omitted", () => {
+    const longText = "A".repeat(200)
+    const msg = mockMessage({
+      parts: [mockPart({ type: "text", text: longText })],
+    })
+    const lines = buildDisplayLines([msg])
+    const textLines = lines.filter((l) => l.kind === "text")
+    expect(textLines.length).toBe(1)
   })
 })

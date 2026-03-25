@@ -7,6 +7,7 @@ import {
   type SessionStatus,
   useStore,
 } from "../store.js"
+import { buildRows, getNavigableIndices, type VisibleRow } from "./tree-rows.js"
 import { useDashboardKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode } from "../hooks/use-attach.js"
 import { config } from "../config.js"
@@ -25,6 +26,8 @@ import {
   getLastMessagePreview,
   getSessionModel,
 } from "../db/reader.js"
+import { usePickerOverlay } from "../hooks/use-picker-overlay.js"
+import { PickerOverlay } from "./picker-overlay.js"
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
 
@@ -72,101 +75,6 @@ function cleanTitle(title: string): string {
   return cleaned
 }
 
-// ─── Flat row model ───────────────────────────────────────────────────────────
-
-type InstanceRow = {
-  kind: "instance"
-  instance: OcmInstance
-}
-
-type ChildRow = {
-  kind: "child"
-  session: OcmSession
-  agentType: string
-  cleanedTitle: string
-  depth: number
-  isLast: boolean
-  parentSessionId: string
-}
-
-type ScrollIndicatorRow = {
-  kind: "scroll-indicator"
-  direction: "above" | "below"
-  count: number
-  depth: number
-  parentSessionId: string
-}
-
-type VisibleRow = InstanceRow | ChildRow | ScrollIndicatorRow
-
-// ─── Build visible rows ───────────────────────────────────────────────────────
-
-function buildRows(
-  instances: OcmInstance[],
-  expandedSessions: Set<string>,
-  childSessions: Map<string, { children: OcmSession[]; totalCount: number }>,
-  childScrollOffsets: Map<string, number>,
-): VisibleRow[] {
-  const rows: VisibleRow[] = []
-
-  for (const instance of instances) {
-    rows.push({ kind: "instance", instance })
-
-    if (expandedSessions.has(instance.sessionId)) {
-      insertChildren(rows, instance.sessionId, 1, expandedSessions, childSessions, childScrollOffsets)
-    }
-  }
-
-  return rows
-}
-
-function insertChildren(
-  rows: VisibleRow[],
-  parentSessionId: string,
-  depth: number,
-  expandedSessions: Set<string>,
-  childSessions: Map<string, { children: OcmSession[]; totalCount: number }>,
-  childScrollOffsets: Map<string, number>,
-): void {
-  const data = childSessions.get(parentSessionId)
-  if (!data) return
-
-  const { children, totalCount } = data
-  const offset = childScrollOffsets.get(parentSessionId) ?? 0
-
-  if (offset > 0) {
-    rows.push({ kind: "scroll-indicator", direction: "above", count: offset, depth, parentSessionId })
-  }
-
-  children.forEach((child, i) => {
-    const isLast = i === children.length - 1 && offset + children.length >= totalCount
-    rows.push({
-      kind: "child",
-      session: child,
-      agentType: extractAgentType(child.title),
-      cleanedTitle: cleanTitle(child.title),
-      depth,
-      isLast,
-      parentSessionId,
-    })
-    if (expandedSessions.has(child.id)) {
-      insertChildren(rows, child.id, depth + 1, expandedSessions, childSessions, childScrollOffsets)
-    }
-  })
-
-  const remaining = totalCount - offset - children.length
-  if (remaining > 0) {
-    rows.push({ kind: "scroll-indicator", direction: "below", count: remaining, depth, parentSessionId })
-  }
-}
-
-// Navigable rows exclude scroll indicators
-function getNavigableIndices(rows: VisibleRow[]): number[] {
-  return rows
-    .map((r, i) => (r.kind === "scroll-indicator" ? -1 : i))
-    .filter((i) => i >= 0)
-}
-
 // ─── Dashboard component ──────────────────────────────────────────────────────
 
 export function Dashboard() {
@@ -197,32 +105,31 @@ export function Dashboard() {
   const [titleStatus, setTitleStatus] = React.useState<string | null>(null)
   // Session picker overlay
   const [sessionPickerOpen, setSessionPickerOpen] = React.useState(false)
-  const [sessionPickerCursor, setSessionPickerCursor] = React.useState(0)
-  const [sessionPickerScroll, setSessionPickerScroll] = React.useState(0)
-  const [sessionPickerFilter, setSessionPickerFilter] = React.useState("")
   const [sessionPickerSessions, setSessionPickerSessions] = React.useState<DbSessionWithProject[]>([])
   const [sessionPickerLoading, setSessionPickerLoading] = React.useState(false)
   const sessionPickerMaxVisible = Math.min(20, Math.max(5, (stdout?.rows ?? 24) - 10))
-  const filteredSessions = React.useMemo(() => {
-    if (!sessionPickerFilter.trim()) return sessionPickerSessions
-    const lower = sessionPickerFilter.toLowerCase()
-    return sessionPickerSessions.filter((s) => {
+  const sessionPicker = usePickerOverlay(sessionPickerOpen, {
+    items: sessionPickerSessions,
+    filterFn: (s, q) => {
+      const lower = q.toLowerCase()
       const repo = deriveRepoName(s.projectWorktree).toLowerCase()
-      const title = s.title.toLowerCase()
-      const dir = s.directory.toLowerCase()
-      return title.includes(lower) || repo.includes(lower) || dir.includes(lower)
-    })
-  }, [sessionPickerSessions, sessionPickerFilter])
-  React.useEffect(() => {
-    setSessionPickerCursor((c) => {
-      const maxIdx = Math.max(filteredSessions.length - 1, 0)
-      return Math.max(0, Math.min(c, maxIdx))
-    })
-    setSessionPickerScroll((s) => {
-      const maxScroll = Math.max(filteredSessions.length - sessionPickerMaxVisible, 0)
-      return Math.min(s, maxScroll)
-    })
-  }, [filteredSessions.length, sessionPickerMaxVisible])
+      return s.title.toLowerCase().includes(lower) || repo.includes(lower) || s.directory.toLowerCase().includes(lower)
+    },
+    onSelect: (session) => {
+      if (sessionPickerLoading) return
+      setSessionPickerOpen(false)
+      setSessionPickerLoading(true)
+      ensureServeProcess(session.projectWorktree)
+        .then(() => navigate("conversation", session.projectId, session.id))
+        .catch((e) => {
+          setTitleStatus(`✗ Failed to start session: ${String(e)}`)
+          setTimeout(() => setTitleStatus(null), 2500)
+        })
+        .finally(() => setSessionPickerLoading(false))
+    },
+    onClose: () => setSessionPickerOpen(false),
+    maxVisible: sessionPickerMaxVisible,
+  })
 
   // Kill confirmation input handler
   useInput((input, key) => {
@@ -248,49 +155,8 @@ export function Dashboard() {
   })
 
   useInput((input, key) => {
-    if (!sessionPickerOpen) return
-
-    if (key.downArrow || (key.ctrl && input === "n")) {
-      const next = Math.min(sessionPickerCursor + 1, Math.max(filteredSessions.length - 1, 0))
-      setSessionPickerCursor(next)
-      setSessionPickerScroll((s) => next >= s + sessionPickerMaxVisible ? next - sessionPickerMaxVisible + 1 : s)
-    } else if (key.upArrow || (key.ctrl && input === "p")) {
-      const next = Math.max(sessionPickerCursor - 1, 0)
-      setSessionPickerCursor(next)
-      setSessionPickerScroll((s) => (next < s ? next : s))
-    } else if (key.return) {
-      const session = filteredSessions[sessionPickerCursor]
-      if (session && !sessionPickerLoading) {
-        setSessionPickerOpen(false)
-        setSessionPickerLoading(true)
-        ensureServeProcess(session.projectWorktree)
-          .then(() => {
-            navigate("conversation", session.projectId, session.id)
-          })
-          .catch((e) => {
-            setTitleStatus(`✗ Failed to start session: ${String(e)}`)
-            setTimeout(() => setTitleStatus(null), 2500)
-          })
-          .finally(() => {
-            setSessionPickerLoading(false)
-          })
-      }
-    } else if (key.escape) {
-      if (sessionPickerFilter) {
-        setSessionPickerFilter("")
-        setSessionPickerCursor(0)
-        setSessionPickerScroll(0)
-      } else {
-        setSessionPickerOpen(false)
-      }
-    } else if (key.backspace || key.delete) {
-      setSessionPickerFilter((f) => f.slice(0, -1))
-      setSessionPickerCursor(0)
-      setSessionPickerScroll(0)
-    } else if (input && !key.ctrl && !key.meta) {
-      setSessionPickerFilter((f) => f + input)
-      setSessionPickerCursor(0)
-      setSessionPickerScroll(0)
+    if (sessionPickerOpen) {
+      sessionPicker.handleInput(input, key)
     }
   })
 
@@ -500,9 +366,6 @@ export function Dashboard() {
     onSessions: () => {
       const sessions = getAllSessions(500)
       setSessionPickerSessions(sessions)
-      setSessionPickerCursor(0)
-      setSessionPickerScroll(0)
-      setSessionPickerFilter("")
       setSessionPickerOpen(true)
     },
     onQuit: () => {
@@ -566,55 +429,28 @@ export function Dashboard() {
           </Box>
         </Box>
       ) : sessionPickerOpen ? (
-        <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="round" borderColor="cyan" marginX={2} marginY={1}>
-          <Box>
-            <Text bold color="cyan">Sessions</Text>
-            <Text dimColor>  {filteredSessions.length} of {sessionPickerSessions.length}</Text>
-          </Box>
-          <Box>
-            <Text color="cyan">› </Text>
-            <Text>{sessionPickerFilter}</Text>
-            <Text color="cyan" dimColor>│</Text>
-          </Box>
-          {(() => {
-            const visibleSessions = filteredSessions.slice(sessionPickerScroll, sessionPickerScroll + sessionPickerMaxVisible)
-            const showScrollUp = sessionPickerScroll > 0
-            const showScrollDown = sessionPickerScroll + sessionPickerMaxVisible < filteredSessions.length
+        <PickerOverlay
+          title="Sessions"
+          state={sessionPicker.state}
+          maxVisible={sessionPickerMaxVisible}
+          width={effectiveWidth}
+          renderItem={(session, i, isCursor) => {
+            const repo = deriveRepoName(session.projectWorktree)
+            const timeAgo = relativeTime(session.timeUpdated)
+            const isRunning = instances.some((inst) => inst.sessionId === session.id)
+            const label = `${repo} / ${session.title}`
+            const maxLabelLen = Math.max(20, effectiveWidth - 16 - timeAgo.length)
+            const truncLabel = label.length > maxLabelLen ? label.slice(0, maxLabelLen - 1) + "…" : label
             return (
-              <>
-                {showScrollUp && <Box paddingLeft={1}><Text dimColor>  ↑ {sessionPickerScroll} more</Text></Box>}
-                {visibleSessions.map((session, vi) => {
-                  const i = vi + sessionPickerScroll
-                  const isCursor = i === sessionPickerCursor
-                  const repo = deriveRepoName(session.projectWorktree)
-                  const timeAgo = relativeTime(session.timeUpdated)
-                  const isRunning = instances.some((inst) => inst.sessionId === session.id)
-                  const label = `${repo} / ${session.title}`
-                   const maxLabelLen = Math.max(20, effectiveWidth - 16 - timeAgo.length)
-                  const truncLabel = label.length > maxLabelLen
-                    ? label.slice(0, maxLabelLen - 1) + "…"
-                    : label
-                  return (
-                    <Box key={session.id} paddingLeft={1}>
-                      <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
-                      {isRunning
-                        ? <Text color="green">▶ </Text>
-                        : <Text dimColor>○ </Text>}
-                      <Text bold={isCursor} dimColor={!isCursor}>{truncLabel}</Text>
-                      <Text dimColor>  {timeAgo}</Text>
-                    </Box>
-                  )
-                })}
-                {showScrollDown && (
-                  <Box paddingLeft={1}>
-                    <Text dimColor>  ↓ {filteredSessions.length - sessionPickerScroll - sessionPickerMaxVisible} more</Text>
-                  </Box>
-                )}
-              </>
+              <Box paddingLeft={1} key={session.id}>
+                <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                {isRunning ? <Text color="green">▶ </Text> : <Text dimColor>○ </Text>}
+                <Text bold={isCursor} dimColor={!isCursor}>{truncLabel}</Text>
+                <Text dimColor>  {timeAgo}</Text>
+              </Box>
             )
-          })()}
-          <Text dimColor>↑↓/Ctrl-N/P: nav  Enter: open  Esc: {sessionPickerFilter ? "clear filter" : "close"}  type to filter</Text>
-        </Box>
+          }}
+        />
       ) : (
         <>
           {instances.length === 0 && (

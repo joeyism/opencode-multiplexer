@@ -82,6 +82,32 @@ export function yieldToNewOpencode(cwd: string): void {
 }
 
 /**
+ * Yield terminal control to a shell in the given directory.
+ * Exits alt screen, unmounts Ink, spawns $SHELL, re-enters alt screen and remounts.
+ */
+export function yieldToShell(cwd: string): void {
+  if (!_inkInstance) return
+
+  _inkInstance.unmount()
+  _inkInstance = null
+
+  if (process.stdout.isTTY) process.stdout.write(EXIT_ALT_SCREEN)
+
+  try {
+    const shell = process.env.SHELL || "/bin/sh"
+    execSync(shell, {
+      stdio: "inherit",
+      cwd,
+    })
+  } catch {
+    // User exited shell — normal, ignore
+  }
+
+  if (process.stdout.isTTY) process.stdout.write(ENTER_ALT_SCREEN + CLEAR_SCREEN)
+  _remountOcm()
+}
+
+/**
  * Open current input text in $EDITOR (Ctrl-X E pattern).
  * Unmounts Ink, opens editor with text in a temp file,
  * reads back the result, remounts OCMux, and calls onResult with the edited text.

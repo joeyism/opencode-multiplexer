@@ -2,8 +2,9 @@ import type { ConversationMessage, ConversationMessagePart } from "../store.js"
 import { getChildSessionQuestions } from "../db/reader.js"
 import { marked } from "marked"
 import TerminalRenderer from "marked-terminal"
+import wrapAnsi from "wrap-ansi"
 
-marked.setOptions({ renderer: new (TerminalRenderer as any)({ reflowText: true }) })
+marked.setOptions({ renderer: new (TerminalRenderer as any)({ reflowText: false, width: 10000 }) })
 
 const BOLD_RE   = /\*\*(.+?)\*\*/g
 const ITALIC_RE = /(?<!\*)\*([^*\n]+)\*(?!\*)/g
@@ -64,7 +65,7 @@ export type DisplayLine =
   | { kind: "question"; header: string; question: string; status: string; options: Array<{ label: string; description?: string }>; custom: boolean }
   | { kind: "spacer" }
 
-export function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[] {
+export function buildDisplayLines(messages: ConversationMessage[], width?: number): DisplayLine[] {
   const lines: DisplayLine[] = []
 
   for (const msg of messages) {
@@ -82,8 +83,17 @@ export function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[
     if (text) {
       try {
         const rendered = fixInlineMarkdown((marked(text) as string).trimEnd())
-        for (const line of rendered.split("\n")) {
-          lines.push({ kind: "text", text: line })
+        for (const rawLine of rendered.split("\n")) {
+          if (width && rawLine.length > 0) {
+            // Wrap long lines at content width (accounting for paddingLeft=4 in the JSX)
+            const maxLineWidth = Math.max(10, width - 4)
+            const wrapped = wrapAnsi(rawLine, maxLineWidth, { hard: true, trim: false })
+            for (const wLine of wrapped.split("\n")) {
+              lines.push({ kind: "text", text: wLine })
+            }
+          } else {
+            lines.push({ kind: "text", text: rawLine })
+          }
         }
       } catch {
         lines.push({ kind: "text", text })
@@ -91,7 +101,7 @@ export function buildDisplayLines(messages: ConversationMessage[]): DisplayLine[
     }
 
     for (const part of getToolParts(msg.parts)) {
-      if (part.tool === "question" && (part.toolInput || part.toolTitle)) {
+      if ((part.tool === "question" || part.tool === "plan_exit") && (part.toolInput || part.toolTitle)) {
         let options: Array<{ label: string; description?: string }> = []
         if (part.toolOptions) {
           try { options = JSON.parse(part.toolOptions) } catch {}

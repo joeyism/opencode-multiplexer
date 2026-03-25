@@ -4,7 +4,7 @@ import TextInput from "ink-text-input"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { useStore, type ConversationMessage } from "../store.js"
 import { useConversationKeys } from "../hooks/use-keybindings.js"
-import { yieldToOpencode, openInEditor, openFileInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
+import { yieldToOpencode, yieldToShell, openInEditor, openFileInEditor, consumePendingEditorResult } from "../hooks/use-attach.js"
 import { getMessages, getSessionById, getSessionStatus, getSessionAgent, getSessionModifiedFiles, getSessionModel, getChildSessionQuestions } from "../db/reader.js"
 import { config } from "../config.js"
 import { shortenModel, refreshNow } from "../poller.js"
@@ -14,23 +14,28 @@ import { computeConversationLayout, APP_BORDER_COLS } from "./layout.js"
 
 
 import { buildDisplayLines, type DisplayLine } from "./display-lines.js"
+import { buildRows, getNavigableIndices, type VisibleRow } from "./tree-rows.js"
+import { PickerOverlay } from "./picker-overlay.js"
+import { usePickerOverlay } from "../hooks/use-picker-overlay.js"
 
 function Sidebar({
-  instances,
+  rows,
   currentSessionId,
   cursorIndex,
   focused,
   height,
   width,
   compact,
+  expandedSessions,
 }: {
-  instances: import("../store.js").OcmInstance[]
+  rows: VisibleRow[]
   currentSessionId: string | null
   cursorIndex: number
   focused: boolean
   height: number
   width: number
   compact: boolean
+  expandedSessions: Set<string>
 }) {
   // Inner width: total - 2 border chars
   const innerWidth = Math.max(0, width - 2)
@@ -54,29 +59,44 @@ function Sidebar({
           {/* Header */}
           <Box paddingX={1} justifyContent="space-between">
             <Text bold color={focused ? "cyan" : "gray"}>sessions</Text>
-            <Text dimColor>{instances.length}</Text>
+            <Text dimColor>{rows.filter(r => r.kind === "instance").length}</Text>
           </Box>
           <Text dimColor>{separatorLine}</Text>
         </>
       )}
 
       {/* Instance list */}
-      {instances.length === 0 && (
+      {rows.length === 0 && (
         <Box paddingX={1}>
           <Text dimColor>no instances</Text>
         </Box>
       )}
-      {instances.map((inst, i) => {
-        const isCurrent = inst.sessionId === currentSessionId
+      {rows.map((row, i) => {
+        if (row.kind === "scroll-indicator") {
+          const indent = "  ".repeat(row.depth)
+          return (
+            <Box key={`scroll-${row.parentSessionId}-${row.direction}`} paddingLeft={1}>
+              <Text dimColor>{indent}  {row.direction === "above" ? "↑" : "↓"} {row.count} more</Text>
+            </Box>
+          )
+        }
+
+        const isInstance = row.kind === "instance"
+        const session = isInstance ? row.instance : row.session
+        const sessionId = isInstance ? row.instance.sessionId : row.session.id
+        const isCurrent = sessionId === currentSessionId
         const isCursor = focused && i === cursorIndex
-        const { char, color } = statusIcon(inst.status)
+        const { char, color } = statusIcon(session.status)
         const cursorChar = isCursor ? "▸" : isCurrent ? "◆" : " "
+        const expandChar = session.hasChildren
+          ? (expandedSessions.has(sessionId) ? "▾" : "▸")
+          : " "
 
         if (compact) {
-          const rawTime = relativeTime(inst.timeUpdated)
+          const rawTime = relativeTime(session.timeUpdated)
           const timeLabel = timeFieldWidth > 0 ? rawTime.slice(0, timeFieldWidth) : ""
           return (
-        <Box key={inst.id} paddingLeft={1} overflow="hidden">
+            <Box key={sessionId} paddingLeft={1} overflow="hidden">
               <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
               <Text>{" "}</Text>
               <Text color={color}>{char}</Text>
@@ -92,38 +112,51 @@ function Sidebar({
           )
         }
 
-        const sep = "/"
-        const maxTotal = maxLabelWidth
-        const repoMax = Math.min(inst.repoName.length, Math.floor(maxTotal * 0.4))
-        const repo = inst.repoName.length > repoMax
-          ? inst.repoName.slice(0, Math.max(0, repoMax - 1)) + "…"
-          : inst.repoName
-        const titleMax = maxTotal - repo.length - sep.length
-        const title = inst.sessionTitle.length > titleMax
-          ? inst.sessionTitle.slice(0, Math.max(0, titleMax - 1)) + "…"
-          : inst.sessionTitle
+        const timeAgo = relativeTime(session.timeUpdated)
+        const indentWidth = isInstance ? 0 : row.depth * 2
+        const labelBudget = Math.max(0, innerWidth - indentWidth - 7 - timeAgo.length)
+
+        let paddedLabel = ""
+        if (isInstance) {
+          const sep = "/"
+          const repoMax = Math.min(row.instance.repoName.length, Math.floor(labelBudget * 0.4))
+          const repo = row.instance.repoName.length > repoMax
+            ? row.instance.repoName.slice(0, Math.max(0, repoMax - 1)) + "…"
+            : row.instance.repoName
+          const titleMax = labelBudget - repo.length - sep.length
+          const title = row.instance.sessionTitle.length > titleMax
+            ? row.instance.sessionTitle.slice(0, Math.max(0, titleMax - 1)) + "…"
+            : row.instance.sessionTitle
+          paddedLabel = `${repo}${sep}${title}`.padEnd(labelBudget)
+        } else {
+          const titleMax = labelBudget
+          const title = row.cleanedTitle.length > titleMax
+            ? row.cleanedTitle.slice(0, Math.max(0, titleMax - 1)) + "…"
+            : row.cleanedTitle
+          paddedLabel = title.padEnd(labelBudget)
+        }
+
+        const indent = " ".repeat(indentWidth)
 
         return (
-          <Box key={inst.id} paddingLeft={1}>
-            <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
-            <Text>{" "}</Text>
-            <Text color={color}>{char}</Text>
-            <Text>{" "}</Text>
-            <Text
-              bold={isCurrent || isCursor}
-              color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
-              dimColor={!isCurrent && !isCursor}
-            >
-              {repo}
+          <Box key={sessionId} height={1} overflow="hidden">
+            <Text wrap="truncate">
+              {" "}
+              <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
+              {" "}
+              {indent}
+              <Text color={color}>{char}</Text>
+              {" "}
+              <Text dimColor>{expandChar}</Text>
+              {" "}
+              <Text
+                bold={isCurrent || isCursor}
+                color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
+                dimColor={!isCurrent && !isCursor}
+              >{paddedLabel}</Text>
+              {" "}
+              <Text dimColor>{timeAgo}</Text>
             </Text>
-            <Text dimColor>{sep}</Text>
-            <Text
-              dimColor={!isCurrent && !isCursor}
-              color={isCursor ? "cyan" : undefined}
-            >
-              {title}
-            </Text>
-            <Text dimColor wrap="truncate"> {relativeTime(inst.timeUpdated)}</Text>
           </Box>
         )
       })}
@@ -141,6 +174,16 @@ export function Conversation() {
   const navigate = useStore((s) => s.navigate)
   const setMessages = useStore((s) => s.setMessages)
   const setMessagesLoading = useStore((s) => s.setMessagesLoading)
+  const expandedSessions = useStore((s) => s.expandedSessions)
+  const childSessions = useStore((s) => s.childSessions)
+  const childScrollOffsets = useStore((s) => s.childScrollOffsets)
+  const toggleExpanded = useStore((s) => s.toggleExpanded)
+
+  const rows = React.useMemo(
+    () => buildRows(instances, expandedSessions, childSessions, childScrollOffsets),
+    [instances, expandedSessions, childSessions, childScrollOffsets]
+  )
+  const navigableIndices = React.useMemo(() => getNavigableIndices(rows), [rows])
 
   const [scrollOffset, setScrollOffset] = React.useState(0)
   const [error, setError] = React.useState<string | null>(null)
@@ -230,12 +273,8 @@ type PendingQuestion = {
 
   // Model picker overlay
   const [modelPickerOpen, setModelPickerOpen] = React.useState(false)
-  const [modelPickerCursor, setModelPickerCursor] = React.useState(0)
-  const [modelPickerScroll, setModelPickerScroll] = React.useState(0)
   // File picker overlay
   const [filePickerOpen, setFilePickerOpen] = React.useState(false)
-  const [filePickerCursor, setFilePickerCursor] = React.useState(0)
-  const [filePickerScroll, setFilePickerScroll] = React.useState(0)
   const [filePickerFiles, setFilePickerFiles] = React.useState<string[]>([])
   // Tick counter to force sessionStatus re-read when SSE session events arrive
   const [statusTick, setStatusTick] = React.useState(0)
@@ -283,9 +322,46 @@ type PendingQuestion = {
   const termWidth = stdout?.columns ?? 80
   const termHeight = stdout?.rows ?? 24
   const effectiveWidth = termWidth - APP_BORDER_COLS   // account for App border (left + right)
+  const { innerHeight, bodyHeight } = computeConversationLayout(
+    termHeight, termWidth, { killConfirm: !!killConfirm }
+  )
+  const modelPickerMaxVisible = Math.min(20, Math.max(5, termHeight - 10))
+  const modelPicker = usePickerOverlay(modelPickerOpen, {
+    items: availableModels,
+    filterFn: (m, q) => {
+      const lower = q.toLowerCase()
+      return m.label.toLowerCase().includes(lower) || m.providerID.toLowerCase().includes(lower)
+    },
+    onSelect: (_item, originalIdx) => {
+      setModelOverrideIdx(originalIdx)
+      setModelPickerOpen(false)
+    },
+    onClose: () => setModelPickerOpen(false),
+    maxVisible: modelPickerMaxVisible,
+  })
   const [sidebarCompact, setSidebarCompact] = React.useState(false)
 
-  const sidebarWidthWide = Math.max(20, Math.floor(termWidth * 0.25))
+  const filePickerMaxVisible = Math.min(20, Math.max(5, termHeight - 10))
+  const filePicker = usePickerOverlay(filePickerOpen, {
+    items: filePickerFiles,
+    filterFn: (f, q) => f.toLowerCase().includes(q.toLowerCase()),
+    onSelect: (file) => {
+      setFilePickerOpen(false)
+      openFileInEditor(file)
+    },
+    onClose: () => setFilePickerOpen(false),
+    maxVisible: filePickerMaxVisible,
+    onExtraKey: (input, _key) => {
+      if (input === "a") {
+        setFilePickerOpen(false)
+        openFileInEditor(filePickerFiles)
+        return true
+      }
+      return false
+    },
+  })
+
+  const sidebarWidthWide = Math.max(20, Math.floor(termWidth * 0.15))
   const sidebarWidthCompact = 10
   const sidebarWidth = sidebarCompact ? sidebarWidthCompact : sidebarWidthWide
 
@@ -335,10 +411,11 @@ type PendingQuestion = {
   }, [selectedSessionId])
 
   const sessionStatus = React.useMemo(() => {
-    if (instance) return instance.status
+    // Always re-read from DB on every statusTick so we pick up changes
+    // regardless of whether the poller has run yet.
     if (!selectedSessionId) return "idle" as const
     return getSessionStatus(selectedSessionId)
-  }, [instance, selectedSessionId, statusTick])
+  }, [selectedSessionId, statusTick])
 
   // Clear waitingForResponse when status catches up OR when new messages arrive
   // (handles case where agent responds so fast the poll never catches "working")
@@ -353,6 +430,13 @@ type PendingQuestion = {
       }
     }
   }, [messages.length, waitingForResponse])
+
+  // Unconditional status tick — ensures sessionStatus re-evaluates even without instancePort
+  // (e.g. sessions opened via session picker with no serve process yet)
+  React.useEffect(() => {
+    const id = setInterval(() => setStatusTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   // Spinner animation for working state
   const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -555,6 +639,7 @@ type PendingQuestion = {
         },
       })
       setInputText("")
+      setMode("normal")
       setWaitingForResponse(true)
       // Show the user's message immediately (SSE will handle assistant updates)
       try {
@@ -580,17 +665,18 @@ type PendingQuestion = {
       const cwd = sessionCwd
 
       const files = getSessionModifiedFiles(selectedSessionId)
-      if (files.length === 0) {
+      const sessionFiles = files.filter((f) => f.startsWith(cwd + "/") || !f.startsWith("/"))
+      if (sessionFiles.length === 0) {
         setCommitStatus("✗ no files modified in this session")
         setTimeout(() => { setCommitStatus(null); setCommitMode(false); setMode("normal") }, 2500)
         return
       }
 
-      const existingFiles = files.filter((f) => existsSync(f))
+      const existingFiles = sessionFiles.filter((f) => existsSync(f))
       if (existingFiles.length > 0) {
         exec(`git add ${existingFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
       }
-      const deletedFiles = files.filter((f) => !existsSync(f))
+      const deletedFiles = sessionFiles.filter((f) => !existsSync(f))
       if (deletedFiles.length > 0) {
         try {
           exec(`git add ${deletedFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
@@ -604,7 +690,7 @@ type PendingQuestion = {
         exec("git push origin HEAD", { cwd, stdio: "pipe" })
       } catch { pushOk = false }
 
-      const n = files.length
+      const n = sessionFiles.length
       const noun = `${n} file${n === 1 ? "" : "s"}`
       setCommitStatus(pushOk
         ? `✓ committed ${noun} and pushed`
@@ -660,27 +746,37 @@ type PendingQuestion = {
 
   const openModelPicker = React.useCallback(() => {
     if (!isLive || availableModels.length === 0) return
-    const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
-    const currentIdx = modelOverrideIdx !== null
-      ? modelOverrideIdx
-      : availableModels.findIndex((m) =>
-          currentModel && m.providerID === currentModel.providerID && m.modelID === currentModel.modelID
-        )
-    const idx = Math.max(0, currentIdx)
-    setModelPickerCursor(idx)
-    setModelPickerScroll(Math.max(0, idx - Math.floor(MAX_VISIBLE / 2)))
     setModelPickerOpen(true)
-  }, [isLive, availableModels, modelOverrideIdx, currentModel, termHeight])
+  }, [isLive, availableModels])
 
-  // Build display lines
-  const displayLines = React.useMemo<DisplayLine[]>(() => buildDisplayLines(messages), [messages])
+  React.useEffect(() => {
+    if (modelPickerOpen && currentModel) {
+      const idx = availableModels.findIndex(
+        (m) => m.providerID === currentModel.providerID && m.modelID === currentModel.modelID
+      )
+      if (idx >= 0) {
+        modelPicker.setCursor(idx)
+        modelPicker.setScroll(Math.max(0, idx - Math.floor(modelPickerMaxVisible / 2)))
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally only on open
+  }, [modelPickerOpen])
+
+  // Content width (used both for display line wrapping and layout)
+  const contentWidth = Math.max(1, effectiveWidth - sidebarWidth - 1)
+
+  // Build display lines — wrap text at contentWidth so 1 display line = 1 terminal row
+  const displayLines = React.useMemo<DisplayLine[]>(
+    () => buildDisplayLines(messages, contentWidth),
+    [messages, contentWidth]
+  )
   const totalLines = displayLines.length
 
   // Estimate visible message lines for scroll/slice calculations.
-  // Layout is flexbox-driven; this only controls how many lines we render.
-  // Err on the side of too many — overflow="hidden" clips any excess.
-  const INNER_OVERHEAD = isLive ? 2 : 0  // input divider + input line (live only)
-  const msgAreaHeight = Math.max(5, termHeight - INNER_OVERHEAD)
+  // Uses bodyHeight (which accounts for border + header + footer) not raw termHeight.
+  const INNER_OVERHEAD = isLive ? 3 : 0  // input divider + prefix line + input line (live only)
+  const SPINNER_ROW = 1  // reserve space for the working spinner
+  const msgAreaHeight = Math.max(5, bodyHeight - INNER_OVERHEAD - SPINNER_ROW)
   const maxScroll = Math.max(0, totalLines - msgAreaHeight)
   const halfPage = Math.max(1, Math.floor(msgAreaHeight / 2))
   const fullPage = Math.max(1, msgAreaHeight - 2)
@@ -745,23 +841,36 @@ type PendingQuestion = {
             const questions = await listRes.json() as Array<{ id: string; sessionID: string }>
             console.error("[DEBUG] pending questions:", JSON.stringify(questions.map((q) => ({ id: q.id, sessionID: q.sessionID }))))
 
-            if (questions.length === 0) {
-              console.error("[DEBUG] no pending questions found")
+            // Find question for THIS session specifically, or fall back to first
+            const match = questions.find((q) => q.sessionID === selectedSessionId) ?? questions[0]
+
+            if (!match) {
+              console.error("[DEBUG] no pending questions found (stale question)")
+              // Stale question — DB says running but serve process has no memory of it.
+              // Set answered flag so the useEffect doesn't re-open the overlay.
+              questionAnswered.current = true
+              setPendingQuestion(null)
+              setQuestionCustomMode(false)
+              setQuestionCustomText("")
               return
             }
 
-            const requestID = questions[0]!.id
+            const requestID = match.id
             const replyRes = await fetch(`http://localhost:${port}/question/${requestID}/reply`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ answers: [[label]] }),
             })
             console.error("[DEBUG] reply result:", replyRes.status, await replyRes.text())
+
+            if (replyRes.ok) {
+              questionAnswered.current = true
+            }
           } catch (e) {
             console.error("[DEBUG] submitAnswer error:", String(e))
           }
 
-          questionAnswered.current = true
+          // Always dismiss overlay after attempting to answer
           setPendingQuestion(null)
           setQuestionCustomMode(false)
           setQuestionCustomText("")
@@ -834,63 +943,11 @@ type PendingQuestion = {
       return
     }
     if (modelPickerOpen) {
-      const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
-      if (input === "j" || key.downArrow) {
-        setModelPickerCursor((c) => {
-          const next = Math.min(c + 1, availableModels.length - 1)
-          setModelPickerScroll((s) => next >= s + MAX_VISIBLE ? next - MAX_VISIBLE + 1 : s)
-          return next
-        })
-      } else if (input === "k" || key.upArrow) {
-        setModelPickerCursor((c) => {
-          const next = Math.max(c - 1, 0)
-          setModelPickerScroll((s) => next < s ? next : s)
-          return next
-        })
-      } else if (key.return) {
-        setModelOverrideIdx(modelPickerCursor)
-        setModelPickerOpen(false)
-      } else if (key.escape) {
-        setModelPickerOpen(false)
-      } else {
-        const num = parseInt(input, 10)
-        if (!isNaN(num) && num >= 1 && num <= availableModels.length) {
-          setModelOverrideIdx(num - 1)
-          setModelPickerOpen(false)
-        }
-      }
+      modelPicker.handleInput(input, key)
       return
     }
     if (filePickerOpen) {
-      const MAX_VISIBLE_F = Math.min(20, Math.max(5, termHeight - 10))
-      if (input === "j" || key.downArrow) {
-        setFilePickerCursor((c) => {
-          const next = Math.min(c + 1, filePickerFiles.length - 1)
-          setFilePickerScroll((s) => next >= s + MAX_VISIBLE_F ? next - MAX_VISIBLE_F + 1 : s)
-          return next
-        })
-      } else if (input === "k" || key.upArrow) {
-        setFilePickerCursor((c) => {
-          const next = Math.max(c - 1, 0)
-          setFilePickerScroll((s) => next < s ? next : s)
-          return next
-        })
-      } else if (key.return) {
-        const file = filePickerFiles[filePickerCursor]
-        setFilePickerOpen(false)
-        if (file) openFileInEditor(file)
-      } else if (input === "a") {
-        setFilePickerOpen(false)
-        openFileInEditor(filePickerFiles)
-      } else if (key.escape) {
-        setFilePickerOpen(false)
-      } else {
-        const num = parseInt(input, 10)
-        if (!isNaN(num) && num >= 1 && num <= filePickerFiles.length) {
-          setFilePickerOpen(false)
-          openFileInEditor(filePickerFiles[num - 1]!)
-        }
-      }
+      filePicker.handleInput(input, key)
       return
     }
     // ── INSERT MODE ──────────────────────────────────────────────────────────
@@ -999,21 +1056,38 @@ type PendingQuestion = {
     // ── SIDEBAR FOCUSED ───────────────────────────────────────────────────────
     if (focus === "sidebar") {
       if (input === "j" || key.downArrow) {
-        const maxIdx = Math.max(0, instances.length - 1)
-        setSidebarCursor((c) => Math.min(c + 1, maxIdx))
+        const currentIndex = navigableIndices.indexOf(sidebarCursor)
+        const nextIndex = Math.min(currentIndex + 1, navigableIndices.length - 1)
+        setSidebarCursor(navigableIndices[nextIndex] ?? 0)
         return
       }
       if (input === "k" || key.upArrow) {
-        setSidebarCursor((c) => Math.max(c - 1, 0))
+        const currentIndex = navigableIndices.indexOf(sidebarCursor)
+        const nextIndex = Math.max(currentIndex - 1, 0)
+        setSidebarCursor(navigableIndices[nextIndex] ?? 0)
         return
       }
       if (key.return) {
-        const target = instances[sidebarCursor]
-        if (target && target.sessionId !== selectedSessionId) {
-          navigate("conversation", target.projectId, target.sessionId)
+        const targetRow = rows[sidebarCursor]
+        if (targetRow && targetRow.kind !== "scroll-indicator") {
+          const targetSessionId = targetRow.kind === "instance" ? targetRow.instance.sessionId : targetRow.session.id
+          const targetProjectId = targetRow.kind === "instance" ? targetRow.instance.projectId : targetRow.session.projectId
+          if (targetSessionId !== selectedSessionId) {
+            navigate("conversation", targetProjectId, targetSessionId)
+          }
         }
-        // Switch focus back to conversation pane regardless
         setFocus("conversation")
+        return
+      }
+      if (key.tab) {
+        const targetRow = rows[sidebarCursor]
+        if (targetRow && targetRow.kind !== "scroll-indicator") {
+          const sessionId = targetRow.kind === "instance" ? targetRow.instance.sessionId : targetRow.session.id
+          const session = targetRow.kind === "instance" ? targetRow.instance : targetRow.session
+          if (session.hasChildren) {
+            toggleExpanded(sessionId)
+          }
+        }
         return
       }
       if (input === "q" || key.escape) {
@@ -1111,8 +1185,6 @@ type PendingQuestion = {
         return
       }
       setFilePickerFiles(files)
-      setFilePickerCursor(0)
-      setFilePickerScroll(0)
       setFilePickerOpen(true)
       return
     }
@@ -1197,6 +1269,7 @@ type PendingQuestion = {
     onScrollPageDown:     () => scrollBy(-fullPage),
     onScrollBottom:       () => setScrollOffset(0),
     onScrollTop:          () => setScrollOffset(maxScroll),
+    onShell:              () => yieldToShell(sessionCwd),
   } : {})
 
   // Status indicator
@@ -1207,13 +1280,8 @@ type PendingQuestion = {
     return { char: "○", color: "white" }
   })()
 
-  const contentWidth = Math.max(1, effectiveWidth - sidebarWidth - 1)
   const fullDivider = "─".repeat(Math.max(1, effectiveWidth))
   const divider = "─".repeat(contentWidth)
-  // Explicit layout heights — single source of truth in src/views/layout.ts
-  const { innerHeight, bodyHeight } = computeConversationLayout(
-    termHeight, termWidth, { killConfirm: !!killConfirm }
-  )
 
 
   return (
@@ -1247,17 +1315,18 @@ type PendingQuestion = {
 
       {/* Body row: sidebar + message area — hidden when any overlay is open */}
       {!anyOverlayOpen && <Box flexDirection="row" height={bodyHeight}>
-          <Sidebar
-            instances={instances}
-            currentSessionId={selectedSessionId}
-            cursorIndex={sidebarCursor}
-            focused={focus === "sidebar"}
-            height={bodyHeight}
-            width={sidebarWidth}
-            compact={sidebarCompact}
-          />
+<Sidebar
+  rows={rows}
+  currentSessionId={selectedSessionId}
+  cursorIndex={sidebarCursor}
+  focused={focus === "sidebar"}
+  height={bodyHeight}
+  width={sidebarWidth}
+  compact={sidebarCompact}
+  expandedSessions={expandedSessions}
+/>
 
-        <Box flexDirection="column" flexGrow={1} height={bodyHeight}>
+        <Box flexDirection="column" flexGrow={1} height={bodyHeight} width={contentWidth}>
           {/* Messages area — fixed height, clips any text wrapping */}
           <Box flexDirection="column" flexGrow={1} overflow="hidden" justifyContent="flex-end">
             {messagesLoading && (
@@ -1283,7 +1352,7 @@ type PendingQuestion = {
               if (line.kind === "role-header") {
                 const isUser = line.role === "user"
                 return (
-                  <Box key={`rh-${i}`} paddingLeft={1}>
+                  <Box key={`rh-${i}`} paddingLeft={4} height={1} overflow="hidden">
                     <Text bold color={isUser ? "blue" : "magenta"}>
                       {isUser ? "▶ YOU" : "◆ ASSISTANT"}
                     </Text>
@@ -1294,7 +1363,7 @@ type PendingQuestion = {
               }
               if (line.kind === "thinking") {
                 return (
-                  <Box key={`th-${i}`} paddingLeft={4}>
+                  <Box key={`th-${i}`} paddingLeft={4} height={1} overflow="hidden">
                     <Text dimColor color="yellow" wrap="truncate">{line.text}</Text>
                   </Box>
                 )
@@ -1302,7 +1371,7 @@ type PendingQuestion = {
               if (line.kind === "question") {
                 const isRunning = line.status === "running"
                 return (
-                  <Box key={`q-${i}`} flexDirection="column" paddingLeft={3}>
+                  <Box key={`q-${i}`} flexDirection="column" paddingLeft={4}>
                     <Box>
                       <Text color="yellow" bold>{isRunning ? "❓ " : "✓ "}</Text>
                       <Text color={isRunning ? "yellow" : "gray"} bold>{line.header}</Text>
@@ -1323,7 +1392,7 @@ type PendingQuestion = {
               if (line.kind === "tool") {
                 const detail = line.title || line.input || ""
                 return (
-                  <Box key={`tool-${i}`} paddingLeft={4}>
+                  <Box key={`tool-${i}`} paddingLeft={4} height={1} overflow="hidden">
                     <Text color={line.color as any}>{line.icon} </Text>
                     <Text dimColor>{line.name}</Text>
                     {detail && <Text dimColor wrap="truncate">  {detail}</Text>}
@@ -1332,7 +1401,7 @@ type PendingQuestion = {
               }
               if (line.kind === "text") {
                 return (
-                  <Box key={`txt-${i}`} paddingLeft={3}>
+                  <Box key={`txt-${i}`} paddingLeft={4} height={1} overflow="hidden">
                     <Text wrap="truncate">{line.text}</Text>
                   </Box>
                 )
@@ -1384,23 +1453,29 @@ type PendingQuestion = {
                         />
                       </>
                     ) : (
-                      <>
-                        <><Text color="yellow">{currentAgent?.name ?? "agent"}</Text><Text color={focus === "conversation" ? "cyan" : "gray"}> [{currentModel?.label ?? "model"}] ❯ </Text></>
-                        <TextInput
-                          value={inputText}
-                          onChange={(val) => {
-                            if (ctrlPressed.current || pendingChord.current) { ctrlPressed.current = false; return }
-                            setInputText(val)
-                          }}
-                          onSubmit={(text) => { void sendMessage(text) }}
-                          placeholder="Type a message...  (^X E: editor  ^X M: model)"
-                          focus={!pendingCtrlX && !modelPickerOpen}
-                        />
-                      </>
+                      <Box flexDirection="column">
+                        <Text><Text color="yellow">{currentAgent?.name ?? "agent"}</Text><Text dimColor> [{currentModel?.label ?? "model"}]</Text></Text>
+                        <Box>
+                          <Text color={focus === "conversation" ? "cyan" : "gray"}>❯ </Text>
+                          <TextInput
+                            value={inputText}
+                            onChange={(val) => {
+                              if (ctrlPressed.current || pendingChord.current) { ctrlPressed.current = false; return }
+                              setInputText(val)
+                            }}
+                            onSubmit={(text) => { void sendMessage(text) }}
+                            placeholder="Type a message...  (^X E: editor  ^X M: model)"
+                            focus={!pendingCtrlX && !modelPickerOpen}
+                          />
+                        </Box>
+                      </Box>
                     )}
                   </Box>
                 ) : (
-                  <><Text color="yellow" dimColor>{currentAgent?.name ?? "agent"}</Text><Text dimColor> [{currentModel?.label ?? "model"}] › Press <Text color={focus === "conversation" ? "cyan" : "gray"} bold>i</Text> to type a message</Text></>
+                  <Box flexDirection="column">
+                    <Text><Text color="yellow" dimColor>{currentAgent?.name ?? "agent"}</Text><Text dimColor> [{currentModel?.label ?? "model"}]</Text></Text>
+                    <Text dimColor>› Press <Text color={focus === "conversation" ? "cyan" : "gray"} bold>i</Text> to type a message</Text>
+                  </Box>
                 )}
               </Box>
               {commitStatus && (
@@ -1448,10 +1523,13 @@ type PendingQuestion = {
             <Box><Box width={16}><Text bold color="white">Tab/S-Tab</Text></Box><Text dimColor>cycle agent</Text></Box>
             <Box><Box width={16}><Text bold color="white">m</Text></Box><Text dimColor>select model</Text></Box>
             <Box><Box width={16}><Text bold color="white">^X M</Text></Box><Text dimColor>model picker (insert)</Text></Box>
-            <Box><Box width={16}><Text bold color="white">f</Text></Box><Text dimColor>edit session files</Text></Box>
-            <Box><Box width={16}><Text bold color="white">a</Text></Box><Text dimColor>attach opencode TUI</Text></Box>
+<Box><Box width={16}><Text bold color="white">f</Text></Box><Text dimColor>edit session files</Text></Box>
+<Box><Box width={16}><Text bold color="white">/</Text></Box><Text dimColor>search text</Text></Box>
+<Box><Box width={16}><Text bold color="white">n / N</Text></Box><Text dimColor>next / prev match</Text></Box>
+<Box><Box width={16}><Text bold color="white">a</Text></Box><Text dimColor>attach opencode TUI</Text></Box>
             <Box><Box width={16}><Text bold color="white">n</Text></Box><Text dimColor>spawn new session</Text></Box>
             <Box><Box width={16}><Text bold color="white">w</Text></Box><Text dimColor>worktree session</Text></Box>
+            <Box><Box width={16}><Text bold color="white">!</Text></Box><Text dimColor>shell in session cwd</Text></Box>
             <Box><Box width={16}><Text bold color="white">x</Text></Box><Text dimColor>kill session</Text></Box>
             <Box><Box width={16}><Text bold color="white">r</Text></Box><Text dimColor>refresh</Text></Box>
             <Box><Box width={16}><Text bold color="white">Ctrl-N</Text></Box><Text dimColor>next needs-input session</Text></Box>
@@ -1498,74 +1576,52 @@ type PendingQuestion = {
       })()}
 
       {/* Model picker overlay */}
-      {modelPickerOpen && (() => {
-        const MAX_VISIBLE = Math.min(20, Math.max(5, termHeight - 10))
-        const visibleModels = availableModels.slice(modelPickerScroll, modelPickerScroll + MAX_VISIBLE)
-        const showScrollUp = modelPickerScroll > 0
-        const showScrollDown = modelPickerScroll + MAX_VISIBLE < availableModels.length
-        return (
-          <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan" width={effectiveWidth}>
-            <Box>
-              <Text bold color="cyan">Select Model</Text>
-              <Text dimColor>  {availableModels.length} available</Text>
-            </Box>
-            {showScrollUp && <Box paddingLeft={1}><Text dimColor>  ↑ {modelPickerScroll} more</Text></Box>}
-            {visibleModels.map((m, vi) => {
-              const i = vi + modelPickerScroll
-              const isCursor = i === modelPickerCursor
-              const isCurrent = currentModel &&
-                m.providerID === currentModel.providerID &&
-                m.modelID === currentModel.modelID
-              return (
-                <Box key={`model-${i}`} paddingLeft={1}>
-                  <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
-                  <Text dimColor>{String(i + 1).padStart(3)}. </Text>
-                  <Text bold={!!isCurrent} color={isCursor ? "cyan" : isCurrent ? "white" : undefined} dimColor={!isCursor && !isCurrent}>
-                    {m.label}
-                  </Text>
-                  <Text dimColor>  {m.providerID}</Text>
-                  {isCurrent && <Text color="green" dimColor>  ✓</Text>}
-                </Box>
-              )
-            })}
-            {showScrollDown && <Box paddingLeft={1}><Text dimColor>  ↓ {availableModels.length - modelPickerScroll - MAX_VISIBLE} more</Text></Box>}
-            <Text dimColor>j/k: nav  Enter: select  Esc: cancel</Text>
-          </Box>
-        )
-      })()}
+      {modelPickerOpen && (
+        <PickerOverlay
+          title="Select Model"
+          state={modelPicker.state}
+          maxVisible={modelPickerMaxVisible}
+          width={effectiveWidth}
+          renderItem={(m, i, isCursor) => {
+            const isCurrent = currentModel &&
+              m.providerID === currentModel.providerID &&
+              m.modelID === currentModel.modelID
+            return (
+              <Box paddingLeft={1}>
+                <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                <Text bold={!!isCurrent} color={isCursor ? "cyan" : isCurrent ? "white" : undefined} dimColor={!isCursor && !isCurrent}>
+                  {m.label}
+                </Text>
+                <Text dimColor>  {m.providerID}</Text>
+                {isCurrent && <Text color="green" dimColor>  ✓</Text>}
+              </Box>
+            )
+          }}
+        />
+      )}
 
       {/* File picker overlay */}
-      {filePickerOpen && (() => {
-        const MAX_VISIBLE_F = Math.min(20, Math.max(5, termHeight - 10))
-        const visibleFiles = filePickerFiles.slice(filePickerScroll, filePickerScroll + MAX_VISIBLE_F)
-        const showScrollUpF = filePickerScroll > 0
-        const showScrollDownF = filePickerScroll + MAX_VISIBLE_F < filePickerFiles.length
-        return (
-          <Box flexDirection="column" paddingX={2} paddingY={0} borderStyle="round" borderColor="cyan" width={effectiveWidth}>
-            <Box>
-              <Text bold color="cyan">Session Files</Text>
-              <Text dimColor>  {filePickerFiles.length} modified</Text>
-            </Box>
-            {showScrollUpF && <Box paddingLeft={1}><Text dimColor>  ↑ {filePickerScroll} more</Text></Box>}
-            {visibleFiles.map((f, vi) => {
-              const i = vi + filePickerScroll
-              const isCursor = i === filePickerCursor
-              const display = f.startsWith(sessionCwd + "/")
-                ? f.slice(sessionCwd.length + 1)
-                : f
-              return (
-                <Box key={`file-${i}`} paddingLeft={1}>
-                  <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
-                  <Text dimColor>{String(i + 1)}. </Text>
-                  <Text color={isCursor ? "cyan" : undefined} dimColor={!isCursor} wrap="truncate">{display}</Text>
-                </Box>
-              )
-            })}
-            {showScrollDownF && <Box paddingLeft={1}><Text dimColor>  ↓ {filePickerFiles.length - filePickerScroll - MAX_VISIBLE_F} more</Text></Box>}
-            <Text dimColor>j/k: nav  Enter: open  a: open all  Esc: cancel</Text>
-          </Box>
-        )
-      })()}
+      {filePickerOpen && (
+        <PickerOverlay
+          title="Session Files"
+          state={filePicker.state}
+          maxVisible={filePickerMaxVisible}
+          width={effectiveWidth}
+          countLabel="modified"
+          renderItem={(f, i, isCursor) => {
+            const display = f.startsWith(sessionCwd + "/")
+              ? f.slice(sessionCwd.length + 1)
+              : f
+            return (
+              <Box paddingLeft={1}>
+                <Text color={isCursor ? "cyan" : "gray"}>{isCursor ? "▸" : " "} </Text>
+                <Text color={isCursor ? "cyan" : undefined} dimColor={!isCursor} wrap="truncate">{display}</Text>
+              </Box>
+            )
+          }}
+          hint={`↑↓: nav  Enter: open  a: open all  Esc: ${filePicker.state.filter ? "clear" : "close"}  type to filter`}
+        />
+      )}
 
       </Box>}
 
@@ -1590,7 +1646,7 @@ type PendingQuestion = {
           {isLive && mode === "insert"
             ? (titleMode ? `Esc: cancel  Enter: rename` : commitMode ? `Esc: cancel  Enter: commit and push` : `Esc: normal  Enter: send  ^XE: editor`)
             : isLive
-            ? `q: back  i: insert  e: edit  c: commit  t: title  m: model  f: files  s: sidebar  ^W^W: focus  Tab: agent  a: attach  j/k: scroll  ? help`
+            ? `q: back  i: insert  e: edit  c: commit  t: title  m: model  f: files  s: sidebar  /:search  ^W^W: focus  Tab: agent  a: attach  !: shell  j/k: scroll  ? help`
             : `q: back  a/i/Enter: attach  j/k: scroll  ^U/^D: ½pg  G/gg: nav`
           }
         </Text>

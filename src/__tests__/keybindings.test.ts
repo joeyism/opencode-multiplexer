@@ -278,3 +278,15 @@ describe("focus event sequence parsing", () => {
     expect(parseFocusEvent("prefix\x1b[Isuffix")).toBe("focus-in")
   })
 })
+
+// ─── Shell keybinding ─────────────────────────────────────────────────────────
+
+describe("shell keybinding", () => {
+  test("'!' matches plain ! press", () => {
+    expect(matchKey("!", "!", {})).toBe(true)
+  })
+
+  test("'!' does NOT match Ctrl-!", () => {
+    expect(matchKey("!", "!", { ctrl: true })).toBe(false)
+  })
+})

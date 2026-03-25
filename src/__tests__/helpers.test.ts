@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test"
-import { relativeTime } from "../views/helpers.js"
+import { relativeTime, highlightMatches } from "../views/helpers.js"
 import { deriveRepoName } from "../poller.js"
-import { getAllSessions, type DbSessionWithProject } from "../db/reader.js"
+import { getAllSessions, type DbSessionWithProject, NEEDS_INPUT_TOOLS } from "../db/reader.js"
 
 describe("relativeTime", () => {
   test("returns 'now' for timestamps within the last minute", () => {
@@ -100,5 +100,47 @@ describe("getAllSessions return type", () => {
       projectWorktree: "/work/web",
     }
     expect(session.projectWorktree).toBe("/work/web")
+  })
+})
+
+describe("NEEDS_INPUT_TOOLS", () => {
+  test("includes question tool", () => {
+    expect(NEEDS_INPUT_TOOLS).toContain("question")
+  })
+  test("includes plan_exit tool", () => {
+    expect(NEEDS_INPUT_TOOLS).toContain("plan_exit")
+  })
+  test("is a non-empty array", () => {
+    expect(NEEDS_INPUT_TOOLS.length).toBeGreaterThan(0)
+  })
+})
+
+describe("highlightMatches", () => {
+  test("highlights plain text matches", () => {
+    const result = highlightMatches("hello world", "world")
+    expect(result).toContain("\x1b[30;43m")
+    expect(result).toContain("world")
+    expect(result).toContain("\x1b[0m")
+  })
+
+  test("case-insensitive matching", () => {
+    const result = highlightMatches("Hello World", "hello")
+    expect(result).toContain("\x1b[30;43m")
+  })
+
+  test("no match returns original text", () => {
+    const result = highlightMatches("hello world", "xyz")
+    expect(result).toBe("hello world")
+  })
+
+  test("empty query returns original text", () => {
+    const result = highlightMatches("hello world", "")
+    expect(result).toBe("hello world")
+  })
+
+  test("multiple matches are all highlighted", () => {
+    const result = highlightMatches("foo bar foo baz foo", "foo")
+    const count = (result.match(/\x1b\[30;43m/g) || []).length
+    expect(count).toBe(3)
   })
 })

@@ -118,6 +118,16 @@ describe("computeConversationLayout formula", () => {
     expect(layout.bodyHeight).toBeGreaterThanOrEqual(5)
     expect(layout.effectiveWidth).toBe(38)
   })
+
+  test("bodyHeight has room for spinner + input area + messages at typical terminal sizes", () => {
+    for (const h of [20, 24, 30, 40, 50]) {
+      const layout = computeConversationLayout(h, 80)
+      const INNER_OVERHEAD = 3  // divider + prefix line + input line
+      const SPINNER_ROW = 1
+      const msgAreaHeight = layout.bodyHeight - INNER_OVERHEAD - SPINNER_ROW
+      expect(msgAreaHeight).toBeGreaterThanOrEqual(5)
+    }
+  })
 })
 
 describe("conversation layout", () => {
