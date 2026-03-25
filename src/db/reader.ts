@@ -647,7 +647,12 @@ export function getSessionAgent(sessionId: string): string | null {
  * Capture changes from both 'patch' parts and 'edit'/'write'/'apply_patch' tool parts.
  */
 export function getSessionModifiedFiles(sessionId: string): string[] {
-  const db = getDb()
+  let db: Database
+  try {
+    db = getDb()
+  } catch {
+    return []
+  }
   const rows = db
     .query<{ file_raw: string | null }, [string]>(
       `WITH RECURSIVE session_tree(id) AS (
