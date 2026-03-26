@@ -17,6 +17,7 @@ type DashboardActions = {
   onHelp?: () => void
   onRescan?: () => void
   onSessions?: () => void
+  onTogglePin?: () => void
 }
 
 type ConversationActions = {
@@ -82,6 +83,7 @@ export function useDashboardKeys(actions: DashboardActions, isActive = true) {
       else if (matchKey(kb.help, input, key)) actions.onHelp?.()
       else if (matchKey(kb.rescan, input, key)) actions.onRescan?.()
       else if (matchKey(kb.sessions, input, key)) actions.onSessions?.()
+      else if (matchKey(kb.togglePin, input, key)) actions.onTogglePin?.()
     },
     { isActive },
   )

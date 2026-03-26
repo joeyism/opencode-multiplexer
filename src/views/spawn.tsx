@@ -7,6 +7,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import { useStore } from "../store.js"
 import { useSpawnKeys } from "../hooks/use-keybindings.js"
 import { refreshNow } from "../poller.js"
+import { getSessionById } from "../db/reader.js"
 import {
   findNextPort,
   waitForServer,
@@ -110,14 +111,13 @@ export function Spawn() {
         // 6. Refresh so the dashboard knows about the new instance
         refreshNow()
 
-        // 7. Navigate to conversation view for the new session
+        // 7. Navigate to conversation view for the new session.
+        //    Use the DB directly instead of the store — refreshNow() is async
+        //    and the store may not be populated yet.
         if (sessionId) {
-          const projectId = useStore.getState().instances.find(
-            (i) => i.sessionId === sessionId
-          )?.projectId ?? null
-
-          if (projectId) {
-            navigate("conversation", projectId, sessionId)
+          const session = getSessionById(sessionId)
+          if (session) {
+            navigate("conversation", session.projectId, sessionId)
           } else {
             navigate("dashboard")
           }

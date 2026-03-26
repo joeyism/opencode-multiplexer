@@ -80,6 +80,10 @@ interface Store {
   instances: OcmInstance[]
   setInstances: (instances: OcmInstance[]) => void
 
+  // Session pinning
+  pinnedSessions: Map<string, number>     // sessionId -> pin timestamp
+  togglePin: (sessionId: string) => void
+
   // Expandable subagent tree
   expandedSessions: Set<string>
   childSessions: Map<string, { children: OcmSession[]; totalCount: number }>
@@ -112,6 +116,19 @@ export const useStore = create<Store>((set) => ({
   // Instances
   instances: [],
   setInstances: (instances) => set({ instances }),
+
+  // Session pinning
+  pinnedSessions: new Map(),
+  togglePin: (sessionId) =>
+    set((state) => {
+      const next = new Map(state.pinnedSessions)
+      if (next.has(sessionId)) {
+        next.delete(sessionId)
+      } else {
+        next.set(sessionId, Date.now())
+      }
+      return { pinnedSessions: next }
+    }),
 
   // Expandable subagent tree
   expandedSessions: new Set(),

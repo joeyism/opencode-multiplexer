@@ -10,6 +10,7 @@ import {
   countChildSessions,
   hasChildSessions,
   getMostRecentSessionForProject,
+  isTopLevelSession,
 } from "./db/reader.js"
 
 /**
@@ -111,6 +112,7 @@ function getRunningOpencodeProcesses(): RunningProcess[] {
         if (cwd) results.push({ cwd, sessionId: spawned?.sessionId ?? null, port })
         continue
       }
+
     }
 
     return results
@@ -153,7 +155,35 @@ function findBestProject(
 let _intervalId: ReturnType<typeof setInterval> | null = null
 let _lastPollTime = 0
 
-function loadFromDb(): void {
+/**
+ * Query a serve process's /session endpoint to discover all active sessions it hosts.
+ * A single serve process can serve multiple sessions (e.g. via `opencode attach`).
+ * Filters to only top-level sessions that were recently active (updated within the
+ * last 24 hours) to avoid flooding the dashboard with old/stale sessions.
+ */
+async function getActiveServeSessionIds(port: number): Promise<string[]> {
+  try {
+    const res = await fetch(`http://localhost:${port}/session`, {
+      signal: AbortSignal.timeout(1000),
+    })
+    if (!res.ok) return []
+    const sessions = (await res.json()) as Array<{
+      id: string
+      time?: { updated?: number }
+    }>
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000
+    return sessions
+      .filter((s) => {
+        const updated = s.time?.updated ?? 0
+        return updated > cutoff
+      })
+      .map((s) => s.id)
+  } catch {
+    return []
+  }
+}
+
+async function loadFromDb(): Promise<void> {
   try {
     const dbProjects = getProjects()
     const runningProcesses = getRunningOpencodeProcesses()
@@ -167,10 +197,16 @@ function loadFromDb(): void {
     const seenSessionIds = new Set<string>()
     // Track how many flag-less processes we've assigned per project
     const flaglessCountByProject = new Map<string, number>()
+    // Track serve processes so we can query them for additional sessions
+    const serveProcesses: Array<{ port: number; cwd: string }> = []
 
     for (const proc of runningProcesses) {
       const project = findBestProject(proc.cwd, dbProjects)
       if (!project) continue
+
+      if (proc.port) {
+        serveProcesses.push({ port: proc.port, cwd: proc.cwd })
+      }
 
       // Resolve the session ID
       let sessionId = proc.sessionId
@@ -217,8 +253,53 @@ function loadFromDb(): void {
       })
     }
 
-    // Sort: most recently updated first
-    ocmInstances.sort((a, b) => b.timeUpdated - a.timeUpdated)
+    // A single serve process can host multiple sessions (via `opencode attach`).
+    // Query each serve's /session API to discover sessions not yet accounted for.
+    for (const serve of serveProcesses) {
+      const allIds = await getActiveServeSessionIds(serve.port)
+      for (const sid of allIds) {
+        if (seenSessionIds.has(sid)) continue
+        if (!isTopLevelSession(sid)) continue
+        seenSessionIds.add(sid)
+
+        const session = getSessionById(sid)
+        if (!session) continue
+
+        const project = findBestProject(serve.cwd, dbProjects)
+        if (!project) continue
+
+        const status = getSessionStatus(sid)
+        const preview = getLastMessagePreview(sid)
+        const rawModel = getSessionModel(sid)
+
+        ocmInstances.push({
+          id: `${project.id}-${sid}`,
+          sessionId: sid,
+          sessionTitle: session.title || sid.slice(0, 20),
+          projectId: project.id,
+          worktree: serve.cwd,
+          repoName: deriveRepoName(serve.cwd),
+          status,
+          lastPreview: preview.text,
+          lastPreviewRole: preview.role,
+          hasChildren: hasChildSessions(sid),
+          model: rawModel ? shortenModel(rawModel) : null,
+          port: serve.port,
+          timeUpdated: session.timeUpdated,
+        })
+      }
+    }
+
+    // Sort: pinned first (by pin time), then by most recently updated
+    const pinned = useStore.getState().pinnedSessions
+    ocmInstances.sort((a, b) => {
+      const aPin = pinned.get(a.sessionId)
+      const bPin = pinned.get(b.sessionId)
+      if (aPin !== undefined && bPin !== undefined) return aPin - bPin
+      if (aPin !== undefined) return -1
+      if (bPin !== undefined) return 1
+      return b.timeUpdated - a.timeUpdated
+    })
 
     useStore.getState().setInstances(ocmInstances)
 

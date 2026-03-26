@@ -482,6 +482,19 @@ export function getSessionById(sessionId: string): DbSession | null {
   }
 }
 
+/**
+ * Check if a session is top-level (not a subagent child) and not archived.
+ */
+export function isTopLevelSession(sessionId: string): boolean {
+  const db = getDb()
+  const row = db
+    .query<{ parent_id: string | null; time_archived: number | null }, [string]>(
+      `SELECT parent_id, time_archived FROM session WHERE id = ?`,
+    )
+    .get(sessionId)
+  return row != null && row.parent_id == null && row.time_archived == null
+}
+
 // ─── Child session queries (for subagent tree) ───────────────────────────────
 
 export function getChildSessions(parentSessionId: string, limit = 10, offset = 0): DbSession[] {

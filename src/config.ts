@@ -19,6 +19,7 @@ export interface KeybindingsConfig {
     worktree: string
     renameTitle: string
     sessions: string
+    togglePin: string
   }
   conversation: {
     back: string
@@ -71,6 +72,7 @@ const DEFAULTS: Config = {
       worktree: "w",
       renameTitle: "t",
       sessions: "s",
+      togglePin: "p",
     },
     conversation: {
       back: "escape",

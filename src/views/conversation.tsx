@@ -27,6 +27,7 @@ function Sidebar({
   width,
   compact,
   expandedSessions,
+  pinnedSessions,
 }: {
   rows: VisibleRow[]
   currentSessionId: string | null
@@ -36,12 +37,10 @@ function Sidebar({
   width: number
   compact: boolean
   expandedSessions: Set<string>
+  pinnedSessions: Map<string, number>
 }) {
   // Inner width: total - 2 border chars
   const innerWidth = Math.max(0, width - 2)
-  // Max chars for repo/title after cursor(1) + space(1) + icon(1) + space(1) = 4
-  const maxLabelWidth = Math.max(0, innerWidth - 4)
-  const timeFieldWidth = Math.max(0, innerWidth - 4)
   const separatorLine = "─".repeat(innerWidth)
 
   return (
@@ -86,6 +85,7 @@ function Sidebar({
         const sessionId = isInstance ? row.instance.sessionId : row.session.id
         const isCurrent = sessionId === currentSessionId
         const isCursor = focused && i === cursorIndex
+        const isPinned = pinnedSessions.has(sessionId)
         const { char, color } = statusIcon(session.status)
         const cursorChar = isCursor ? "▸" : isCurrent ? "◆" : " "
         const expandChar = session.hasChildren
@@ -94,17 +94,21 @@ function Sidebar({
 
         if (compact) {
           const rawTime = relativeTime(session.timeUpdated)
-          const timeLabel = timeFieldWidth > 0 ? rawTime.slice(0, timeFieldWidth) : ""
+          const pinCols = isPinned ? 2 : 0
+          // Overhead: paddingLeft(1) + cursor(1) + space(1) + status(1) + space(1) = 5
+          const availableWidth = Math.max(0, innerWidth - 5 - pinCols)
+          const timeLabel = availableWidth > 0 ? rawTime.slice(0, availableWidth) : ""
           return (
             <Box key={sessionId} paddingLeft={1} overflow="hidden">
               <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
               <Text>{" "}</Text>
+              {isPinned && <Text color="yellow">⊤ </Text>}
               <Text color={color}>{char}</Text>
               <Text>{" "}</Text>
               <Text
                 bold={isCurrent || isCursor}
-                color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
-                dimColor={!isCurrent && !isCursor}
+                color={isCursor ? "cyan" : isPinned ? "yellow" : isCurrent ? "white" : undefined}
+                dimColor={!isCurrent && !isCursor && !isPinned}
               >
                 {timeLabel}
               </Text>
@@ -114,7 +118,9 @@ function Sidebar({
 
         const timeAgo = relativeTime(session.timeUpdated)
         const indentWidth = isInstance ? 0 : row.depth * 2
-        const labelBudget = Math.max(0, innerWidth - indentWidth - 7 - timeAgo.length)
+        const pinCols = isPinned ? 2 : 0
+        // Overhead: space(1) + cursor(1) + space(1) + status(1) + space(1) + expand(1) + space(1) + space-before-time(1) = 8
+        const labelBudget = Math.max(0, innerWidth - indentWidth - 8 - timeAgo.length - pinCols)
 
         let paddedLabel = ""
         if (isInstance) {
@@ -145,14 +151,15 @@ function Sidebar({
               <Text color={isCursor ? "cyan" : isCurrent ? "white" : "gray"}>{cursorChar}</Text>
               {" "}
               {indent}
+              {isPinned && <Text color="yellow">⊤ </Text>}
               <Text color={color}>{char}</Text>
               {" "}
               <Text dimColor>{expandChar}</Text>
               {" "}
               <Text
                 bold={isCurrent || isCursor}
-                color={isCursor ? "cyan" : isCurrent ? "white" : undefined}
-                dimColor={!isCurrent && !isCursor}
+                color={isCursor ? "cyan" : isPinned ? "yellow" : isCurrent ? "white" : undefined}
+                dimColor={!isCurrent && !isCursor && !isPinned}
               >{paddedLabel}</Text>
               {" "}
               <Text dimColor>{timeAgo}</Text>
@@ -178,6 +185,8 @@ export function Conversation() {
   const childSessions = useStore((s) => s.childSessions)
   const childScrollOffsets = useStore((s) => s.childScrollOffsets)
   const toggleExpanded = useStore((s) => s.toggleExpanded)
+  const pinnedSessions = useStore((s) => s.pinnedSessions)
+  const togglePin = useStore((s) => s.togglePin)
 
   const rows = React.useMemo(
     () => buildRows(instances, expandedSessions, childSessions, childScrollOffsets),
@@ -672,11 +681,33 @@ type PendingQuestion = {
         return
       }
 
-      const existingFiles = sessionFiles.filter((f) => existsSync(f))
+      // Filter out gitignored files before staging
+      const { spawnSync } = await import("child_process")
+      const ignoredSet = new Set<string>()
+      if (sessionFiles.length > 0) {
+        const result = spawnSync(
+          "git", ["check-ignore", "--stdin"],
+          { input: sessionFiles.join("\n"), cwd, encoding: "utf8" }
+        )
+        if (result.stdout) {
+          for (const line of result.stdout.split("\n")) {
+            const f = line.trim()
+            if (f) ignoredSet.add(f)
+          }
+        }
+      }
+      const committableFiles = sessionFiles.filter((f) => !ignoredSet.has(f))
+      if (committableFiles.length === 0) {
+        setCommitStatus("✗ no files to commit (all ignored or outside repo)")
+        setTimeout(() => { setCommitStatus(null); setCommitMode(false); setMode("normal") }, 2500)
+        return
+      }
+
+      const existingFiles = committableFiles.filter((f) => existsSync(f))
       if (existingFiles.length > 0) {
         exec(`git add ${existingFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
       }
-      const deletedFiles = sessionFiles.filter((f) => !existsSync(f))
+      const deletedFiles = committableFiles.filter((f) => !existsSync(f))
       if (deletedFiles.length > 0) {
         try {
           exec(`git add ${deletedFiles.map((f) => `"${f}"`).join(" ")}`, { cwd, stdio: "pipe" })
@@ -690,7 +721,7 @@ type PendingQuestion = {
         exec("git push origin HEAD", { cwd, stdio: "pipe" })
       } catch { pushOk = false }
 
-      const n = sessionFiles.length
+      const n = committableFiles.length
       const noun = `${n} file${n === 1 ? "" : "s"}`
       setCommitStatus(pushOk
         ? `✓ committed ${noun} and pushed`
@@ -1098,6 +1129,15 @@ type PendingQuestion = {
         setSidebarCompact((c) => !c)
         return
       }
+      if (input === "p") {
+        const targetRow = rows[sidebarCursor]
+        if (targetRow && targetRow.kind !== "scroll-indicator") {
+          const sessionId = targetRow.kind === "instance" ? targetRow.instance.sessionId : targetRow.session.id
+          togglePin(sessionId)
+          refreshNow()
+        }
+        return
+      }
       if (input === "t") {
         const target = instances[sidebarCursor]
         if (target) {
@@ -1324,6 +1364,7 @@ type PendingQuestion = {
   width={sidebarWidth}
   compact={sidebarCompact}
   expandedSessions={expandedSessions}
+  pinnedSessions={pinnedSessions}
 />
 
         <Box flexDirection="column" flexGrow={1} height={bodyHeight} width={contentWidth}>
@@ -1515,6 +1556,7 @@ type PendingQuestion = {
             <Box><Box width={16}><Text bold color="white">e</Text></Box><Text dimColor>open editor (normal mode)</Text></Box>
             <Box><Box width={16}><Text bold color="white">c</Text></Box><Text dimColor>commit session files + push</Text></Box>
             <Box><Box width={16}><Text bold color="white">t</Text></Box><Text dimColor>rename session title</Text></Box>
+            <Box><Box width={16}><Text bold color="white">p</Text></Box><Text dimColor>pin/unpin session (sidebar)</Text></Box>
             <Box><Box width={16}><Text bold color="white">Esc</Text></Box><Text dimColor>normal mode</Text></Box>
             <Box><Box width={16}><Text bold color="white">^W ^W</Text></Box><Text dimColor>toggle sidebar focus</Text></Box>
             <Box><Box width={16}><Text bold color="white">j/k</Text></Box><Text dimColor>scroll messages</Text></Box>
@@ -1646,7 +1688,7 @@ type PendingQuestion = {
           {isLive && mode === "insert"
             ? (titleMode ? `Esc: cancel  Enter: rename` : commitMode ? `Esc: cancel  Enter: commit and push` : `Esc: normal  Enter: send  ^XE: editor`)
             : isLive
-            ? `q: back  i: insert  e: edit  c: commit  t: title  m: model  f: files  s: sidebar  /:search  ^W^W: focus  Tab: agent  a: attach  !: shell  j/k: scroll  ? help`
+            ? `q: back  i: insert  e: edit  c: commit  t: title  p: pin  m: model  f: files  s: sidebar  /:search  ^W^W: focus  Tab: agent  a: attach  !: shell  j/k: scroll  ? help`
             : `q: back  a/i/Enter: attach  j/k: scroll  ^U/^D: ½pg  G/gg: nav`
           }
         </Text>

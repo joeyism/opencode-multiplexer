@@ -12,7 +12,6 @@ import { useDashboardKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode } from "../hooks/use-attach.js"
 import { config } from "../config.js"
 import { refreshNow, shortenModel, deriveRepoName } from "../poller.js"
-import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ensureServeProcess, killInstance } from "../registry/instances.js"
 import { statusIcon, relativeTime } from "./helpers.js"
 import { APP_BORDER_COLS } from "./layout.js"
@@ -89,6 +88,8 @@ export function Dashboard() {
   const childScrollOffsets = useStore((s) => s.childScrollOffsets)
   const setChildSessions = useStore((s) => s.setChildSessions)
   const setChildScrollOffset = useStore((s) => s.setChildScrollOffset)
+  const pinnedSessions = useStore((s) => s.pinnedSessions)
+  const togglePin = useStore((s) => s.togglePin)
   const { stdout } = useStdout()
   const termWidth = stdout?.columns ?? 80
   const effectiveWidth = termWidth - APP_BORDER_COLS   // account for App border (left + right)
@@ -146,8 +147,9 @@ export function Dashboard() {
     }
     if (!killConfirm) return
     if (input === "y" || input === "Y") {
-      killInstance(killConfirm.worktree, killConfirm.sessionId)
+      const inst = killConfirm
       setKillConfirm(null)
+      killInstance(inst.worktree, inst.sessionId)
       refreshNow()
     } else if (input === "n" || input === "N" || key.escape) {
       setKillConfirm(null)
@@ -168,11 +170,19 @@ export function Dashboard() {
         port = await ensureServeProcess(titleRenameTarget.worktree)
       }
       if (!port) throw new Error("unable to determine serve port")
-      const client = createOpencodeClient({ baseUrl: `http://localhost:${port}` })
-      await (client.session as any).update({
-        path: { id: titleRenameTarget.sessionId },
-        body: { title: newTitle.trim() },
-      })
+      const res = await fetch(
+        `http://localhost:${port}/session/${titleRenameTarget.sessionId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: newTitle.trim() }),
+          signal: AbortSignal.timeout(3000),
+        },
+      )
+      if (!res.ok) {
+        const text = await res.text().catch(() => "")
+        throw new Error(`HTTP ${res.status}: ${text}`)
+      }
       setTitleStatus("✓ title updated")
       setTimeout(() => setTitleStatus(null), 1500)
       refreshNow()
@@ -363,6 +373,12 @@ export function Dashboard() {
     },
     onRescan: () => { refreshNow() },
     onHelp: () => setShowHelp((v) => !v),
+    onTogglePin: () => {
+      if (!currentRow || currentRow.kind === "scroll-indicator") return
+      const sessionId = currentRow.kind === "instance" ? currentRow.instance.sessionId : currentRow.session.id
+      togglePin(sessionId)
+      refreshNow()
+    },
     onSessions: () => {
       const sessions = getAllSessions(500)
       setSessionPickerSessions(sessions)
@@ -420,6 +436,7 @@ export function Dashboard() {
             <Box><Box width={12}><Text bold color="white">{kb.kill}</Text></Box><Text dimColor>kill selected instance</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.rescan}</Text></Box><Text dimColor>refresh from database</Text></Box>
             <Box><Box width={12}><Text bold color="white">t</Text></Box><Text dimColor>rename title</Text></Box>
+            <Box><Box width={12}><Text bold color="white">p</Text></Box><Text dimColor>pin/unpin to top</Text></Box>
             <Box><Box width={12}><Text bold color="white">s</Text></Box><Text dimColor>browse past sessions</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.help}</Text></Box><Text dimColor>close help</Text></Box>
             <Box><Box width={12}><Text bold color="white">{kb.quit}</Text></Box><Text dimColor>quit</Text></Box>
@@ -481,6 +498,7 @@ export function Dashboard() {
 
             if (row.kind === "instance") {
               const { char, color } = statusIcon(row.instance.status)
+              const isPinned = pinnedSessions.has(row.instance.sessionId)
               const canExpand = row.instance.hasChildren
               const isExpanded = expandedSessions.has(row.instance.sessionId)
               const expandChar = !canExpand ? "  " : isExpanded ? "▾ " : "▸ "
@@ -489,23 +507,26 @@ export function Dashboard() {
               if (row.instance.status === "working" && !preview) preview = "working..."
 
               // Fixed prefix: paddingLeft(1) + cursor(2) + icon(2) + expand(2) = 7 chars
+              // Plus pin icon(2) if pinned
+              const prefixLen = isPinned ? 9 : 7
               const model = row.instance.model
               const timeAgoStr = relativeTime(row.instance.timeUpdated)
               const modelStr = model ? model + "  " : ""
               const modelLen = modelStr.length
               const timeLen = timeAgoStr.length + 2  // "  2m"
-                 const labelLen = Math.min(36, Math.floor((effectiveWidth - 7 - modelLen - timeLen - 2) * 0.55))
+              const labelLen = Math.min(36, Math.floor((effectiveWidth - prefixLen - modelLen - timeLen - 2) * 0.55))
               const label = `${row.instance.repoName} / ${row.instance.sessionTitle}`
               const truncLabel = label.length > labelLen ? label.slice(0, labelLen - 1) + "…" : label.padEnd(labelLen)
-                 const previewLen = Math.max(0, effectiveWidth - 7 - labelLen - modelLen - timeLen - 2)
+              const previewLen = Math.max(0, effectiveWidth - prefixLen - labelLen - modelLen - timeLen - 2)
               const truncPreview = preview.length > previewLen ? preview.slice(0, Math.max(0, previewLen - 1)) + (previewLen > 1 ? "…" : "") : preview
 
               return (
                 <Box key={row.instance.id} paddingLeft={1}>
                   <Text color={isCursor ? "cyan" : undefined} bold={isCursor}>{isCursor ? "┃ " : "  "}</Text>
+                  {isPinned && <Text color="yellow">⊤ </Text>}
                   <Text color={color}>{char} </Text>
                   <Text dimColor>{expandChar}</Text>
-                  <Text bold={isCursor}>{truncLabel}</Text>
+                  <Text bold={isCursor} color={isPinned ? "yellow" : undefined}>{truncLabel}</Text>
                   {model && <Text color="cyan" dimColor>  {model}</Text>}
                   <Text dimColor>  {timeAgoStr}</Text>
                   <Text dimColor wrap="truncate">  {truncPreview}</Text>
@@ -515,6 +536,7 @@ export function Dashboard() {
 
             if (row.kind === "child") {
               const { char, color } = statusIcon(row.session.status)
+              const isPinned = pinnedSessions.has(row.session.id)
               const indent = "  ".repeat(row.depth)
               const treeChar = row.isLast ? "└─ " : "├─ "
               const expandIndicator = row.session.hasChildren
@@ -531,10 +553,11 @@ export function Dashboard() {
               return (
                 <Box key={`child-${row.parentSessionId}-${row.session.id}`} paddingLeft={1}>
                   <Text color={isCursor ? "cyan" : undefined} bold={isCursor}>{isCursor ? "┃ " : "  "}</Text>
+                  {isPinned && <Text color="yellow">⊤ </Text>}
                   <Text dimColor>{indent + treeChar}</Text>
                   <Text color={color}>{char} </Text>
                   <Text color="magenta">{badge}</Text>
-                  <Text bold={isCursor}> {truncChildTitle}</Text>
+                  <Text bold={isCursor} color={isPinned ? "yellow" : undefined}> {truncChildTitle}</Text>
                   {row.session.model && <Text color="cyan" dimColor>  {row.session.model}</Text>}
                   <Text dimColor>{expandIndicator}  {timeAgo}</Text>
                 </Box>
@@ -590,6 +613,7 @@ export function Dashboard() {
                  <Text><Text bold color="white">s</Text> <Text dimColor>sessions</Text></Text>
                  <Text><Text bold color="white">{kb.kill}</Text> <Text dimColor>kill</Text></Text>
                   <Text><Text bold color="white">t</Text> <Text dimColor>rename</Text></Text>
+                  <Text><Text bold color="white">p</Text> <Text dimColor>pin</Text></Text>
                   <Text><Text bold color="white">?</Text> <Text dimColor>help</Text></Text>
                  <Text><Text bold color="white">{kb.quit}</Text> <Text dimColor>quit</Text></Text>
                </Box>
