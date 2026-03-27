@@ -8,7 +8,7 @@ import { yieldToOpencode, yieldToShell, openInEditor, openFileInEditor, consumeP
 import { getMessages, getSessionById, getSessionStatus, getSessionAgent, getSessionModifiedFiles, getSessionModel, getChildSessionQuestions } from "../db/reader.js"
 import { config } from "../config.js"
 import { shortenModel, refreshNow } from "../poller.js"
-import { ensureServeProcess, killInstance } from "../registry/instances.js"
+import { ensureServeProcess, killInstance, untrackSession } from "../registry/instances.js"
 import { statusIcon, relativeTime } from "./helpers.js"
 import { computeConversationLayout, APP_BORDER_COLS } from "./layout.js"
 
@@ -206,6 +206,7 @@ export function Conversation() {
   // Auto-spawned serve process port (for non-OCMux sessions)
   const [autoSpawnedPort, setAutoSpawnedPort] = React.useState<number | null>(null)
   const [autoSpawning, setAutoSpawning] = React.useState(false)
+  const [autoSpawnError, setAutoSpawnError] = React.useState<string | null>(null)
   // Loading state: covers the gap between promptAsync returning and SSE status arriving
   const [waitingForResponse, setWaitingForResponse] = React.useState(false)
   // Kill confirmation
@@ -585,13 +586,14 @@ type PendingQuestion = {
     async function spawn() {
       try {
         setAutoSpawning(true)
+        setAutoSpawnError(null)
         const cwd = sessionCwd
         if (!cwd) return
         const port = await ensureServeProcess(cwd)
         if (cancelled) return
         setAutoSpawnedPort(port)
       } catch (e) {
-        // Failed to spawn — instance stays read-only
+        if (!cancelled) setAutoSpawnError(String(e))
       } finally {
         if (!cancelled) setAutoSpawning(false)
       }
@@ -605,6 +607,7 @@ type PendingQuestion = {
   // Reset auto-spawned port when session changes (new session may need different serve)
   React.useEffect(() => {
     setAutoSpawnedPort(null)
+    setAutoSpawnError(null)
   }, [selectedSessionId])
 
   const openInOpencode = React.useCallback(() => {
@@ -960,6 +963,7 @@ type PendingQuestion = {
         const killed = killConfirm
         setKillConfirm(null)
         killInstance(killed.worktree, killed.sessionId)
+        untrackSession(killed.sessionId)
         refreshNow()
         const remaining = instances.filter((i) => i.sessionId !== killed.sessionId)
         if (remaining.length > 0) {
@@ -1538,6 +1542,14 @@ type PendingQuestion = {
               <Text dimColor>{divider}</Text>
               <Box paddingLeft={1}>
                 <Text dimColor>Starting background server...</Text>
+              </Box>
+            </>
+          )}
+          {!isLive && autoSpawnError && (
+            <>
+              <Text dimColor>{divider}</Text>
+              <Box paddingLeft={1}>
+                <Text color="red">Server error: {autoSpawnError}</Text>
               </Box>
             </>
           )}

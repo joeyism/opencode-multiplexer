@@ -1,4 +1,5 @@
 import { create } from "zustand"
+import { trackSession } from "./registry/instances.js"
 
 // ─── Status types ─────────────────────────────────────────────────────────────
 
@@ -169,7 +170,10 @@ export const useStore = create<Store>((set) => ({
   selectedSessionId: null,
   cursorIndex: 0,
   setCursorIndex: (cursorIndex) => set({ cursorIndex }),
-  navigate: (view, projectId, sessionId) =>
+  navigate: (view, projectId, sessionId) => {
+    if (view === "conversation" && sessionId) {
+      trackSession(sessionId)
+    }
     set({
       view,
       selectedProjectId: projectId ?? null,
@@ -177,7 +181,8 @@ export const useStore = create<Store>((set) => ({
       cursorIndex: 0,
       messages: [],
       messagesLoading: false,
-    }),
+    })
+  },
 
   // Conversation
   messages: [],

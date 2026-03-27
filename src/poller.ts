@@ -39,7 +39,7 @@ export function shortenModel(model: string): string {
   return s
 }
 import { useStore, type OcmInstance, type OcmSession, type SessionStatus } from "./store.js"
-import { loadSpawnedInstances } from "./registry/instances.js"
+import { loadSpawnedInstances, loadManagedSessions } from "./registry/instances.js"
 
 interface RunningProcess {
   cwd: string
@@ -255,11 +255,20 @@ async function loadFromDb(): Promise<void> {
 
     // A single serve process can host multiple sessions (via `opencode attach`).
     // Query each serve's /session API to discover sessions not yet accounted for.
+    const managedSessions = loadManagedSessions()
+
     for (const serve of serveProcesses) {
       const allIds = await getActiveServeSessionIds(serve.port)
       for (const sid of allIds) {
         if (seenSessionIds.has(sid)) continue
         if (!isTopLevelSession(sid)) continue
+
+        const status = getSessionStatus(sid)
+        // Skip unless: managed by ocmux OR genuinely active right now
+        if (!managedSessions.has(sid) && status !== "working" && status !== "needs-input") {
+          continue
+        }
+
         seenSessionIds.add(sid)
 
         const session = getSessionById(sid)
@@ -268,7 +277,6 @@ async function loadFromDb(): Promise<void> {
         const project = findBestProject(serve.cwd, dbProjects)
         if (!project) continue
 
-        const status = getSessionStatus(sid)
         const preview = getLastMessagePreview(sid)
         const rawModel = getSessionModel(sid)
 

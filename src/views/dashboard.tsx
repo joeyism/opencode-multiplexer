@@ -12,7 +12,7 @@ import { useDashboardKeys } from "../hooks/use-keybindings.js"
 import { yieldToOpencode } from "../hooks/use-attach.js"
 import { config } from "../config.js"
 import { refreshNow, shortenModel, deriveRepoName } from "../poller.js"
-import { ensureServeProcess, killInstance } from "../registry/instances.js"
+import { ensureServeProcess, killInstance, untrackSession } from "../registry/instances.js"
 import { statusIcon, relativeTime } from "./helpers.js"
 import { APP_BORDER_COLS } from "./layout.js"
 import {
@@ -150,6 +150,7 @@ export function Dashboard() {
       const inst = killConfirm
       setKillConfirm(null)
       killInstance(inst.worktree, inst.sessionId)
+      untrackSession(inst.sessionId)
       refreshNow()
     } else if (input === "n" || input === "N" || key.escape) {
       setKillConfirm(null)

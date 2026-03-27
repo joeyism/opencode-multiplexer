@@ -5,6 +5,7 @@ import { execSync, spawn } from "child_process"
 
 const CONFIG_DIR = join(homedir(), ".config", "ocmux")
 const INSTANCES_FILE = join(CONFIG_DIR, "instances.json")
+const MANAGED_SESSIONS_FILE = join(CONFIG_DIR, "managed-sessions.json")
 
 export interface SpawnedInstance {
   port: number
@@ -31,7 +32,35 @@ export function saveSpawnedInstances(instances: SpawnedInstance[]): void {
   writeFileSync(INSTANCES_FILE, JSON.stringify(instances, null, 2))
 }
 
-function isPidAlive(pid: number): boolean {
+export function loadManagedSessions(): Set<string> {
+  try {
+    const raw = readFileSync(MANAGED_SESSIONS_FILE, "utf-8")
+    return new Set(JSON.parse(raw) as string[])
+  } catch {
+    return new Set()
+  }
+}
+
+export function saveManagedSessions(sessions: Set<string>): void {
+  ensureDir()
+  writeFileSync(MANAGED_SESSIONS_FILE, JSON.stringify([...sessions], null, 2))
+}
+
+export function trackSession(sessionId: string): void {
+  const sessions = loadManagedSessions()
+  if (sessions.has(sessionId)) return
+  sessions.add(sessionId)
+  saveManagedSessions(sessions)
+}
+
+export function untrackSession(sessionId: string): void {
+  const sessions = loadManagedSessions()
+  if (!sessions.has(sessionId)) return
+  sessions.delete(sessionId)
+  saveManagedSessions(sessions)
+}
+
+export function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
@@ -40,7 +69,7 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-async function isPortAlive(port: number): Promise<boolean> {
+export async function isPortAlive(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://localhost:${port}/doc`, {
       signal: AbortSignal.timeout(1000),
@@ -74,13 +103,31 @@ export async function cleanDeadInstances(): Promise<void> {
 /**
  * Find the next available port for a new opencode serve instance.
  */
-export async function findNextPort(startPort = 4096, endPort = 4115): Promise<number> {
-  const existing = new Set(loadSpawnedInstances().map((i) => i.port))
+export async function findNextPort(startPort = 4096, endPort = 4295): Promise<number> {
+  const instances = loadSpawnedInstances()
+  const portToInstance = new Map(instances.map((i) => [i.port, i]))
+
+  let pruned = false
   for (let port = startPort; port <= endPort; port++) {
-    if (existing.has(port)) continue
-    // Check if anything is already listening
+    const inst = portToInstance.get(port)
+    if (inst) {
+      // Claimed in instances.json — but is the process actually alive?
+      if (isPidAlive(inst.pid)) continue
+      // PID is dead — mark for cleanup and treat port as candidate
+      portToInstance.delete(port)
+      pruned = true
+    }
+    // Check if anything else is listening on this port
     const inUse = await isPortAlive(port)
-    if (!inUse) return port
+    if (!inUse) {
+      if (pruned) {
+        saveSpawnedInstances(instances.filter((i) => portToInstance.has(i.port)))
+      }
+      return port
+    }
+  }
+  if (pruned) {
+    saveSpawnedInstances(instances.filter((i) => portToInstance.has(i.port)))
   }
   throw new Error(`No available ports in range ${startPort}-${endPort}`)
 }
@@ -148,11 +195,12 @@ function findPidByWorktree(worktree: string): number | null {
  * Handles both spawned serve instances (from instances.json) and TUI instances.
  */
 export function killInstance(worktree: string, sessionId: string | null): void {
-  // 1. Check instances.json for a matching spawned serve process.
-  //    Match by sessionId first (most reliable), then by cwd prefix.
+  // 1. Kill ALL matching instances in instances.json:
+  //    - exact sessionId match (the managed ocmux instance)
+  //    - any sessionId=null (auto-spawned) serve process for the same cwd
   //    Note: instances.json cwd may differ from the project's SQLite worktree.
   const instances = loadSpawnedInstances()
-  const idx = instances.findIndex((i) => {
+  const toKill = instances.filter((i) => {
     if (sessionId && i.sessionId === sessionId) return true
     return (
       i.cwd === worktree ||
@@ -161,11 +209,11 @@ export function killInstance(worktree: string, sessionId: string | null): void {
     )
   })
 
-  if (idx >= 0) {
-    const inst = instances[idx]!
-    try { process.kill(inst.pid, "SIGTERM") } catch { /* already dead */ }
-    instances.splice(idx, 1)
-    saveSpawnedInstances(instances)
+  if (toKill.length > 0) {
+    for (const inst of toKill) {
+      try { process.kill(inst.pid, "SIGTERM") } catch { /* already dead */ }
+    }
+    saveSpawnedInstances(instances.filter((i) => !toKill.includes(i)))
     return
   }
 
@@ -183,14 +231,20 @@ export function killInstance(worktree: string, sessionId: string | null): void {
  * Returns the port number.
  */
 export async function ensureServeProcess(cwd: string): Promise<number> {
-  // 1. Check if we already have a live serve process for this directory
+  // 1. Prune dead entries opportunistically (synchronous, free)
   const instances = loadSpawnedInstances()
-  for (const inst of instances) {
+  const liveInstances = instances.filter((i) => isPidAlive(i.pid))
+  if (liveInstances.length !== instances.length) {
+    saveSpawnedInstances(liveInstances)
+  }
+
+  // 2. Check if we already have a live serve process for this directory
+  for (const inst of liveInstances) {
     const cwdMatch =
       inst.cwd === cwd ||
       inst.cwd.startsWith(cwd + "/") ||
       cwd.startsWith(inst.cwd + "/")
-    if (cwdMatch && isPidAlive(inst.pid) && (await isPortAlive(inst.port))) {
+    if (cwdMatch && (await isPortAlive(inst.port))) {
       return inst.port
     }
   }
