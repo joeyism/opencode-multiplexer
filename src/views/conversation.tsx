@@ -9,7 +9,7 @@ import { getMessages, getSessionById, getSessionStatus, getSessionAgent, getSess
 import { config } from "../config.js"
 import { shortenModel, refreshNow } from "../poller.js"
 import { ensureServeProcess, killInstance, untrackSession } from "../registry/instances.js"
-import { statusIcon, relativeTime } from "./helpers.js"
+import { statusIcon, relativeTime, filterFilesForCwd, findDisplayLineMatches, getSearchScrollOffset, highlightMatches } from "./helpers.js"
 import { computeConversationLayout, APP_BORDER_COLS } from "./layout.js"
 
 
@@ -217,6 +217,10 @@ export function Conversation() {
   const [commitMode, setCommitMode] = React.useState(false)
   const [commitText, setCommitText] = React.useState("")
   const [commitStatus, setCommitStatus] = React.useState<string | null>(null)
+  const [searchMode, setSearchMode] = React.useState(false)
+  const [searchInput, setSearchInput] = React.useState("")
+  const [searchQuery, setSearchQuery] = React.useState("")
+  const [searchMatchCursor, setSearchMatchCursor] = React.useState(0)
   // Title rename mode
   const [titleMode, setTitleMode] = React.useState(false)
   const [titleText, setTitleText] = React.useState("")
@@ -676,8 +680,7 @@ type PendingQuestion = {
       const { existsSync } = await import("fs")
       const cwd = sessionCwd
 
-      const files = getSessionModifiedFiles(selectedSessionId)
-      const sessionFiles = files.filter((f) => f.startsWith(cwd + "/") || !f.startsWith("/"))
+      const sessionFiles = filterFilesForCwd(getSessionModifiedFiles(selectedSessionId), cwd)
       if (sessionFiles.length === 0) {
         setCommitStatus("✗ no files modified in this session")
         setTimeout(() => { setCommitStatus(null); setCommitMode(false); setMode("normal") }, 2500)
@@ -839,6 +842,33 @@ type PendingQuestion = {
   const endIdx = Math.max(0, totalLines - scrollOffset)
   const visibleLines: typeof displayLines = displayLines.slice(startIdx, endIdx)
 
+  const searchMatches = React.useMemo(
+    () => findDisplayLineMatches(displayLines, searchQuery),
+    [displayLines, searchQuery]
+  )
+
+  React.useEffect(() => {
+    if (searchMatches.length === 0) {
+      setSearchMatchCursor(0)
+      return
+    }
+    setSearchMatchCursor((cursor) => Math.min(cursor, searchMatches.length - 1))
+  }, [searchMatches.length])
+
+  React.useEffect(() => {
+    if (!searchQuery || searchMatches.length === 0) return
+    const lineIndex = searchMatches[searchMatchCursor]
+    if (lineIndex === undefined) return
+    setScrollOffset(getSearchScrollOffset(totalLines, msgAreaHeight, lineIndex))
+  }, [searchMatchCursor, searchMatches, searchQuery, totalLines, msgAreaHeight])
+
+  React.useEffect(() => {
+    setSearchMode(false)
+    setSearchInput("")
+    setSearchQuery("")
+    setSearchMatchCursor(0)
+  }, [selectedSessionId])
+
 
   // Scroll position indicator
   const scrollPct = totalLines <= msgAreaHeight
@@ -983,6 +1013,21 @@ type PendingQuestion = {
     }
     if (filePickerOpen) {
       filePicker.handleInput(input, key)
+      return
+    }
+    if (searchMode) {
+      if (key.return) {
+        setSearchQuery(searchInput.trim())
+        setSearchMatchCursor(0)
+        setSearchMode(false)
+      } else if (key.escape) {
+        setSearchMode(false)
+        setSearchInput(searchQuery)
+      } else if (key.backspace || key.delete) {
+        setSearchInput((text) => text.slice(0, -1))
+      } else if (input && !key.ctrl && !key.meta) {
+        setSearchInput((text) => text + input)
+      }
       return
     }
     // ── INSERT MODE ──────────────────────────────────────────────────────────
@@ -1165,6 +1210,12 @@ type PendingQuestion = {
       return
     }
 
+    if (input === "/") {
+      setSearchMode(true)
+      setSearchInput(searchQuery)
+      return
+    }
+
     // ── CONVERSATION FOCUSED — session management keys ────────────────────
 
     // Ctrl-N: jump to next needs-input session (must be before 'n' check)
@@ -1178,6 +1229,15 @@ type PendingQuestion = {
         }) ?? needsInput[0]!
         navigate("conversation", next.projectId, next.sessionId)
       }
+      return
+    }
+
+    if (searchQuery && (input === "n" || input === "N" || (input === "n" && key.shift))) {
+      if (searchMatches.length === 0) return
+      setSearchMatchCursor((cursor) => {
+        if (input === "N" || key.shift) return (cursor - 1 + searchMatches.length) % searchMatches.length
+        return (cursor + 1) % searchMatches.length
+      })
       return
     }
 
@@ -1299,9 +1359,12 @@ type PendingQuestion = {
 
   // When any overlay is open, hide the body entirely — prevents background bleed-through in Ink
   const anyOverlayOpen = showHelp || modelPickerOpen || filePickerOpen || !!pendingQuestion
+  const searchStatus = searchQuery
+    ? (searchMatches.length > 0 ? `${searchMatchCursor + 1}/${searchMatches.length}` : "0/0")
+    : null
 
   // Normal mode keybindings — all disabled in insert mode
-  useConversationKeys(mode === "normal" && focus === "conversation" && !anyOverlayOpen ? {
+  useConversationKeys(mode === "normal" && focus === "conversation" && !anyOverlayOpen && !searchMode ? {
     onBack: () => navigate("dashboard"),
     onAttach: openInOpencode,
     onSend: isLive ? undefined : openInOpencode,  // Enter attaches for read-only
@@ -1407,22 +1470,25 @@ type PendingQuestion = {
                 )
               }
               if (line.kind === "thinking") {
+                const text = searchQuery ? highlightMatches(line.text, searchQuery) : line.text
                 return (
                   <Box key={`th-${i}`} paddingLeft={4} height={1} overflow="hidden">
-                    <Text dimColor color="yellow" wrap="truncate">{line.text}</Text>
+                    <Text dimColor color="yellow" wrap="truncate">{text}</Text>
                   </Box>
                 )
               }
               if (line.kind === "question") {
                 const isRunning = line.status === "running"
+                const header = searchQuery ? highlightMatches(line.header, searchQuery) : line.header
+                const question = searchQuery ? highlightMatches(line.question, searchQuery) : line.question
                 return (
                   <Box key={`q-${i}`} flexDirection="column" paddingLeft={4}>
                     <Box>
                       <Text color="yellow" bold>{isRunning ? "❓ " : "✓ "}</Text>
-                      <Text color={isRunning ? "yellow" : "gray"} bold>{line.header}</Text>
+                      <Text color={isRunning ? "yellow" : "gray"} bold>{header}</Text>
                     </Box>
                     <Box paddingLeft={3}>
-                      <Text color={isRunning ? "yellow" : "gray"} wrap="truncate">{line.question}</Text>
+                      <Text color={isRunning ? "yellow" : "gray"} wrap="truncate">{question}</Text>
                     </Box>
                     {isRunning && line.options.length === 0 && (
                       <Box paddingLeft={3}>
@@ -1436,18 +1502,21 @@ type PendingQuestion = {
               }
               if (line.kind === "tool") {
                 const detail = line.title || line.input || ""
+                const name = searchQuery ? highlightMatches(line.name, searchQuery) : line.name
+                const highlightedDetail = searchQuery ? highlightMatches(detail, searchQuery) : detail
                 return (
                   <Box key={`tool-${i}`} paddingLeft={4} height={1} overflow="hidden">
                     <Text color={line.color as any}>{line.icon} </Text>
-                    <Text dimColor>{line.name}</Text>
-                    {detail && <Text dimColor wrap="truncate">  {detail}</Text>}
+                    <Text dimColor>{name}</Text>
+                    {detail && <Text dimColor wrap="truncate">  {highlightedDetail}</Text>}
                   </Box>
                 )
               }
               if (line.kind === "text") {
+                const text = searchQuery ? highlightMatches(line.text, searchQuery) : line.text
                 return (
                   <Box key={`txt-${i}`} paddingLeft={4} height={1} overflow="hidden">
-                    <Text wrap="truncate">{line.text}</Text>
+                    <Text wrap="truncate">{text}</Text>
                   </Box>
                 )
               }
@@ -1697,7 +1766,11 @@ type PendingQuestion = {
       {/* Footer — full width, outside the sidebar/content row */}
       <Box paddingX={1} paddingY={0} borderStyle="single" borderColor="gray">
         <Text dimColor wrap="truncate">
-          {isLive && mode === "insert"
+          {searchMode
+            ? `/` + searchInput + "  Enter: search  Esc: cancel"
+            : searchQuery
+            ? `/${searchQuery}  ${searchStatus}  n/N: next/prev  /: edit search`
+            : isLive && mode === "insert"
             ? (titleMode ? `Esc: cancel  Enter: rename` : commitMode ? `Esc: cancel  Enter: commit and push` : `Esc: normal  Enter: send  ^XE: editor`)
             : isLive
             ? `q: back  i: insert  e: edit  c: commit  t: title  p: pin  m: model  f: files  s: sidebar  /:search  ^W^W: focus  Tab: agent  a: attach  !: shell  j/k: scroll  ? help`

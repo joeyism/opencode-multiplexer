@@ -1,5 +1,7 @@
 import stripAnsi from "strip-ansi"
+import { relative as pathRelative } from "path"
 import type { SessionStatus } from "../store.js"
+import type { DisplayLine } from "./display-lines.js"
 
 /**
  * Format a timestamp as a compact relative time string.
@@ -83,4 +85,44 @@ export function highlightMatches(text: string, query: string): string {
       result.slice(endOrig)
   }
   return result
+}
+
+export function filterFilesForCwd(files: string[], cwd: string): string[] {
+  return files.filter((file) => {
+    if (!file.startsWith("/")) return true
+
+    const relativePath = pathRelative(cwd, file)
+    return relativePath === "" || (!relativePath.startsWith("..") && relativePath !== "..")
+  })
+}
+
+function getDisplayLineSearchText(line: DisplayLine): string {
+  switch (line.kind) {
+    case "thinking":
+    case "text":
+      return line.text
+    case "tool":
+      return [line.name, line.title || line.input].filter(Boolean).join(" ")
+    case "question":
+      return [line.header, line.question].filter(Boolean).join(" ")
+    default:
+      return ""
+  }
+}
+
+export function findDisplayLineMatches(lines: DisplayLine[], query: string): number[] {
+  const trimmed = query.trim()
+  if (!trimmed) return []
+
+  const lowerQuery = trimmed.toLowerCase()
+  return lines.flatMap((line, index) =>
+    stripAnsi(getDisplayLineSearchText(line)).toLowerCase().includes(lowerQuery) ? [index] : []
+  )
+}
+
+export function getSearchScrollOffset(totalLines: number, msgAreaHeight: number, lineIndex: number): number {
+  const safeHeight = Math.max(1, msgAreaHeight)
+  const maxStart = Math.max(0, totalLines - safeHeight)
+  const targetStart = Math.max(0, Math.min(lineIndex, maxStart))
+  return Math.max(0, totalLines - safeHeight - targetStart)
 }

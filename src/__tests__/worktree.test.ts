@@ -1,10 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test"
 import { execSync } from "child_process"
-import { existsSync, mkdirSync, rmSync } from "fs"
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
 import { createWorktree } from "../registry/instances.js"
 import { getSessionModifiedFiles } from "../db/reader.js"
+import { detectProjectVenv } from "../views/worktree.js"
 
 // Create a temporary git repo for testing
 const TEST_DIR = join(tmpdir(), `ocmux-worktree-test-${Date.now()}`)
@@ -89,5 +90,44 @@ describe("createWorktree", () => {
       encoding: "utf-8",
     }).trim()
     expect(isWt).toBe("true")
+  })
+})
+
+describe("detectProjectVenv", () => {
+  test("prefers project root .venv over worktree cwd", () => {
+    const repoDir = join(TEST_DIR, "repo-with-venv")
+    const worktreeDir = join(repoDir, ".worktrees", "feature-branch")
+    const rootPython = join(repoDir, ".venv", "bin", "python")
+    const worktreePython = join(worktreeDir, ".venv", "bin", "python")
+
+    mkdirSync(join(repoDir, ".venv", "bin"), { recursive: true })
+    mkdirSync(join(worktreeDir, ".venv", "bin"), { recursive: true })
+    writeFileSync(rootPython, "")
+    writeFileSync(worktreePython, "")
+
+    const venv = detectProjectVenv(repoDir)
+
+    expect(venv?.root).toBe(join(repoDir, ".venv"))
+    expect(venv?.binDir).toBe(join(repoDir, ".venv", "bin"))
+  })
+
+  test("falls back to project root venv when .venv is absent", () => {
+    const repoDir = join(TEST_DIR, "repo-with-venv-fallback")
+    const pythonPath = join(repoDir, "venv", "bin", "python")
+
+    mkdirSync(join(repoDir, "venv", "bin"), { recursive: true })
+    writeFileSync(pythonPath, "")
+
+    const venv = detectProjectVenv(repoDir)
+
+    expect(venv?.root).toBe(join(repoDir, "venv"))
+    expect(venv?.binDir).toBe(join(repoDir, "venv", "bin"))
+  })
+
+  test("returns null when no supported project-root virtualenv exists", () => {
+    const repoDir = join(TEST_DIR, "repo-without-venv")
+    mkdirSync(repoDir, { recursive: true })
+
+    expect(detectProjectVenv(repoDir)).toBeNull()
   })
 })

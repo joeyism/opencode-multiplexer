@@ -3,6 +3,7 @@ import { Box, Text } from "ink"
 import TextInput from "ink-text-input"
 import { execSync, spawn as spawnProcess } from "child_process"
 import { existsSync } from "fs"
+import { join } from "path"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { useStore } from "../store.js"
 import { useSpawnKeys } from "../hooks/use-keybindings.js"
@@ -68,6 +69,17 @@ function isGitRepo(dir: string): boolean {
   }
 }
 
+export function detectProjectVenv(projectRoot: string): { root: string; binDir: string } | null {
+  for (const dirName of [".venv", "venv"]) {
+    const root = join(projectRoot, dirName)
+    const binDir = join(root, "bin")
+    if (existsSync(join(binDir, "python"))) {
+      return { root, binDir }
+    }
+  }
+  return null
+}
+
 export function Worktree() {
   const navigate = useStore((s) => s.navigate)
   const [step, setStep] = React.useState<"repo" | "branch" | "spawning" | "error">("repo")
@@ -112,16 +124,25 @@ export function Worktree() {
     }
   }, []) // eslint-disable-line
 
-  const doSpawn = React.useCallback(async (cwd: string) => {
+  const doSpawn = React.useCallback(async (cwd: string, projectRoot: string) => {
     setStep("spawning")
     setErrorMsg("")
 
     try {
       const port = await findNextPort()
+      const projectVenv = detectProjectVenv(projectRoot)
+      const env = projectVenv
+        ? {
+            ...process.env,
+            PATH: `${projectVenv.binDir}:${process.env.PATH ?? ""}`,
+            VIRTUAL_ENV: projectVenv.root,
+          }
+        : undefined
       const proc = spawnProcess("opencode", ["serve", "--port", String(port)], {
         cwd,
         detached: true,
         stdio: "ignore",
+        env,
       })
       proc.unref()
 
@@ -157,12 +178,12 @@ export function Worktree() {
 
   const handleBranchSubmit = React.useCallback((name: string) => {
     if (!name.trim()) {
-      void doSpawn(repoDir)
+      void doSpawn(repoDir, repoDir)
       return
     }
     try {
       const worktreeDir = createWorktree(repoDir, name.trim())
-      void doSpawn(worktreeDir)
+      void doSpawn(worktreeDir, repoDir)
     } catch (e) {
       setErrorMsg(`Failed to create worktree: ${String(e)}`)
       setStep("error")

@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { relativeTime, highlightMatches } from "../views/helpers.js"
+import { relativeTime, highlightMatches, filterFilesForCwd, findDisplayLineMatches, getSearchScrollOffset } from "../views/helpers.js"
 import { deriveRepoName } from "../poller.js"
 import { getAllSessions, type DbSessionWithProject, NEEDS_INPUT_TOOLS } from "../db/reader.js"
 
@@ -142,5 +142,88 @@ describe("highlightMatches", () => {
     const result = highlightMatches("foo bar foo baz foo", "foo")
     const count = (result.match(/\x1b\[30;43m/g) || []).length
     expect(count).toBe(3)
+  })
+})
+
+describe("filterFilesForCwd", () => {
+  test("keeps relative files and absolute files within cwd", () => {
+    expect(filterFilesForCwd([
+      "src/app.ts",
+      "/repo/src/views/conversation.tsx",
+      "/other/file.ts",
+    ], "/repo")).toEqual([
+      "src/app.ts",
+      "/repo/src/views/conversation.tsx",
+    ])
+  })
+
+  test("does not treat sibling directories as inside cwd", () => {
+    expect(filterFilesForCwd([
+      "/repo-other/file.ts",
+      "/repo/file.ts",
+    ], "/repo")).toEqual([
+      "/repo/file.ts",
+    ])
+  })
+})
+
+describe("findDisplayLineMatches", () => {
+  const lines = [
+    { kind: "role-header", role: "user", time: "10:00" },
+    { kind: "text", text: "Hello world" },
+    { kind: "tool", icon: "✓", color: "green", name: "bash", input: "python -V" },
+    { kind: "question", header: "Confirm", question: "Search the visible line?", status: "running", options: [], custom: false },
+    { kind: "thinking", text: "Working through the plan" },
+    { kind: "spacer" },
+  ] as const
+
+  test("matches visible text-bearing lines only", () => {
+    expect(findDisplayLineMatches(lines as any, "world")).toEqual([1])
+    expect(findDisplayLineMatches(lines as any, "python")).toEqual([2])
+    expect(findDisplayLineMatches(lines as any, "visible line")).toEqual([3])
+    expect(findDisplayLineMatches(lines as any, "working")).toEqual([4])
+  })
+
+  test("is case-insensitive and ignores non-searchable rows", () => {
+    expect(findDisplayLineMatches(lines as any, "HELLO")).toEqual([1])
+    expect(findDisplayLineMatches(lines as any, "10:00")).toEqual([])
+  })
+
+  test("uses only the visible tool detail when title and input both exist", () => {
+    const toolLine = [{
+      kind: "tool",
+      icon: "✓",
+      color: "green",
+      name: "bash",
+      title: "visible title",
+      input: "hidden input",
+    }] as const
+
+    expect(findDisplayLineMatches(toolLine as any, "visible title")).toEqual([0])
+    expect(findDisplayLineMatches(toolLine as any, "hidden input")).toEqual([])
+  })
+
+  test("matches text after stripping ansi styling", () => {
+    const styledLine = [{ kind: "text", text: "\x1b[1mHello\x1b[22m world" }] as const
+    expect(findDisplayLineMatches(styledLine as any, "hello")).toEqual([0])
+  })
+
+  test("returns no matches for blank queries", () => {
+    expect(findDisplayLineMatches(lines as any, "")).toEqual([])
+    expect(findDisplayLineMatches(lines as any, "   ")).toEqual([])
+  })
+})
+
+describe("getSearchScrollOffset", () => {
+  test("keeps a matched line visible near the top of the viewport", () => {
+    expect(getSearchScrollOffset(100, 10, 30)).toBe(60)
+  })
+
+  test("clamps near the bottom when the match is already in the latest rows", () => {
+    expect(getSearchScrollOffset(100, 10, 95)).toBe(0)
+  })
+
+  test("clamps near the top when the first rows are matched", () => {
+    expect(getSearchScrollOffset(100, 10, 0)).toBe(90)
   })
 })
