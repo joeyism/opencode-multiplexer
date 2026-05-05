@@ -116,12 +116,12 @@ pub fn update_serve_registry_tui_pid(port: u16, tui_pid: u32) -> anyhow::Result<
 }
 
 #[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 #[cfg(windows)]
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     if let Ok(output) = std::process::Command::new("tasklist")
         .arg("/FI")
         .arg(format!("PID eq {}", pid))
@@ -137,4 +137,20 @@ fn is_pid_alive(pid: u32) -> bool {
 fn default_serve_registry_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".config/ocmux/serve-processes.json"))
+}
+
+#[cfg(unix)]
+pub(crate) fn kill_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .arg("/F")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .output();
 }

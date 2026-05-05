@@ -257,15 +257,19 @@ impl PtyManager {
             None => return Ok(None),
         };
 
-        let keep_placeholder = self
-            .sessions
-            .items()
-            .iter()
-            .find(|session| session.id == id)
-            .is_some_and(|session| session.origin == SessionOrigin::Discovered);
+        let session = self.sessions.items().iter().find(|s| s.id == id).cloned();
+        let keep_placeholder = session.as_ref().is_some_and(|s| s.origin == SessionOrigin::Discovered);
 
         if let Some(Some(pty)) = self.ptys.get_mut(&id) {
             let _ = pty.kill();
+        }
+
+        if let Some(session) = session {
+            if session.origin == SessionOrigin::Managed {
+                if let Some(serve_pid) = session.serve_pid {
+                    crate::registry::kill_pid(serve_pid);
+                }
+            }
         }
 
         if keep_placeholder {
