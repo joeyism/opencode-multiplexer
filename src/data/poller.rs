@@ -52,25 +52,19 @@ pub struct ChildSessionInfo {
     pub children: Vec<ChildSessionInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PollSnapshot {
+    pub sessions: Vec<DiscoveredSessionInfo>,
+}
+
 pub struct ServeSessionInfo {
     pub is_top_level: bool,
     pub is_managed: bool,
     pub status: SessionStatus,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PollSnapshot {
-    pub sessions: Vec<DiscoveredSessionInfo>,
-}
-
 pub fn should_include_serve_session(session: &ServeSessionInfo) -> bool {
     session.is_top_level
-        && (session.is_managed
-            || matches!(
-                session.status,
-                SessionStatus::Working | SessionStatus::NeedsInput
-            ))
 }
 
 pub struct PollerHandle {
@@ -116,7 +110,15 @@ pub fn start_poller(poll_tx: Sender<PollSnapshot>) -> PollerHandle {
                 }
             } else {
                 match poll_fast() {
-                    Ok(fast) => merge_cached_serve_sessions(fast, &cached_serve),
+                    Ok(fast) => match merge_cached_serve_sessions(fast, &cached_serve) {
+                        Ok(merged) => merged,
+                        Err(_) => {
+                            if stop_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                                break;
+                            }
+                            continue;
+                        }
+                    },
                     Err(_) => {
                         if stop_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
                             break;
@@ -242,7 +244,6 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
 
     let reader = DbReader::open_default()?;
     let projects = reader.get_projects()?;
-    let managed_sessions = load_managed_sessions().unwrap_or_default();
     let serve_processes = scan_serve_processes().unwrap_or_default();
 
     let serve_sessions_by_port: HashMap<u16, Vec<String>> = std::thread::scope(|s| {
@@ -277,13 +278,6 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
                 continue;
             }
             let status = reader.get_session_status(&serve_session_id)?;
-            if !should_include_serve_session(&ServeSessionInfo {
-                is_top_level: true,
-                is_managed: managed_sessions.contains(&serve_session_id),
-                status,
-            }) {
-                continue;
-            }
             seen.insert(serve_session_id.clone());
             let cwd = if session.directory.as_os_str().is_empty() {
                 if let Some(proj) = projects
@@ -333,18 +327,33 @@ fn extract_serve_only_sessions(snapshot: &PollSnapshot) -> Vec<DiscoveredSession
         .collect()
 }
 
-fn merge_cached_serve_sessions(
+/// Merge cached serve sessions into a fast poll snapshot, validating each
+/// cached entry against the DB to ensure the session still exists.
+pub fn merge_cached_serve_sessions(
+    fast: PollSnapshot,
+    cached: &[DiscoveredSessionInfo],
+) -> anyhow::Result<PollSnapshot> {
+    let reader = DbReader::open_default()?;
+    merge_cached_serve_sessions_with_reader(fast, cached, &reader)
+}
+
+/// Testable variant that accepts an existing [`DbReader`].
+pub fn merge_cached_serve_sessions_with_reader(
     mut fast: PollSnapshot,
     cached: &[DiscoveredSessionInfo],
-) -> PollSnapshot {
+    reader: &DbReader,
+) -> anyhow::Result<PollSnapshot> {
     let fast_ids: std::collections::HashSet<String> =
         fast.sessions.iter().map(|s| s.session_id.clone()).collect();
     for entry in cached {
         if !fast_ids.contains(&entry.session_id) {
-            fast.sessions.push(entry.clone());
+            // Validate the cached session still exists in the DB
+            if reader.get_session_by_id(&entry.session_id)?.is_some() {
+                fast.sessions.push(entry.clone());
+            }
         }
     }
-    fast
+    Ok(fast)
 }
 
 fn collect_children(
@@ -402,12 +411,12 @@ fn fetch_recent_serve_session_ids(port: u16) -> anyhow::Result<Vec<String>> {
             let id = entry.get("id")?.as_str()?.to_string();
             let updated = entry.pointer("/time/updated")?;
             let updated_epoch = if let Some(value) = updated.as_u64() {
-                value
+                normalize_epoch_secs(value)
             } else if let Some(value) = updated.as_str() {
-                value
+                normalize_epoch_secs(value
                     .parse::<u64>()
                     .ok()
-                    .or_else(|| chrono_like_epoch(value))?
+                    .or_else(|| chrono_like_epoch(value))?)
             } else {
                 return None;
             };
@@ -415,6 +424,14 @@ fn fetch_recent_serve_session_ids(port: u16) -> anyhow::Result<Vec<String>> {
         })
         .collect();
     Ok(sessions)
+}
+
+fn normalize_epoch_secs(value: u64) -> u64 {
+    if value > 10_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
 }
 
 fn chrono_like_epoch(value: &str) -> Option<u64> {
@@ -615,7 +632,28 @@ mod tests {
     }
 
     #[test]
+    fn normalize_epoch_secs_handles_milliseconds() {
+        assert_eq!(normalize_epoch_secs(1_778_018_371_220), 1_778_018_371);
+        assert_eq!(normalize_epoch_secs(1_778_018_371), 1_778_018_371);
+    }
+
+    #[test]
     fn merge_cached_serve_sessions_adds_serve_only_entries() {
+        let db_path = temp_db_path("merge-adds");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        // Insert sess_c so it survives validation
+        conn.execute(
+            "INSERT INTO session VALUES ('sess_c', 'proj1', NULL, 'C', '/tmp/c', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
         let fast = PollSnapshot {
             sessions: vec![
                 DiscoveredSessionInfo {
@@ -678,7 +716,7 @@ mod tests {
                 source: DiscoverySource::Serve,
             },
         ];
-        let merged = merge_cached_serve_sessions(fast, &cached);
+        let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
         assert_eq!(merged.sessions.len(), 3);
         // Fast B should win over cached B
         let b = merged
@@ -730,9 +768,141 @@ mod tests {
             serve_port: Some(4200),
             source: DiscoverySource::Serve,
         }];
-        let merged = merge_cached_serve_sessions(fast, &cached);
+        let merged = merge_cached_serve_sessions(fast, &cached).unwrap();
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.sessions[0].title, "A");
         assert_eq!(merged.sessions[0].source, DiscoverySource::TuiExplicit);
+    }
+
+    #[test]
+    fn merge_cached_skips_deleted_sessions() {
+        let db_path = temp_db_path("merge-deleted");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess_alive', 'proj1', NULL, 'Alive', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        // sess_deleted is NOT in the DB
+
+        let reader = DbReader::open(&db_path).unwrap();
+        let fast = PollSnapshot {
+            sessions: vec![DiscoveredSessionInfo {
+                session_id: "sess_fast".into(),
+                cwd: PathBuf::from("/tmp/fast"),
+                title: "Fast".into(),
+                status: SessionStatus::Working,
+                process_pid: None,
+                model: None,
+                preview: None,
+                time_updated: None,
+                has_children: false,
+                children: vec![],
+                serve_port: None,
+                source: DiscoverySource::TuiExplicit,
+            }],
+        };
+        let cached = vec![
+            DiscoveredSessionInfo {
+                session_id: "sess_alive".into(),
+                cwd: PathBuf::from("/tmp/alive"),
+                title: "Alive".into(),
+                status: SessionStatus::Idle,
+                process_pid: None,
+                model: None,
+                preview: None,
+                time_updated: None,
+                has_children: false,
+                children: vec![],
+                serve_port: Some(4200),
+                source: DiscoverySource::Serve,
+            },
+            DiscoveredSessionInfo {
+                session_id: "sess_deleted".into(),
+                cwd: PathBuf::from("/tmp/deleted"),
+                title: "Deleted".into(),
+                status: SessionStatus::Idle,
+                process_pid: None,
+                model: None,
+                preview: None,
+                time_updated: None,
+                has_children: false,
+                children: vec![],
+                serve_port: Some(4201),
+                source: DiscoverySource::Serve,
+            },
+        ];
+
+        let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
+        assert_eq!(merged.sessions.len(), 2);
+        assert!(merged.sessions.iter().any(|s| s.session_id == "sess_fast"));
+        assert!(merged.sessions.iter().any(|s| s.session_id == "sess_alive"));
+        assert!(
+            !merged.sessions.iter().any(|s| s.session_id == "sess_deleted"),
+            "Deleted session should be skipped"
+        );
+    }
+
+    #[test]
+    fn merge_cached_keeps_existing_sessions() {
+        let db_path = temp_db_path("merge-keeps");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess_cached', 'proj1', NULL, 'Cached', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        let fast = PollSnapshot {
+            sessions: vec![DiscoveredSessionInfo {
+                session_id: "sess_fast".into(),
+                cwd: PathBuf::from("/tmp/fast"),
+                title: "Fast".into(),
+                status: SessionStatus::Working,
+                process_pid: None,
+                model: None,
+                preview: None,
+                time_updated: None,
+                has_children: false,
+                children: vec![],
+                serve_port: None,
+                source: DiscoverySource::TuiExplicit,
+            }],
+        };
+        let cached = vec![DiscoveredSessionInfo {
+            session_id: "sess_cached".into(),
+            cwd: PathBuf::from("/tmp/cached"),
+            title: "Cached".into(),
+            status: SessionStatus::Idle,
+            process_pid: Some(200),
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: Some(4200),
+            source: DiscoverySource::Serve,
+        }];
+
+        let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
+        assert_eq!(merged.sessions.len(), 2);
+        let cached_session = merged
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "sess_cached")
+            .unwrap();
+        assert_eq!(cached_session.title, "Cached");
+        assert_eq!(cached_session.source, DiscoverySource::Serve);
     }
 }

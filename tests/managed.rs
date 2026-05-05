@@ -512,7 +512,7 @@ fn apply_poll_snapshot_updates_via_serve_pid() {
         None,
         SessionOrigin::Managed,
         Some(200),
-        Some(100),
+        Some(std::process::id()), // live serve PID
         None,
         None,
         None,
@@ -527,7 +527,7 @@ fn apply_poll_snapshot_updates_via_serve_pid() {
             cwd: PathBuf::from("/tmp/project"),
             title: "Correct Title".into(),
             status: SessionStatus::Working,
-            process_pid: Some(100), // serve PID
+            process_pid: Some(std::process::id()), // serve PID (live)
             model: None,
             preview: None,
             time_updated: None,
@@ -547,7 +547,7 @@ fn apply_poll_snapshot_updates_via_serve_pid() {
         Some(200),
         "process_pid should remain the TUI PID"
     );
-    assert_eq!(summary.serve_pid, Some(100));
+    assert_eq!(summary.serve_pid, Some(std::process::id()));
 }
 
 #[test]
@@ -693,7 +693,7 @@ fn serve_discovery_does_not_overwrite_managed_serve_port() {
         Some("sess_managed".into()),
         SessionOrigin::Managed,
         Some(500),
-        Some(500),
+        Some(std::process::id()), // live serve PID so it doesn't get marked Error
         Some(4223),
         None,
         None,
@@ -736,7 +736,7 @@ fn session_id_match_takes_priority_over_serve_port() {
         Some("sess_a".into()),
         SessionOrigin::Managed,
         Some(200),
-        Some(200),
+        Some(std::process::id()), // live serve PID so it doesn't get cleaned up
         Some(4220),
         None,
         None,
@@ -751,7 +751,7 @@ fn session_id_match_takes_priority_over_serve_port() {
         Some("sess_b".into()),
         SessionOrigin::Managed,
         Some(500),
-        Some(500),
+        Some(std::process::id()), // live serve PID
         Some(4223),
         None,
         None,
@@ -788,4 +788,629 @@ fn session_id_match_takes_priority_over_serve_port() {
     assert_eq!(summary_a.title, "a");
     assert_eq!(summary_a.status, SessionStatus::Idle);
     assert_eq!(summary_a.serve_port, Some(4220));
+}
+
+#[test]
+fn idle_unmanaged_serve_session_appears_in_sidebar() {
+    let mut manager = PtyManager::default();
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_idle_external".into(),
+            cwd: PathBuf::from("/tmp/external-project"),
+            title: "External Idle Session".into(),
+            status: SessionStatus::Idle,
+            process_pid: Some(99999),
+            model: Some("gpt-5".into()),
+            preview: Some("waiting...".into()),
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: Some(4242),
+            source: DiscoverySource::Serve,
+        }],
+    });
+
+    assert!(!manager.is_empty(), "Idle serve session should appear in manager");
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1, "Idle serve session should appear in sidebar");
+    assert_eq!(entries[0].title, "External Idle Session");
+}
+
+#[test]
+fn error_unmanaged_serve_session_appears_in_sidebar() {
+    let mut manager = PtyManager::default();
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_error_external".into(),
+            cwd: PathBuf::from("/tmp/error-project"),
+            title: "External Error Session".into(),
+            status: SessionStatus::Error,
+            process_pid: Some(88888),
+            model: Some("gpt-5".into()),
+            preview: Some("error occurred".into()),
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: Some(4343),
+            source: DiscoverySource::Serve,
+        }],
+    });
+
+    assert!(!manager.is_empty(), "Error serve session should appear in manager");
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1, "Error serve session should appear in sidebar");
+    assert_eq!(entries[0].status, SessionStatus::Error);
+}
+
+#[test]
+fn idle_serve_session_survives_cache_merge() {
+    use opencode_multiplexer::data::poller::merge_cached_serve_sessions_with_reader;
+    use opencode_multiplexer::data::db::reader::DbReader;
+    use rusqlite::Connection;
+
+    // Set up a temp DB with the cached session present
+    let db_path = std::env::temp_dir().join(format!(
+        "ocmux-test-merge-cache-{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE project (
+            id TEXT PRIMARY KEY,
+            worktree TEXT NOT NULL,
+            name TEXT,
+            time_created INTEGER,
+            time_updated INTEGER
+        );
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_id TEXT,
+            title TEXT,
+            directory TEXT,
+            permission TEXT,
+            time_created INTEGER,
+            time_updated INTEGER,
+            time_archived INTEGER
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            time_created INTEGER
+        );
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session VALUES ('sess_idle_serve', 'proj1', NULL, 'Idle Serve', '/tmp/idle-serve', NULL, 100, 200, NULL)",
+        [],
+    )
+    .unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+
+    let fast = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_tui".into(),
+            cwd: PathBuf::from("/tmp/tui"),
+            title: "TUI".into(),
+            status: SessionStatus::Working,
+            process_pid: Some(100),
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+
+    let cached = vec![DiscoveredSessionInfo {
+        session_id: "sess_idle_serve".into(),
+        cwd: PathBuf::from("/tmp/idle-serve"),
+        title: "Idle Serve".into(),
+        status: SessionStatus::Idle,
+        process_pid: Some(200),
+        model: Some("claude".into()),
+        preview: None,
+        time_updated: None,
+        has_children: false,
+        children: vec![],
+        serve_port: Some(4200),
+        source: DiscoverySource::Serve,
+    }];
+
+    let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
+    let found = merged.sessions.iter().find(|s| s.session_id == "sess_idle_serve");
+    assert!(found.is_some(), "Idle serve session should survive cache merge");
+    assert_eq!(found.unwrap().status, SessionStatus::Idle);
+}
+
+// ============================================================================
+// Bug 1 Tests: Dead managed sessions showing Working (green) should show Error
+// ============================================================================
+
+#[test]
+fn managed_working_with_dead_serve_becomes_error() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "delorean".into(),
+        SessionStatus::Working,
+        Some("sess_dead".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(99999), // definitely dead PID
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    // Apply snapshot that still contains the session (e.g., from managed sessions list)
+    let snapshot = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_dead".into(),
+            cwd: PathBuf::from("/tmp/delorean"),
+            title: "delorean".into(),
+            status: SessionStatus::Working,
+            process_pid: None,
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+
+    manager.apply_poll_snapshot(snapshot);
+
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, SessionStatus::Error, "Dead Working session should flip to Error");
+}
+
+#[test]
+fn managed_idle_with_dead_serve_stays_idle() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "delorean".into(),
+        SessionStatus::Idle,
+        Some("sess_idle".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(99999), // dead PID
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    let snapshot = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_idle".into(),
+            cwd: PathBuf::from("/tmp/delorean"),
+            title: "delorean".into(),
+            status: SessionStatus::Idle,
+            process_pid: None,
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+
+    manager.apply_poll_snapshot(snapshot);
+
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, SessionStatus::Idle, "Idle session should stay Idle");
+}
+
+#[test]
+fn managed_working_with_live_serve_stays_working() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "delorean".into(),
+        SessionStatus::Working,
+        Some("sess_live".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(std::process::id()), // live PID
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    let snapshot = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_live".into(),
+            cwd: PathBuf::from("/tmp/delorean"),
+            title: "delorean".into(),
+            status: SessionStatus::Working,
+            process_pid: None,
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+
+    manager.apply_poll_snapshot(snapshot);
+
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, SessionStatus::Working, "Live Working session should stay Working");
+}
+
+#[test]
+fn managed_without_serve_pid_is_not_marked_error() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "delorean".into(),
+        SessionStatus::Working,
+        Some("sess_no_serve".into()),
+        SessionOrigin::Managed,
+        None,
+        None, // no serve_pid
+        None,
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    let snapshot = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_no_serve".into(),
+            cwd: PathBuf::from("/tmp/delorean"),
+            title: "delorean".into(),
+            status: SessionStatus::Working,
+            process_pid: None,
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+
+    manager.apply_poll_snapshot(snapshot);
+
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, SessionStatus::Working, "Session without serve_pid should not be marked Error");
+}
+
+// ============================================================================
+// Bug 2 Tests: Stale managed session removal
+// ============================================================================
+
+#[test]
+fn managed_dead_serve_not_in_snapshot_is_removed() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "old".into(),
+        SessionStatus::Working,
+        Some("sess_old".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(99999), // dead
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    // Empty snapshot — session is not rediscovered
+    let snapshot = PollSnapshot { sessions: vec![] };
+    let registry_dirty = manager.apply_poll_snapshot(snapshot);
+
+    assert!(registry_dirty, "Removing managed session should signal registry dirty");
+    assert!(manager.is_empty(), "Dead managed session not in snapshot should be removed");
+}
+
+#[test]
+fn managed_dead_serve_replaced_in_same_cwd_is_removed() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "old".into(),
+        SessionStatus::Working,
+        Some("sess_old".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(99999), // dead
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    // New session in the same cwd
+    let snapshot = PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_new".into(),
+            cwd: PathBuf::from("/tmp/delorean"),
+            title: "new".into(),
+            status: SessionStatus::Working,
+            process_pid: None,
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+            serve_port: None,
+            source: DiscoverySource::TuiExplicit,
+        }],
+    };
+    let registry_dirty = manager.apply_poll_snapshot(snapshot);
+
+    assert!(registry_dirty, "Replacing managed session should signal registry dirty");
+    let entries = manager.sidebar_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, Some("sess_new".into()), "New session should remain");
+    assert!(
+        !manager.sessions().items().iter().any(|s| s.session_id.as_deref() == Some("sess_old")),
+        "Old dead session should be removed"
+    );
+}
+
+#[test]
+fn managed_dead_serve_with_live_pty_is_kept() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "delorean".into(),
+        SessionStatus::Working,
+        Some("sess_pty".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(99999), // dead serve
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    // Spawn a live PTY for this session
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.args(["60"]);
+    let pty = PtySession::spawn_test_command(cmd, 24, 80).unwrap();
+    manager.insert_pty_for_session(id, pty);
+
+    let snapshot = PollSnapshot { sessions: vec![] };
+    let registry_dirty = manager.apply_poll_snapshot(snapshot);
+
+    assert!(!registry_dirty, "Session with live PTY should not trigger registry dirty");
+    assert_eq!(manager.len(), 1, "Managed session with live PTY should be kept");
+}
+
+#[test]
+fn discovered_stale_cleanup_still_works() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "discovered".into(),
+        SessionStatus::Idle,
+        Some("sess_discovered".into()),
+        SessionOrigin::Discovered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    // Empty snapshot — discovered session is stale
+    let snapshot = PollSnapshot { sessions: vec![] };
+    let registry_dirty = manager.apply_poll_snapshot(snapshot);
+
+    assert!(!registry_dirty, "Discovered cleanup should not mark registry dirty");
+    assert!(manager.is_empty(), "Stale discovered session should be removed");
+}
+
+#[test]
+fn managed_live_serve_is_never_removed() {
+    let mut manager = PtyManager::default();
+    manager.register_placeholder(
+        PathBuf::from("/tmp/delorean"),
+        "live".into(),
+        SessionStatus::Working,
+        Some("sess_live".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(std::process::id()), // live serve
+        Some(4200),
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    let snapshot = PollSnapshot { sessions: vec![] };
+    let registry_dirty = manager.apply_poll_snapshot(snapshot);
+
+    assert!(!registry_dirty, "Live managed session should not trigger registry dirty");
+    assert_eq!(manager.len(), 1, "Managed session with live serve should be kept");
+}
+
+fn heuristic_discovery(
+    session_id: &str,
+    process_pid: Option<u32>,
+    title: &str,
+    status: SessionStatus,
+    time_updated: i64,
+) -> DiscoveredSessionInfo {
+    DiscoveredSessionInfo {
+        session_id: session_id.into(),
+        cwd: PathBuf::from("/tmp/proj"),
+        title: title.into(),
+        status,
+        process_pid,
+        model: Some("new-model".into()),
+        preview: Some("new-preview".into()),
+        time_updated: Some(time_updated),
+        has_children: false,
+        children: vec![],
+        serve_port: None,
+        source: DiscoverySource::TuiHeuristic,
+    }
+}
+
+#[test]
+fn heuristic_with_session_id_match_updates_metadata() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/proj"),
+        "Old title".into(),
+        SessionStatus::Working,
+        Some("sess-1".into()),
+        SessionOrigin::Managed,
+        Some(111),
+        None,
+        Some(4200),
+        Some("old-model".into()),
+        Some("old-preview".into()),
+        Some(10),
+        false,
+        vec![],
+    );
+
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![heuristic_discovery(
+            "sess-1",
+            Some(222),
+            "New title",
+            SessionStatus::Idle,
+            20,
+        )],
+    });
+
+    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    assert_eq!(summary.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(summary.title, "New title");
+    assert_eq!(summary.status, SessionStatus::Idle);
+    assert_eq!(summary.model.as_deref(), Some("new-model"));
+    assert_eq!(summary.preview.as_deref(), Some("new-preview"));
+    assert_eq!(summary.time_updated, Some(20));
+}
+
+#[test]
+fn heuristic_with_pid_match_blocks_update() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/proj"),
+        "Correct title".into(),
+        SessionStatus::Working,
+        Some("sess-1".into()),
+        SessionOrigin::Managed,
+        Some(111),
+        None,
+        Some(4200),
+        Some("old-model".into()),
+        Some("old-preview".into()),
+        Some(10),
+        false,
+        vec![],
+    );
+
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![heuristic_discovery(
+            "sess-wrong",
+            Some(111),
+            "Wrong title",
+            SessionStatus::Idle,
+            20,
+        )],
+    });
+
+    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    assert_eq!(summary.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(summary.title, "Correct title");
+    assert_eq!(summary.status, SessionStatus::Working);
+    assert_eq!(summary.model.as_deref(), Some("old-model"));
+    assert_eq!(summary.preview.as_deref(), Some("old-preview"));
+    assert_eq!(summary.time_updated, Some(10));
+}
+
+#[test]
+fn heuristic_adopts_session_id_when_none() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/proj"),
+        "Old title".into(),
+        SessionStatus::Working,
+        None,
+        SessionOrigin::Managed,
+        None,
+        None,
+        Some(4200),
+        Some("old-model".into()),
+        Some("old-preview".into()),
+        Some(10),
+        false,
+        vec![],
+    );
+
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![heuristic_discovery(
+            "sess-adopted",
+            None,
+            "New title",
+            SessionStatus::Idle,
+            20,
+        )],
+    });
+
+    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    assert_eq!(summary.session_id.as_deref(), Some("sess-adopted"));
+    assert_eq!(summary.title, "New title");
+    assert_eq!(summary.status, SessionStatus::Idle);
+    assert_eq!(summary.model.as_deref(), Some("new-model"));
+    assert_eq!(summary.preview.as_deref(), Some("new-preview"));
+    assert_eq!(summary.time_updated, Some(20));
 }

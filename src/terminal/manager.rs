@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use crate::{
     app::sessions::{SessionList, SessionOrigin, SessionStatus, SessionSummary},
     data::poller::{ChildSessionInfo, DiscoverySource, PollSnapshot},
+    registry::is_pid_alive,
     ui::sidebar::{ChildSidebarEntry, SidebarEntry},
 };
 
@@ -370,12 +371,27 @@ impl PtyManager {
             .collect()
     }
 
-    pub fn apply_poll_snapshot(&mut self, snapshot: PollSnapshot) {
-        let keep_ids = snapshot
+    pub fn apply_poll_snapshot(&mut self, snapshot: PollSnapshot) -> bool {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum MatchKind {
+            SessionId,
+            ProcessPid,
+            ServePort,
+            ManagedCwd,
+        }
+
+        let keep_ids: std::collections::HashSet<String> = snapshot
             .sessions
             .iter()
             .map(|info| info.session_id.clone())
-            .collect::<std::collections::HashSet<_>>();
+            .collect();
+        let snapshot_cwd_ids: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
+            snapshot.sessions.iter().fold(HashMap::new(), |mut map, info| {
+                map.entry(info.cwd.clone())
+                    .or_default()
+                    .insert(info.session_id.clone());
+                map
+            });
 
         for discovered in snapshot.sessions {
             // Try to find an existing session to update, in order of reliability:
@@ -384,18 +400,23 @@ impl PtyManager {
             // 3. By serve port (only if not already matched — can be wrong when
             //    multiple serves share the same DB)
             // 4. By cwd for managed sessions with unresolved session_id
-            let matched_id = self
+            let matched = self
                 .sessions
                 .find_by_session_id(&discovered.session_id)
+                .map(|id| (id, MatchKind::SessionId))
                 .or_else(|| {
-                    discovered
-                        .process_pid
-                        .and_then(|pid| self.sessions.find_by_process_pid(pid))
+                    discovered.process_pid.and_then(|pid| {
+                        self.sessions
+                            .find_by_process_pid(pid)
+                            .map(|id| (id, MatchKind::ProcessPid))
+                    })
                 })
                 .or_else(|| {
-                    discovered
-                        .serve_port
-                        .and_then(|port| self.sessions.find_by_serve_port(port))
+                    discovered.serve_port.and_then(|port| {
+                        self.sessions
+                            .find_by_serve_port(port)
+                            .map(|id| (id, MatchKind::ServePort))
+                    })
                 })
                 .or_else(|| {
                     // Match managed sessions that don't have a session_id yet by cwd.
@@ -407,10 +428,10 @@ impl PtyManager {
                                 && s.session_id.is_none()
                                 && s.cwd == discovered.cwd
                         })
-                        .map(|s| s.id)
+                        .map(|s| (s.id, MatchKind::ManagedCwd))
                 });
 
-            if let Some(id) = matched_id {
+            if let Some((id, match_kind)) = matched {
                 if let Some(summary) = self.sessions.get_mut(id) {
                     // Guard: do not let a heuristic TUI discovery claim a managed
                     // session that has a serve backend. The heuristic
@@ -420,7 +441,11 @@ impl PtyManager {
                         summary.origin == SessionOrigin::Managed && summary.serve_port.is_some();
 
                     // Allow the heuristic if the session doesn't have an ID yet, to adopt the guessed ID
-                    if is_heuristic && has_serve_backend && summary.session_id.is_some() {
+                    if is_heuristic
+                        && has_serve_backend
+                        && summary.session_id.is_some()
+                        && !matches!(match_kind, MatchKind::SessionId)
+                    {
                         continue;
                     }
 
@@ -467,26 +492,83 @@ impl PtyManager {
             );
         }
 
-        let stale_ids = self
+        // Pass 1: Flip dead managed "Working" sessions to Error.
+        // If the DB says Working but the serve process is dead, the session
+        // was interrupted — that's an error, not idle.
+        let dead_working_ids: Vec<u64> = self
             .sessions
             .items()
             .iter()
             .filter(|session| {
-                session.origin == SessionOrigin::Discovered
-                    && self.ptys.get(&session.id).is_none_or(|pty| pty.is_none())
-                    && session
-                        .session_id
-                        .as_deref()
-                        .is_none_or(|session_id| !keep_ids.contains(session_id))
+                session.origin == SessionOrigin::Managed
+                    && session.status == SessionStatus::Working
+                    && session.serve_pid.is_some_and(|pid| !is_pid_alive(pid))
             })
             .map(|session| session.id)
-            .collect::<Vec<_>>();
+            .collect();
+        for id in dead_working_ids {
+            if let Some(session) = self.sessions.get_mut(id) {
+                session.status = SessionStatus::Error;
+            }
+        }
+
+        // Pass 2: Prune stale sessions.
+        // Discovered placeholders are removed when not in the snapshot and
+        // they have no live PTY. Managed sessions are also removed when they
+        // have a known-dead serve backend, no live PTY, and either are not in
+        // the snapshot or have been replaced by a different session in the
+        // same cwd.
+        let stale_ids: Vec<u64> = self
+            .sessions
+            .items()
+            .iter()
+            .filter(|session| {
+                let no_pty = self.ptys.get(&session.id).is_none_or(|pty| pty.is_none());
+                let not_in_snapshot = session
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|sid| !keep_ids.contains(sid));
+
+                match session.origin {
+                    SessionOrigin::Discovered => {
+                        no_pty && not_in_snapshot
+                    }
+                    SessionOrigin::Managed => {
+                        let dead_serve = session
+                            .serve_pid
+                            .is_some_and(|pid| !is_pid_alive(pid));
+                        let replaced_in_cwd = session
+                            .session_id
+                            .as_deref()
+                            .map_or(false, |sid| {
+                                snapshot_cwd_ids
+                                    .get(&session.cwd)
+                                    .map_or(false, |ids| ids.iter().any(|id| id != sid))
+                            });
+                        dead_serve && no_pty && (not_in_snapshot || replaced_in_cwd)
+                    }
+                }
+            })
+            .map(|session| session.id)
+            .collect();
+
+        let registry_dirty = stale_ids.iter().any(|id| {
+            self.sessions
+                .items()
+                .iter()
+                .find(|s| s.id == *id)
+                .map_or(false, |s| {
+                    s.origin == SessionOrigin::Managed && s.session_id.is_some()
+                })
+        });
 
         self.sessions
             .retain(|session| !stale_ids.contains(&session.id));
         for id in stale_ids {
             self.ptys.remove(&id);
         }
+
+        registry_dirty
     }
 
     pub fn refresh_active(&mut self, rows: u16, cols: u16) -> anyhow::Result<bool> {
