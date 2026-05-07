@@ -83,8 +83,7 @@ impl DiffViewState {
                     self.history.remove(&first_key);
                 }
             }
-            self.history
-                .insert(sid.clone(), (self.scroll, self.cursor));
+            self.history.insert(sid.clone(), (self.scroll, self.cursor));
         }
 
         self.session_id = None;
@@ -718,7 +717,7 @@ mod tests_scroll_view {
         state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
         state.scroll = 0;
         state.cursor = 0;
-        
+
         // Scroll down by 1 (content moves up). Viewport is 5 lines.
         // Visible lines: 1..5. Cursor is at 0.
         // After scroll: Visible lines: 2..6 (scroll=1). Cursor should be clamped to 1.
@@ -733,7 +732,7 @@ mod tests_scroll_view {
         state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
         state.scroll = 5;
         state.cursor = 9; // At the bottom of the viewport (5 + 5 - 1 = 9)
-        
+
         // Scroll up by 1 (content moves down). Viewport is 5 lines.
         // Visible lines: 5..9. Cursor is at 9.
         // After scroll: Visible lines: 4..8 (scroll=4). Cursor should be clamped to 8.
@@ -746,20 +745,35 @@ mod tests_scroll_view {
     fn open_restores_from_history() {
         let mut state = DiffViewState::default();
         let sid = "session1".to_string();
-        
+
         // Open, move cursor/scroll, and close
-        state.open(sid.clone(), "Title".to_string(), "Diff".to_string(), AppFocus::Sidebar);
+        state.open(
+            sid.clone(),
+            "Title".to_string(),
+            "Diff".to_string(),
+            AppFocus::Sidebar,
+        );
         state.scroll = 10;
         state.cursor = 15;
         state.close();
-        
+
         // Re-open same session
-        state.open(sid.clone(), "Title".to_string(), "Diff".to_string(), AppFocus::Sidebar);
+        state.open(
+            sid.clone(),
+            "Title".to_string(),
+            "Diff".to_string(),
+            AppFocus::Sidebar,
+        );
         assert_eq!(state.scroll, 10);
         assert_eq!(state.cursor, 15);
-        
+
         // Open different session
-        state.open("session2".to_string(), "Title 2".to_string(), "Diff 2".to_string(), AppFocus::Sidebar);
+        state.open(
+            "session2".to_string(),
+            "Title 2".to_string(),
+            "Diff 2".to_string(),
+            AppFocus::Sidebar,
+        );
         assert_eq!(state.scroll, 0);
         assert_eq!(state.cursor, 0);
     }

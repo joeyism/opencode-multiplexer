@@ -258,7 +258,9 @@ impl PtyManager {
         };
 
         let session = self.sessions.items().iter().find(|s| s.id == id).cloned();
-        let keep_placeholder = session.as_ref().is_some_and(|s| s.origin == SessionOrigin::Discovered);
+        let keep_placeholder = session
+            .as_ref()
+            .is_some_and(|s| s.origin == SessionOrigin::Discovered);
 
         if let Some(Some(pty)) = self.ptys.get_mut(&id) {
             let _ = pty.kill();
@@ -389,8 +391,13 @@ impl PtyManager {
             .iter()
             .map(|info| info.session_id.clone())
             .collect();
-        let snapshot_cwd_ids: std::collections::HashMap<PathBuf, std::collections::HashSet<String>> =
-            snapshot.sessions.iter().fold(HashMap::new(), |mut map, info| {
+        let snapshot_cwd_ids: std::collections::HashMap<
+            PathBuf,
+            std::collections::HashSet<String>,
+        > = snapshot
+            .sessions
+            .iter()
+            .fold(HashMap::new(), |mut map, info| {
                 map.entry(info.cwd.clone())
                     .or_default()
                     .insert(info.session_id.clone());
@@ -534,21 +541,14 @@ impl PtyManager {
                     .is_none_or(|sid| !keep_ids.contains(sid));
 
                 match session.origin {
-                    SessionOrigin::Discovered => {
-                        no_pty && not_in_snapshot
-                    }
+                    SessionOrigin::Discovered => no_pty && not_in_snapshot,
                     SessionOrigin::Managed => {
-                        let dead_serve = session
-                            .serve_pid
-                            .is_some_and(|pid| !is_pid_alive(pid));
-                        let replaced_in_cwd = session
-                            .session_id
-                            .as_deref()
-                            .map_or(false, |sid| {
-                                snapshot_cwd_ids
-                                    .get(&session.cwd)
-                                    .map_or(false, |ids| ids.iter().any(|id| id != sid))
-                            });
+                        let dead_serve = session.serve_pid.is_some_and(|pid| !is_pid_alive(pid));
+                        let replaced_in_cwd = session.session_id.as_deref().map_or(false, |sid| {
+                            snapshot_cwd_ids
+                                .get(&session.cwd)
+                                .map_or(false, |ids| ids.iter().any(|id| id != sid))
+                        });
                         dead_serve && no_pty && (not_in_snapshot || replaced_in_cwd)
                     }
                 }

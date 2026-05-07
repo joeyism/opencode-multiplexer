@@ -810,9 +810,16 @@ fn idle_unmanaged_serve_session_appears_in_sidebar() {
         }],
     });
 
-    assert!(!manager.is_empty(), "Idle serve session should appear in manager");
+    assert!(
+        !manager.is_empty(),
+        "Idle serve session should appear in manager"
+    );
     let entries = manager.sidebar_entries();
-    assert_eq!(entries.len(), 1, "Idle serve session should appear in sidebar");
+    assert_eq!(
+        entries.len(),
+        1,
+        "Idle serve session should appear in sidebar"
+    );
     assert_eq!(entries[0].title, "External Idle Session");
 }
 
@@ -836,16 +843,23 @@ fn error_unmanaged_serve_session_appears_in_sidebar() {
         }],
     });
 
-    assert!(!manager.is_empty(), "Error serve session should appear in manager");
+    assert!(
+        !manager.is_empty(),
+        "Error serve session should appear in manager"
+    );
     let entries = manager.sidebar_entries();
-    assert_eq!(entries.len(), 1, "Error serve session should appear in sidebar");
+    assert_eq!(
+        entries.len(),
+        1,
+        "Error serve session should appear in sidebar"
+    );
     assert_eq!(entries[0].status, SessionStatus::Error);
 }
 
 #[test]
 fn idle_serve_session_survives_cache_merge() {
-    use opencode_multiplexer::data::poller::merge_cached_serve_sessions_with_reader;
     use opencode_multiplexer::data::db::reader::DbReader;
+    use opencode_multiplexer::data::poller::merge_cached_serve_sessions_with_reader;
     use rusqlite::Connection;
 
     // Set up a temp DB with the cached session present
@@ -932,8 +946,14 @@ fn idle_serve_session_survives_cache_merge() {
     }];
 
     let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
-    let found = merged.sessions.iter().find(|s| s.session_id == "sess_idle_serve");
-    assert!(found.is_some(), "Idle serve session should survive cache merge");
+    let found = merged
+        .sessions
+        .iter()
+        .find(|s| s.session_id == "sess_idle_serve");
+    assert!(
+        found.is_some(),
+        "Idle serve session should survive cache merge"
+    );
     assert_eq!(found.unwrap().status, SessionStatus::Idle);
 }
 
@@ -982,7 +1002,11 @@ fn managed_working_with_dead_serve_becomes_error() {
 
     let entries = manager.sidebar_entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].status, SessionStatus::Error, "Dead Working session should flip to Error");
+    assert_eq!(
+        entries[0].status,
+        SessionStatus::Error,
+        "Dead Working session should flip to Error"
+    );
 }
 
 #[test]
@@ -1025,7 +1049,11 @@ fn managed_idle_with_dead_serve_stays_idle() {
 
     let entries = manager.sidebar_entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].status, SessionStatus::Idle, "Idle session should stay Idle");
+    assert_eq!(
+        entries[0].status,
+        SessionStatus::Idle,
+        "Idle session should stay Idle"
+    );
 }
 
 #[test]
@@ -1068,7 +1096,11 @@ fn managed_working_with_live_serve_stays_working() {
 
     let entries = manager.sidebar_entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].status, SessionStatus::Working, "Live Working session should stay Working");
+    assert_eq!(
+        entries[0].status,
+        SessionStatus::Working,
+        "Live Working session should stay Working"
+    );
 }
 
 #[test]
@@ -1111,7 +1143,11 @@ fn managed_without_serve_pid_is_not_marked_error() {
 
     let entries = manager.sidebar_entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].status, SessionStatus::Working, "Session without serve_pid should not be marked Error");
+    assert_eq!(
+        entries[0].status,
+        SessionStatus::Working,
+        "Session without serve_pid should not be marked Error"
+    );
 }
 
 // ============================================================================
@@ -1141,8 +1177,14 @@ fn managed_dead_serve_not_in_snapshot_is_removed() {
     let snapshot = PollSnapshot { sessions: vec![] };
     let registry_dirty = manager.apply_poll_snapshot(snapshot);
 
-    assert!(registry_dirty, "Removing managed session should signal registry dirty");
-    assert!(manager.is_empty(), "Dead managed session not in snapshot should be removed");
+    assert!(
+        registry_dirty,
+        "Removing managed session should signal registry dirty"
+    );
+    assert!(
+        manager.is_empty(),
+        "Dead managed session not in snapshot should be removed"
+    );
 }
 
 #[test]
@@ -1183,12 +1225,23 @@ fn managed_dead_serve_replaced_in_same_cwd_is_removed() {
     };
     let registry_dirty = manager.apply_poll_snapshot(snapshot);
 
-    assert!(registry_dirty, "Replacing managed session should signal registry dirty");
+    assert!(
+        registry_dirty,
+        "Replacing managed session should signal registry dirty"
+    );
     let entries = manager.sidebar_entries();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].session_id, Some("sess_new".into()), "New session should remain");
+    assert_eq!(
+        entries[0].session_id,
+        Some("sess_new".into()),
+        "New session should remain"
+    );
     assert!(
-        !manager.sessions().items().iter().any(|s| s.session_id.as_deref() == Some("sess_old")),
+        !manager
+            .sessions()
+            .items()
+            .iter()
+            .any(|s| s.session_id.as_deref() == Some("sess_old")),
         "Old dead session should be removed"
     );
 }
@@ -1221,8 +1274,15 @@ fn managed_dead_serve_with_live_pty_is_kept() {
     let snapshot = PollSnapshot { sessions: vec![] };
     let registry_dirty = manager.apply_poll_snapshot(snapshot);
 
-    assert!(!registry_dirty, "Session with live PTY should not trigger registry dirty");
-    assert_eq!(manager.len(), 1, "Managed session with live PTY should be kept");
+    assert!(
+        !registry_dirty,
+        "Session with live PTY should not trigger registry dirty"
+    );
+    assert_eq!(
+        manager.len(),
+        1,
+        "Managed session with live PTY should be kept"
+    );
 }
 
 #[test]
@@ -1248,8 +1308,14 @@ fn discovered_stale_cleanup_still_works() {
     let snapshot = PollSnapshot { sessions: vec![] };
     let registry_dirty = manager.apply_poll_snapshot(snapshot);
 
-    assert!(!registry_dirty, "Discovered cleanup should not mark registry dirty");
-    assert!(manager.is_empty(), "Stale discovered session should be removed");
+    assert!(
+        !registry_dirty,
+        "Discovered cleanup should not mark registry dirty"
+    );
+    assert!(
+        manager.is_empty(),
+        "Stale discovered session should be removed"
+    );
 }
 
 #[test]
@@ -1274,8 +1340,15 @@ fn managed_live_serve_is_never_removed() {
     let snapshot = PollSnapshot { sessions: vec![] };
     let registry_dirty = manager.apply_poll_snapshot(snapshot);
 
-    assert!(!registry_dirty, "Live managed session should not trigger registry dirty");
-    assert_eq!(manager.len(), 1, "Managed session with live serve should be kept");
+    assert!(
+        !registry_dirty,
+        "Live managed session should not trigger registry dirty"
+    );
+    assert_eq!(
+        manager.len(),
+        1,
+        "Managed session with live serve should be kept"
+    );
 }
 
 fn heuristic_discovery(
@@ -1330,7 +1403,12 @@ fn heuristic_with_session_id_match_updates_metadata() {
         )],
     });
 
-    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    let summary = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap();
     assert_eq!(summary.session_id.as_deref(), Some("sess-1"));
     assert_eq!(summary.title, "New title");
     assert_eq!(summary.status, SessionStatus::Idle);
@@ -1368,7 +1446,12 @@ fn heuristic_with_pid_match_blocks_update() {
         )],
     });
 
-    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    let summary = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap();
     assert_eq!(summary.session_id.as_deref(), Some("sess-1"));
     assert_eq!(summary.title, "Correct title");
     assert_eq!(summary.status, SessionStatus::Working);
@@ -1406,7 +1489,12 @@ fn heuristic_adopts_session_id_when_none() {
         )],
     });
 
-    let summary = manager.sessions().items().iter().find(|s| s.id == id).unwrap();
+    let summary = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap();
     assert_eq!(summary.session_id.as_deref(), Some("sess-adopted"));
     assert_eq!(summary.title, "New title");
     assert_eq!(summary.status, SessionStatus::Idle);

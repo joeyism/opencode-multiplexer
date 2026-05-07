@@ -413,10 +413,12 @@ fn fetch_recent_serve_session_ids(port: u16) -> anyhow::Result<Vec<String>> {
             let updated_epoch = if let Some(value) = updated.as_u64() {
                 normalize_epoch_secs(value)
             } else if let Some(value) = updated.as_str() {
-                normalize_epoch_secs(value
-                    .parse::<u64>()
-                    .ok()
-                    .or_else(|| chrono_like_epoch(value))?)
+                normalize_epoch_secs(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .or_else(|| chrono_like_epoch(value))?,
+                )
             } else {
                 return None;
             };
@@ -843,7 +845,10 @@ mod tests {
         assert!(merged.sessions.iter().any(|s| s.session_id == "sess_fast"));
         assert!(merged.sessions.iter().any(|s| s.session_id == "sess_alive"));
         assert!(
-            !merged.sessions.iter().any(|s| s.session_id == "sess_deleted"),
+            !merged
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "sess_deleted"),
             "Deleted session should be skipped"
         );
     }
