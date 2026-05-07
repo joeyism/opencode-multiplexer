@@ -87,7 +87,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     .filter_map(|s| Some((s.session_id.clone()?, s.status)))
                     .collect();
 
-                manager.apply_poll_snapshot(snapshot.clone());
+                let registry_dirty = manager.apply_poll_snapshot(snapshot.clone());
+                if registry_dirty {
+                    let _ = save_managed_sessions(manager.managed_session_ids());
+                }
 
                 // Notify on interesting transitions when the app is not focused.
                 if config.notifications && !state.app_focused {
@@ -578,7 +581,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         }
                     }
                     KeyCode::Char(c) if c == config.keybindings.spawn => {
-                        match pick_directory_with_terminal(terminal) {
+                        match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
                             Ok(Some(cwd)) => {
                                 let title = display_title_for_cwd(&cwd);
                                 let (rows, cols) =
@@ -693,7 +696,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         }
                     }
                     KeyCode::Char(c) if c == config.keybindings.worktree => {
-                        match pick_directory_with_terminal(terminal) {
+                        match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
                             Ok(Some(repo_dir)) => {
                                 match prompt_text_with_terminal(
                                     terminal,
@@ -802,6 +805,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         KeyCode::Char('j') | KeyCode::Down => {
                             conversation.scroll_down(1, vp);
                         }
+                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            conversation.scroll_up(1);
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            conversation.scroll_down(1, vp);
+                        }
                         KeyCode::Char('G') => {
                             conversation.scroll_to_end(vp);
                         }
@@ -894,6 +903,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             diff_view.move_cursor_down(vp.saturating_sub(1), vp);
+                        }
+                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            diff_view.scroll_view_up(1, vp);
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            diff_view.scroll_view_down(1, vp);
                         }
                         KeyCode::Char('v') => {
                             diff_view.toggle_visual();
@@ -1061,9 +1076,10 @@ fn is_panel_toggle(key: KeyEvent) -> bool {
 
 fn pick_directory_with_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    maxdepth: u32,
 ) -> Result<Option<std::path::PathBuf>, Box<dyn Error>> {
     leave_tui(terminal)?;
-    let picked = pick_directory();
+    let picked = pick_directory(maxdepth);
     enter_tui(terminal)?;
 
     Ok(picked?)

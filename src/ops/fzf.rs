@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub fn pick_directory() -> anyhow::Result<Option<PathBuf>> {
+pub fn pick_directory(maxdepth: u32) -> anyhow::Result<Option<PathBuf>> {
     let _capture_path = std::env::temp_dir().join(format!(
         "ocmux-rs-fzf-{}.txt",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
@@ -34,7 +34,7 @@ pub fn pick_directory() -> anyhow::Result<Option<PathBuf>> {
     }
     find_args.extend_from_slice(&[
         "-maxdepth".into(),
-        "4".into(),
+        maxdepth.to_string().into(),
         "-name".into(),
         ".git".into(),
     ]);

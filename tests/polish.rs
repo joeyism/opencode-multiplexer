@@ -7,7 +7,7 @@ use std::{
 use opencode_multiplexer::{
     app::sessions::SessionStatus,
     config::{AppConfig, Keybindings, load_config_from_path},
-    data::poller::{ServeSessionInfo, should_include_serve_session},
+    data::poller::{should_include_serve_session, ServeSessionInfo},
     ops::worktree::{WorktreePlan, build_worktree_plan, worktree_target_dir},
     registry::{load_managed_sessions_from_path, save_managed_sessions_to_path},
     ui::sidebar::{
@@ -83,28 +83,28 @@ fn worktree_plan_creates_new_branch_from_base_when_missing() {
     );
 }
 
+fn serve_visibility_depends_only_on_top_level() {
+    for status in [SessionStatus::Working, SessionStatus::NeedsInput, SessionStatus::Idle, SessionStatus::Error] {
+        let info = ServeSessionInfo { is_top_level: true, is_managed: false, status };
+        assert!(should_include_serve_session(&info), "top-level should be included regardless of status {:?}", status);
+    }
+    for status in [SessionStatus::Working, SessionStatus::NeedsInput, SessionStatus::Idle, SessionStatus::Error] {
+        let info = ServeSessionInfo { is_top_level: true, is_managed: true, status };
+        assert!(should_include_serve_session(&info), "top-level managed should be included regardless of status {:?}", status);
+    }
+    for status in [SessionStatus::Working, SessionStatus::NeedsInput, SessionStatus::Idle, SessionStatus::Error] {
+        let info = ServeSessionInfo { is_top_level: false, is_managed: false, status };
+        assert!(!should_include_serve_session(&info), "non-top-level should be excluded regardless of status {:?}", status);
+    }
+    for status in [SessionStatus::Working, SessionStatus::NeedsInput, SessionStatus::Idle, SessionStatus::Error] {
+        let info = ServeSessionInfo { is_top_level: false, is_managed: true, status };
+        assert!(!should_include_serve_session(&info), "non-top-level should be excluded regardless of managed {:?}", status);
+    }
+}
+
 #[test]
 fn serve_filter_matches_ts_visibility_rule() {
-    assert!(should_include_serve_session(&ServeSessionInfo {
-        is_top_level: true,
-        is_managed: false,
-        status: SessionStatus::NeedsInput,
-    }));
-    assert!(!should_include_serve_session(&ServeSessionInfo {
-        is_top_level: true,
-        is_managed: false,
-        status: SessionStatus::Idle,
-    }));
-    assert!(should_include_serve_session(&ServeSessionInfo {
-        is_top_level: true,
-        is_managed: true,
-        status: SessionStatus::Idle,
-    }));
-    assert!(!should_include_serve_session(&ServeSessionInfo {
-        is_top_level: false,
-        is_managed: true,
-        status: SessionStatus::Working,
-    }));
+    serve_visibility_depends_only_on_top_level();
 }
 
 #[test]

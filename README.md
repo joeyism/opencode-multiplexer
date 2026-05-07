@@ -247,6 +247,7 @@ The sidebar has three states:
 - **Search and attach** — press `/` to open the session picker, search across all opencode sessions, and attach to one.
 - **Reuse an earlier prompt** — press `h` to open the message history picker, search past user messages, and paste one into the active terminal session.
 - **Create a worktree** — press `t` to pick a repo directory, then enter a branch name (leave empty to spawn in the repo root without a worktree). A new worktree is created and a session is spawned in it.
+- **Spawn a session** — press `n` to pick a repo from discovered git repositories (see Configuration for search paths and depth), then spawn a new managed session in that directory.
 
 ## System behaviors
 
@@ -260,12 +261,13 @@ The sidebar has three states:
 
 ## Configuration
 
-Keybindings, sidebar width, and desktop notifications are configurable via `~/.config/ocmux/config.json`:
+Keybindings, sidebar width, desktop notifications, and repo search depth are configurable via `~/.config/ocmux/config.json`:
 
 ```json
 {
   "sidebar_width": 30,
   "notifications": true,
+  "spawn_maxdepth": 5,
   "keybindings": {
     "up": "k",
     "down": "j",
@@ -286,6 +288,8 @@ Keybinding values are single characters. Default `sidebar_width` is `30`. Only t
 
 `notifications` controls desktop alerts. Defaults to `true`.
 
+`spawn_maxdepth` controls how deep `find` searches for git repos when spawning or creating worktrees. It searches `~/Programming`, `~/repos`, `~/projects`, and `~/code` (falling back to `~` if none exist). Defaults to `5`.
+
 ## Notes
 
 - `Ctrl-4` is the actual focus toggle binding (hold `Ctrl` and press `4`)
@@ -294,6 +298,7 @@ Keybinding values are single characters. Default `sidebar_width` is `30`. Only t
 - Child sessions are expandable and selectable in the sidebar, but `Enter` attach is not yet supported for child rows — use `v` to view their conversation instead
 - `c` and `!` operate on top-level sessions only
 - `r` refreshes the currently active session's PTY, not the selected sidebar row
+- Killing a managed session (`x`) also terminates its associated opencode serve daemon
 
 ## License
 

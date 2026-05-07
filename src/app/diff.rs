@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::text::Line;
 
 use crate::app::focus::AppFocus;
@@ -25,6 +27,7 @@ pub struct DiffViewState {
     search_active: bool,
     match_positions: Vec<(usize, usize, usize)>, // (line_idx, byte_start, byte_len)
     current_match: usize,
+    history: HashMap<String, (usize, usize)>,
 }
 
 impl Default for DiffViewState {
@@ -43,6 +46,7 @@ impl Default for DiffViewState {
             search_active: false,
             match_positions: Vec::new(),
             current_match: 0,
+            history: HashMap::new(),
         }
     }
 }
@@ -55,14 +59,16 @@ impl DiffViewState {
         raw_diff: String,
         return_focus: AppFocus,
     ) {
+        let (saved_scroll, saved_cursor) = self.history.get(&session_id).copied().unwrap_or((0, 0));
+
         self.session_id = Some(session_id);
         self.session_title = session_title;
         self.raw_diff = raw_diff;
         self.return_focus = return_focus;
         self.document.clear();
         self.metadata.clear();
-        self.scroll = 0;
-        self.cursor = 0;
+        self.scroll = saved_scroll;
+        self.cursor = saved_cursor;
         self.selection_anchor = None;
         self.search_query.clear();
         self.search_active = false;
@@ -71,6 +77,16 @@ impl DiffViewState {
     }
 
     pub fn close(&mut self) -> AppFocus {
+        if let Some(ref sid) = self.session_id {
+            if self.history.len() > 50 {
+                if let Some(first_key) = self.history.keys().next().cloned() {
+                    self.history.remove(&first_key);
+                }
+            }
+            self.history
+                .insert(sid.clone(), (self.scroll, self.cursor));
+        }
+
         self.session_id = None;
         self.raw_diff.clear();
         self.document.clear();
@@ -148,6 +164,26 @@ impl DiffViewState {
 
     pub fn scroll_offset(&self) -> usize {
         self.scroll
+    }
+
+    /// Scroll the viewport up by `amount` lines (content moves down).
+    /// If the cursor falls below the viewport, it is moved up to stay visible.
+    pub fn scroll_view_up(&mut self, amount: usize, vp: usize) {
+        self.scroll = self.scroll.saturating_sub(amount);
+        let max_visible = self.scroll + vp.saturating_sub(1);
+        if self.cursor > max_visible {
+            self.cursor = max_visible;
+        }
+    }
+
+    /// Scroll the viewport down by `amount` lines (content moves up).
+    /// If the cursor falls above the viewport, it is moved down to stay visible.
+    pub fn scroll_view_down(&mut self, amount: usize, vp: usize) {
+        let max_scroll = self.document.len().saturating_sub(vp);
+        self.scroll = (self.scroll + amount).min(max_scroll);
+        if self.cursor < self.scroll {
+            self.cursor = self.scroll;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -661,5 +697,70 @@ mod tests {
         state.cursor = 1;
 
         assert!(state.format_selection().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests_scroll_view {
+    use super::*;
+    use ratatui::text::Span;
+
+    fn make_document(texts: &[&str]) -> Vec<Line<'static>> {
+        texts
+            .iter()
+            .map(|t| Line::from(Span::raw(t.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn scroll_view_down_clamps_cursor() {
+        let mut state = DiffViewState::default();
+        state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        state.scroll = 0;
+        state.cursor = 0;
+        
+        // Scroll down by 1 (content moves up). Viewport is 5 lines.
+        // Visible lines: 1..5. Cursor is at 0.
+        // After scroll: Visible lines: 2..6 (scroll=1). Cursor should be clamped to 1.
+        state.scroll_view_down(1, 5);
+        assert_eq!(state.scroll, 1);
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn scroll_view_up_clamps_cursor() {
+        let mut state = DiffViewState::default();
+        state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        state.scroll = 5;
+        state.cursor = 9; // At the bottom of the viewport (5 + 5 - 1 = 9)
+        
+        // Scroll up by 1 (content moves down). Viewport is 5 lines.
+        // Visible lines: 5..9. Cursor is at 9.
+        // After scroll: Visible lines: 4..8 (scroll=4). Cursor should be clamped to 8.
+        state.scroll_view_up(1, 5);
+        assert_eq!(state.scroll, 4);
+        assert_eq!(state.cursor, 8);
+    }
+
+    #[test]
+    fn open_restores_from_history() {
+        let mut state = DiffViewState::default();
+        let sid = "session1".to_string();
+        
+        // Open, move cursor/scroll, and close
+        state.open(sid.clone(), "Title".to_string(), "Diff".to_string(), AppFocus::Sidebar);
+        state.scroll = 10;
+        state.cursor = 15;
+        state.close();
+        
+        // Re-open same session
+        state.open(sid.clone(), "Title".to_string(), "Diff".to_string(), AppFocus::Sidebar);
+        assert_eq!(state.scroll, 10);
+        assert_eq!(state.cursor, 15);
+        
+        // Open different session
+        state.open("session2".to_string(), "Title 2".to_string(), "Diff 2".to_string(), AppFocus::Sidebar);
+        assert_eq!(state.scroll, 0);
+        assert_eq!(state.cursor, 0);
     }
 }

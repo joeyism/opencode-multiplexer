@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub sidebar_width: u16,
     pub keybindings: Keybindings,
     pub notifications: bool,
+    pub spawn_maxdepth: u32,
 }
 
 impl Default for AppConfig {
@@ -19,6 +20,7 @@ impl Default for AppConfig {
             sidebar_width: 30,
             keybindings: Keybindings::default(),
             notifications: true,
+            spawn_maxdepth: 5,
         }
     }
 }
@@ -61,6 +63,7 @@ struct PartialConfig {
     sidebar_width: Option<u16>,
     keybindings: Option<PartialKeybindings>,
     notifications: Option<bool>,
+    spawn_maxdepth: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +114,9 @@ pub fn load_config_from_path(path: &Path) -> anyhow::Result<AppConfig> {
     }
     if let Some(notifications) = partial.notifications {
         config.notifications = notifications;
+    }
+    if let Some(spawn_maxdepth) = partial.spawn_maxdepth {
+        config.spawn_maxdepth = spawn_maxdepth;
     }
 
     Ok(config)
