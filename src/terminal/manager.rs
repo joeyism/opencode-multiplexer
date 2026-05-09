@@ -560,7 +560,9 @@ impl PtyManager {
                 .items()
                 .iter()
                 .find(|s| s.id == *id)
-                .is_some_and(|s| s.origin == SessionOrigin::Managed && s.session_id.is_some())
+                .is_some_and(|s| {
+                    s.origin == SessionOrigin::Managed && s.session_id.is_some()
+                })
         });
 
         self.sessions
