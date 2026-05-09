@@ -79,9 +79,10 @@ impl DiffViewState {
     pub fn close(&mut self) -> AppFocus {
         if let Some(ref sid) = self.session_id {
             if self.history.len() > 50
-                && let Some(first_key) = self.history.keys().next().cloned() {
-                    self.history.remove(&first_key);
-                }
+                && let Some(first_key) = self.history.keys().next().cloned()
+            {
+                self.history.remove(&first_key);
+            }
             self.history.insert(sid.clone(), (self.scroll, self.cursor));
         }
 

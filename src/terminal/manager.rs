@@ -268,9 +268,10 @@ impl PtyManager {
 
         if let Some(session) = session
             && session.origin == SessionOrigin::Managed
-                && let Some(serve_pid) = session.serve_pid {
-                    crate::registry::kill_pid(serve_pid);
-                }
+            && let Some(serve_pid) = session.serve_pid
+        {
+            crate::registry::kill_pid(serve_pid);
+        }
 
         if keep_placeholder {
             self.sessions.cancel_kill();
@@ -559,9 +560,7 @@ impl PtyManager {
                 .items()
                 .iter()
                 .find(|s| s.id == *id)
-                .is_some_and(|s| {
-                    s.origin == SessionOrigin::Managed && s.session_id.is_some()
-                })
+                .is_some_and(|s| s.origin == SessionOrigin::Managed && s.session_id.is_some())
         });
 
         self.sessions
