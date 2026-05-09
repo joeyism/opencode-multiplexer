@@ -34,7 +34,7 @@ pub fn pick_directory(maxdepth: u32) -> anyhow::Result<Option<PathBuf>> {
     }
     find_args.extend_from_slice(&[
         "-maxdepth".into(),
-        maxdepth.to_string().into(),
+        maxdepth.to_string(),
         "-name".into(),
         ".git".into(),
     ]);

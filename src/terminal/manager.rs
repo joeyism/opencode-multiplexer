@@ -266,13 +266,11 @@ impl PtyManager {
             let _ = pty.kill();
         }
 
-        if let Some(session) = session {
-            if session.origin == SessionOrigin::Managed {
-                if let Some(serve_pid) = session.serve_pid {
+        if let Some(session) = session
+            && session.origin == SessionOrigin::Managed
+                && let Some(serve_pid) = session.serve_pid {
                     crate::registry::kill_pid(serve_pid);
                 }
-            }
-        }
 
         if keep_placeholder {
             self.sessions.cancel_kill();
@@ -544,10 +542,10 @@ impl PtyManager {
                     SessionOrigin::Discovered => no_pty && not_in_snapshot,
                     SessionOrigin::Managed => {
                         let dead_serve = session.serve_pid.is_some_and(|pid| !is_pid_alive(pid));
-                        let replaced_in_cwd = session.session_id.as_deref().map_or(false, |sid| {
+                        let replaced_in_cwd = session.session_id.as_deref().is_some_and(|sid| {
                             snapshot_cwd_ids
                                 .get(&session.cwd)
-                                .map_or(false, |ids| ids.iter().any(|id| id != sid))
+                                .is_some_and(|ids| ids.iter().any(|id| id != sid))
                         });
                         dead_serve && no_pty && (not_in_snapshot || replaced_in_cwd)
                     }
@@ -561,7 +559,7 @@ impl PtyManager {
                 .items()
                 .iter()
                 .find(|s| s.id == *id)
-                .map_or(false, |s| {
+                .is_some_and(|s| {
                     s.origin == SessionOrigin::Managed && s.session_id.is_some()
                 })
         });
