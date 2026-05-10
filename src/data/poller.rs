@@ -740,6 +740,10 @@ mod tests {
 
     #[test]
     fn merge_cached_serve_sessions_does_not_duplicate_when_fast_covers_all() {
+        let db_path = temp_db_path("merge-no-dup");
+        let _conn = init_db(&db_path);
+        let reader = DbReader::open(&db_path).unwrap();
+
         let fast = PollSnapshot {
             sessions: vec![DiscoveredSessionInfo {
                 session_id: "sess_a".into(),
@@ -770,7 +774,7 @@ mod tests {
             serve_port: Some(4200),
             source: DiscoverySource::Serve,
         }];
-        let merged = merge_cached_serve_sessions(fast, &cached).unwrap();
+        let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.sessions[0].title, "A");
         assert_eq!(merged.sessions[0].source, DiscoverySource::TuiExplicit);
