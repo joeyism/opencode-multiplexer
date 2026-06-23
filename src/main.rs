@@ -15,6 +15,7 @@ use crossterm::{
 use opencode_multiplexer::{
     app::{
         Action, conversation::ConversationViewState, diff::DiffViewState, focus::AppFocus,
+        key_handler::{handle_conversation_key, handle_diff_key, KeyAction},
         message_picker::MessagePickerState, reducer::reduce, session_picker::SessionPickerState,
         sessions::SessionStatus, state::AppState,
     },
@@ -25,10 +26,11 @@ use opencode_multiplexer::{
     ops::worktree::create_worktree,
     ops::{fzf::pick_directory, opencode::display_title_for_cwd},
     registry::save_managed_sessions,
-    terminal::manager::PtyManager,
+    terminal::{manager::PtyManager, selection::TerminalSelection, selection::MouseResult, clipboard},
     ui::{
         conversation, diff as ui_diff, root,
         sidebar::{SidebarRowKind, flatten_sidebar_entries},
+        layout::terminal_inner_rect,
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -44,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         crossterm::event::EnableFocusChange
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -71,7 +74,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     let mut footer_message: Option<String> = None;
     let mut conversation = ConversationViewState::default();
     let mut diff_view = DiffViewState::default();
-    let mut mouse_captured = false;
+    let mut terminal_selection = TerminalSelection::default();
     let (poll_tx, poll_rx) = std::sync::mpsc::channel();
     let poller = start_poller(poll_tx);
 
@@ -190,6 +193,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     state.session_picker.as_mut(),
                     state.message_picker.as_mut(),
                     state.confirm_quit,
+                    terminal_selection.range(),
                 )
             })?;
 
@@ -198,190 +202,159 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             }
 
             match event::read()? {
-                Event::Key(key) if state.message_picker.is_some() => match key.code {
-                    KeyCode::Esc => {
-                        state.message_picker = None;
-                        footer_message = Some("history canceled".into());
-                    }
-                    KeyCode::Enter => {
-                        let selected_text = state
-                            .message_picker
-                            .as_ref()
-                            .and_then(|p| p.selected_entry())
-                            .map(|entry| entry.text.clone());
+                Event::Key(key) => {
+                    terminal_selection.clear();
+                    if state.message_picker.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.message_picker = None;
+                                footer_message = Some("history canceled".into());
+                            }
+                            KeyCode::Enter => {
+                                let selected_text = state
+                                    .message_picker
+                                    .as_ref()
+                                    .and_then(|p| p.selected_entry())
+                                    .map(|entry| entry.text.clone());
 
-                        if let Some(text) = selected_text {
-                            state.message_picker = None;
-                            state.last_main_focus = AppFocus::Terminal;
-                            reduce(&mut state, Action::SetFocus(AppFocus::Terminal));
+                                if let Some(text) = selected_text {
+                                    state.message_picker = None;
+                                    state.last_main_focus = AppFocus::Terminal;
+                                    reduce(&mut state, Action::SetFocus(AppFocus::Terminal));
 
-                            if let Some(pty) = manager.active_session_mut() {
-                                match pty.send_paste(&text) {
-                                    Ok(_) => footer_message = None,
-                                    Err(error) => {
-                                        footer_message = Some(format!("paste failed: {error}"));
+                                    if let Some(pty) = manager.active_session_mut() {
+                                        match pty.send_paste(&text) {
+                                            Ok(_) => footer_message = None,
+                                            Err(error) => {
+                                                footer_message = Some(format!("paste failed: {error}"));
+                                            }
+                                        }
+                                    } else {
+                                        footer_message = Some("no active session to paste into".into());
                                     }
                                 }
-                            } else {
-                                footer_message = Some("no active session to paste into".into());
                             }
+                            KeyCode::Up => {
+                                if let Some(picker) = state.message_picker.as_mut() {
+                                    picker.move_up();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(picker) = state.message_picker.as_mut() {
+                                    picker.move_down();
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(picker) = state.message_picker.as_mut() {
+                                    picker.backspace();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(picker) = state.message_picker.as_mut() {
+                                    picker.insert_char(c);
+                                }
+                            }
+                            _ => {}
                         }
-                    }
-                    KeyCode::Up => {
-                        if let Some(picker) = state.message_picker.as_mut() {
-                            picker.move_up();
-                        }
-                    }
-                    KeyCode::Down => {
-                        if let Some(picker) = state.message_picker.as_mut() {
-                            picker.move_down();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(picker) = state.message_picker.as_mut() {
-                            picker.backspace();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        if let Some(picker) = state.message_picker.as_mut() {
-                            picker.insert_char(c);
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Key(key) if state.session_picker.is_some() => match key.code {
-                    KeyCode::Esc => {
-                        state.session_picker = None;
-                        footer_message = Some("search canceled".into());
-                    }
-                    KeyCode::Enter => {
-                        let entry = state
-                            .session_picker
-                            .as_ref()
-                            .and_then(|p| p.selected_entry());
-                        state.session_picker = None;
-                        if let Some(entry) = entry {
-                            match DbReader::open_default()
-                                .and_then(|r| r.get_session_status(&entry.session_id))
-                            {
-                                Ok(status) => {
-                                    let (rows, cols) =
-                                        pane_size(terminal.size()?.into(), config.sidebar_width);
-                                    match manager.attach_arbitrary_session(
-                                        entry.session_id,
-                                        entry.dir_path,
-                                        entry.title.clone(),
-                                        status,
-                                        Some(entry.time_updated),
-                                        rows,
-                                        cols,
-                                    ) {
-                                        Ok(_) => {
-                                            save_managed_sessions(manager.managed_session_ids())?;
-                                            state.focus = AppFocus::Terminal;
-                                            state.selected_sidebar_row = 0;
-                                            footer_message = None;
+                    } else if state.session_picker.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.session_picker = None;
+                                footer_message = Some("search canceled".into());
+                            }
+                            KeyCode::Enter => {
+                                let entry = state
+                                    .session_picker
+                                    .as_ref()
+                                    .and_then(|p| p.selected_entry());
+                                state.session_picker = None;
+                                if let Some(entry) = entry {
+                                    match DbReader::open_default()
+                                        .and_then(|r| r.get_session_status(&entry.session_id))
+                                    {
+                                        Ok(status) => {
+                                            let (rows, cols) =
+                                                pane_size(terminal.size()?.into(), config.sidebar_width);
+                                            match manager.attach_arbitrary_session(
+                                                entry.session_id,
+                                                entry.dir_path,
+                                                entry.title.clone(),
+                                                status,
+                                                Some(entry.time_updated),
+                                                rows,
+                                                cols,
+                                            ) {
+                                                Ok(_) => {
+                                                    save_managed_sessions(manager.managed_session_ids())?;
+                                                    state.focus = AppFocus::Terminal;
+                                                    state.selected_sidebar_row = 0;
+                                                    footer_message = None;
+                                                }
+                                                Err(error) => {
+                                                    footer_message =
+                                                        Some(format!("attach failed: {error}"));
+                                                }
+                                            }
                                         }
                                         Err(error) => {
-                                            footer_message =
-                                                Some(format!("attach failed: {error}"));
+                                            footer_message = Some(format!("status lookup failed: {error}"));
                                         }
                                     }
                                 }
-                                Err(error) => {
-                                    footer_message = Some(format!("status lookup failed: {error}"));
+                            }
+                            KeyCode::Up => {
+                                if let Some(picker) = state.session_picker.as_mut() {
+                                    picker.move_up();
                                 }
                             }
+                            KeyCode::Down => {
+                                if let Some(picker) = state.session_picker.as_mut() {
+                                    picker.move_down();
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(picker) = state.session_picker.as_mut() {
+                                    picker.backspace();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(picker) = state.session_picker.as_mut() {
+                                    picker.insert_char(c);
+                                }
+                            }
+                            _ => {}
                         }
-                    }
-                    KeyCode::Up => {
-                        if let Some(picker) = state.session_picker.as_mut() {
-                            picker.move_up();
+                    } else if key.code == KeyCode::Char(config.keybindings.help)
+                        && !matches!(state.focus, AppFocus::Terminal)
+                    {
+                        reduce(&mut state, Action::ToggleHelp)
+                    } else if state.show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char(_)) {
+                        state.show_help = false;
+                    } else if !state.show_files.is_empty()
+                        && matches!(key.code, KeyCode::Esc | KeyCode::Char(_))
+                    {
+                        state.show_files.clear();
+                    } else if state.confirm_quit {
+                        match key.code {
+                            KeyCode::Char('y') => break,
+                            KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                                state.confirm_quit = false;
+                            }
+                            _ => {}
                         }
-                    }
-                    KeyCode::Down => {
-                        if let Some(picker) = state.session_picker.as_mut() {
-                            picker.move_down();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if let Some(picker) = state.session_picker.as_mut() {
-                            picker.backspace();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        if let Some(picker) = state.session_picker.as_mut() {
-                            picker.insert_char(c);
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Key(key)
-                    if key.code == KeyCode::Char(config.keybindings.help)
-                        && !matches!(state.focus, AppFocus::Terminal) =>
-                {
-                    reduce(&mut state, Action::ToggleHelp)
-                }
-                Event::Key(key)
-                    if state.show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char(_)) =>
-                {
-                    state.show_help = false;
-                }
-                Event::Key(key)
-                    if !state.show_files.is_empty()
-                        && matches!(key.code, KeyCode::Esc | KeyCode::Char(_)) =>
-                {
-                    state.show_files.clear();
-                }
-                Event::Key(key) if state.confirm_quit => match key.code {
-                    KeyCode::Char('y') => break,
-                    KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
-                        state.confirm_quit = false;
-                    }
-                    _ => {}
-                },
-                Event::Key(key)
-                    if is_panel_toggle(key)
+                    } else if is_panel_toggle(key)
                         && matches!(
                             state.focus,
                             AppFocus::Terminal
                                 | AppFocus::Sidebar
                                 | AppFocus::Diff
                                 | AppFocus::Conversation
-                        ) =>
-                {
-                    reduce(&mut state, Action::TogglePanelHidden);
-                    let new_sidebar_width = if state.panel_hidden {
-                        0
-                    } else if state.sidebar_collapsed {
-                        COLLAPSED_SIDEBAR_WIDTH
-                    } else {
-                        config.sidebar_width
-                    };
-                    let (pty_rows, pty_cols) =
-                        pane_size(terminal.size()?.into(), new_sidebar_width);
-                    if let Err(error) = manager.resize_active(pty_rows, pty_cols) {
-                        footer_message = Some(format!("resize failed: {error}"));
-                    }
-
-                    if diff_view.is_active() {
-                        let new_content_width =
-                            terminal.size()?.width.saturating_sub(new_sidebar_width);
-                        let new_vp =
-                            terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1) as usize;
-                        let (doc, meta) =
-                            ui_diff::build_diff_document(diff_view.raw_diff(), new_content_width);
-                        diff_view.replace_document(doc, meta, new_vp);
-                    }
-
-                    if matches!(state.focus, AppFocus::Conversation) {
-                        conversation.force_poll();
-                    }
-                }
-                Event::Key(key) if is_focus_toggle(key) => {
-                    if state.panel_hidden {
+                        )
+                    {
                         reduce(&mut state, Action::TogglePanelHidden);
-                        let new_sidebar_width = if state.sidebar_collapsed {
+                        let new_sidebar_width = if state.panel_hidden {
+                            0
+                        } else if state.sidebar_collapsed {
                             COLLAPSED_SIDEBAR_WIDTH
                         } else {
                             config.sidebar_width
@@ -391,327 +364,384 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         if let Err(error) = manager.resize_active(pty_rows, pty_cols) {
                             footer_message = Some(format!("resize failed: {error}"));
                         }
-                    } else {
-                        reduce(&mut state, Action::ToggleFocus);
-                    }
-                }
-                Event::Key(key)
-                    if matches!(state.focus, AppFocus::Sidebar)
-                        && manager.pending_kill().is_some() =>
-                {
-                    match key.code {
-                        KeyCode::Char('y') => {
-                            let _ = manager.kill_selected()?;
-                            save_managed_sessions(manager.managed_session_ids())?;
-                            footer_message = Some("killed session".into());
-                        }
-                        KeyCode::Char('n') | KeyCode::Esc => {
-                            manager.cancel_kill();
-                            footer_message = None;
-                        }
-                        _ => {}
-                    }
-                }
-                Event::Key(key) if matches!(state.focus, AppFocus::Sidebar) => match key.code {
-                    KeyCode::Char(c) if c == config.keybindings.quit => {
-                        state.confirm_quit = true;
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.down => {
-                        reduce(&mut state, Action::SelectNextRow)
-                    }
-                    KeyCode::Down => reduce(&mut state, Action::SelectNextRow),
-                    KeyCode::Char(c) if c == config.keybindings.up => {
-                        reduce(&mut state, Action::SelectPrevRow)
-                    }
-                    KeyCode::Up => reduce(&mut state, Action::SelectPrevRow),
-                    KeyCode::Enter => {
-                        let (pty_rows, pty_cols) =
-                            pane_size(terminal.size()?.into(), config.sidebar_width);
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            match &row.kind {
-                                SidebarRowKind::TopLevel { top_level_id, .. } => {
-                                    manager.select_top_level(*top_level_id);
-                                    match manager.activate_or_attach_selected(pty_rows, pty_cols) {
-                                        Ok(_) => {
-                                            save_managed_sessions(manager.managed_session_ids())?;
-                                            state.focus = AppFocus::Terminal;
-                                            footer_message = None
-                                        }
-                                        Err(error) => {
-                                            footer_message = Some(format!("attach failed: {error}"))
-                                        }
-                                    }
-                                }
-                                SidebarRowKind::Child { .. } => {
-                                    footer_message = Some(
-                                        "child rows are selectable; attach not wired yet".into(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.view => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            match &row.kind {
-                                SidebarRowKind::TopLevel {
-                                    session_id: Some(sid),
-                                    ..
-                                } => {
-                                    let title = row.title.clone();
-                                    conversation.open(sid.clone(), title, AppFocus::Sidebar);
-                                    reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
-                                    footer_message = None;
-                                }
-                                SidebarRowKind::Child { session_id } => {
-                                    let title = row.title.clone();
-                                    conversation.open(session_id.clone(), title, AppFocus::Sidebar);
-                                    reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
-                                    footer_message = None;
-                                }
-                                _ => {
-                                    footer_message = Some(
-                                        "conversation view requires a session with a DB ID".into(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.files => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            if let Some(sid) = row.session_id.as_deref() {
-                                match DbReader::open_default()
-                                    .and_then(|r| r.get_session_modified_files(sid))
-                                {
-                                    Ok(files) if files.is_empty() => {
-                                        footer_message =
-                                            Some("no files modified by this session".into());
-                                    }
-                                    Ok(files) => {
-                                        state.show_files = files;
-                                    }
-                                    Err(e) => {
-                                        footer_message = Some(format!("failed to read files: {e}"));
-                                    }
-                                }
-                            } else {
-                                footer_message = Some("no session ID for this row".into());
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.diff => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            if let Some(sid) = row.session_id.as_deref() {
-                                match resolve_session_diff(row, sid) {
-                                    Ok(diff) => {
-                                        let title = row.title.clone();
-                                        diff_view.open(
-                                            sid.to_string(),
-                                            title,
-                                            diff,
-                                            AppFocus::Sidebar,
-                                        );
-                                        let (doc, meta) = ui_diff::build_diff_document(
-                                            diff_view.raw_diff(),
-                                            content_width,
-                                        );
-                                        diff_view.replace_document(doc, meta, viewport_height);
-                                        reduce(&mut state, Action::SetFocus(AppFocus::Diff));
-                                        footer_message = None;
-                                    }
-                                    Err(msg) => {
-                                        footer_message = Some(msg);
-                                    }
-                                }
-                            } else {
-                                footer_message = Some("no session ID for this row".into());
-                            }
-                        }
-                    }
-                    KeyCode::Char('/') => {
-                        let live_ids: HashSet<String> = manager
-                            .sidebar_entries()
-                            .iter()
-                            .filter_map(|e| e.session_id.clone())
-                            .collect();
-                        match SessionPickerState::load(live_ids) {
-                            Ok(picker) if picker.total_count() > 0 => {
-                                state.session_picker = Some(picker);
-                            }
-                            Ok(_) => {
-                                footer_message = Some("no sessions found".into());
-                            }
-                            Err(error) => {
-                                footer_message = Some(format!("search failed: {error}"));
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.history => {
-                        match MessagePickerState::load() {
-                            Ok(picker) if picker.total_count() > 0 => {
-                                state.message_picker = Some(picker);
-                                state.session_picker = None;
-                                footer_message = None;
-                            }
-                            Ok(_) => {
-                                footer_message = Some("no message history found".into());
-                            }
-                            Err(error) => {
-                                footer_message = Some(format!("history failed: {error}"));
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.kill => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            match row.kind {
-                                SidebarRowKind::TopLevel { top_level_id, .. } => {
-                                    manager.select_top_level(top_level_id);
-                                    manager.request_kill_selected();
-                                    if let Some(summary) = manager.selected_summary() {
-                                        footer_message = Some(format!(
-                                            "kill {}? y confirm / n cancel",
-                                            summary.title
-                                        ));
-                                    }
-                                }
-                                SidebarRowKind::Child { .. } => {
-                                    footer_message =
-                                        Some("kill only supported on top-level sessions".into());
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.spawn => {
-                        match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
-                            Ok(Some(cwd)) => {
-                                let title = display_title_for_cwd(&cwd);
-                                let (rows, cols) =
-                                    pane_size(terminal.size()?.into(), config.sidebar_width);
-                                match manager.spawn_managed(cwd, title.clone(), rows, cols) {
-                                    Ok(_) => {
-                                        save_managed_sessions(manager.managed_session_ids())?;
-                                        state.focus = AppFocus::Terminal;
-                                        state.selected_sidebar_row = 0;
-                                        footer_message = Some(format!("spawned {title}"))
-                                    }
-                                    Err(error) => {
-                                        footer_message = Some(format!("spawn failed: {error}"))
-                                    }
-                                }
-                            }
-                            Ok(None) => footer_message = Some("spawn canceled".into()),
-                            Err(error) => footer_message = Some(format!("picker failed: {error}")),
-                        }
-                    }
-                    KeyCode::Tab => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row)
-                            && row.has_children
-                            && let Some(session_id) = row.session_id.clone()
-                        {
-                            reduce(&mut state, Action::ToggleExpandSelected(session_id));
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        let (pty_rows, pty_cols) =
-                            pane_size(terminal.size()?.into(), sidebar_width);
-                        match manager.refresh_active(pty_rows, pty_cols) {
-                            Ok(true) => footer_message = Some("refreshed session".into()),
-                            Ok(false) => {
-                                footer_message = Some("no active session to refresh".into())
-                            }
-                            Err(error) => footer_message = Some(format!("refresh failed: {error}")),
-                        }
-                    }
-
-                    KeyCode::Char('c') => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            match &row.kind {
-                                SidebarRowKind::TopLevel {
-                                    session_id: Some(sid),
-                                    ..
-                                } => {
-                                    if let Some(cwd) = resolve_session_cwd(row) {
-                                        match commit_session_files(terminal, sid, &cwd) {
-                                            Ok(Some(msg)) => footer_message = Some(msg),
-                                            Ok(None) => {
-                                                footer_message = Some("commit canceled".into())
-                                            }
-                                            Err(e) => {
-                                                footer_message = Some(format!("commit failed: {e}"))
-                                            }
-                                        }
-                                    } else {
-                                        footer_message = Some("session directory not found".into());
-                                    }
-                                }
-                                _ => {
-                                    footer_message =
-                                        Some("commit requires a top-level session with ID".into())
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('!') => {
-                        if let Some(row) = rows.get(state.selected_sidebar_row) {
-                            match &row.kind {
-                                SidebarRowKind::TopLevel { .. } => {
-                                    if let Some(cwd) = resolve_session_cwd(row) {
-                                        match drop_to_bash(terminal, &cwd) {
-                                            Ok(_) => footer_message = None,
-                                            Err(error) => {
-                                                footer_message =
-                                                    Some(format!("bash failed: {error}"))
-                                            }
-                                        }
-                                    } else {
-                                        footer_message = Some("session directory not found".into());
-                                    }
-                                }
-                                SidebarRowKind::Child { .. } => {
-                                    footer_message = Some("bash only on top-level sessions".into());
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        reduce(&mut state, Action::ToggleSidebarCollapse);
-
-                        let new_sidebar_width = if state.panel_hidden {
-                            0
-                        } else if state.sidebar_collapsed {
-                            COLLAPSED_SIDEBAR_WIDTH
-                        } else {
-                            config.sidebar_width
-                        };
 
                         if diff_view.is_active() {
                             let new_content_width =
                                 terminal.size()?.width.saturating_sub(new_sidebar_width);
                             let new_vp =
                                 terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1) as usize;
-                            let (doc, meta) = ui_diff::build_diff_document(
-                                diff_view.raw_diff(),
-                                new_content_width,
-                            );
+                            let (doc, meta) =
+                                ui_diff::build_diff_document(diff_view.raw_diff(), new_content_width);
                             diff_view.replace_document(doc, meta, new_vp);
                         }
-                    }
-                    KeyCode::Char(c) if c == config.keybindings.worktree => {
-                        match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
-                            Ok(Some(repo_dir)) => {
-                                match prompt_text_with_terminal(
-                                    terminal,
-                                    "Branch name (empty = repo root):",
-                                )? {
-                                    Some(branch) if !branch.trim().is_empty() => {
-                                        match create_worktree(&repo_dir, branch.trim()) {
-                                            Ok(worktree_dir) => {
-                                                let title = display_title_for_cwd(&worktree_dir);
+
+                        if matches!(state.focus, AppFocus::Conversation) {
+                            conversation.force_poll();
+                        }
+                    } else if is_focus_toggle(key) {
+                        if state.panel_hidden {
+                            reduce(&mut state, Action::TogglePanelHidden);
+                            let new_sidebar_width = if state.sidebar_collapsed {
+                                COLLAPSED_SIDEBAR_WIDTH
+                            } else {
+                                config.sidebar_width
+                            };
+                            let (pty_rows, pty_cols) =
+                                pane_size(terminal.size()?.into(), new_sidebar_width);
+                            if let Err(error) = manager.resize_active(pty_rows, pty_cols) {
+                                footer_message = Some(format!("resize failed: {error}"));
+                            }
+                        } else {
+                            reduce(&mut state, Action::ToggleFocus);
+                        }
+                    } else if matches!(state.focus, AppFocus::Sidebar)
+                        && manager.pending_kill().is_some()
+                    {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                let _ = manager.kill_selected()?;
+                                save_managed_sessions(manager.managed_session_ids())?;
+                                footer_message = Some("killed session".into());
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => {
+                                manager.cancel_kill();
+                                footer_message = None;
+                            }
+                            _ => {}
+                        }
+                    } else if matches!(state.focus, AppFocus::Sidebar) {
+                        match key.code {
+                            KeyCode::Char(c) if c == config.keybindings.quit => {
+                                state.confirm_quit = true;
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.down => {
+                                reduce(&mut state, Action::SelectNextRow)
+                            }
+                            KeyCode::Down => reduce(&mut state, Action::SelectNextRow),
+                            KeyCode::Char(c) if c == config.keybindings.up => {
+                                reduce(&mut state, Action::SelectPrevRow)
+                            }
+                            KeyCode::Up => reduce(&mut state, Action::SelectPrevRow),
+                            KeyCode::Enter => {
+                                let (pty_rows, pty_cols) =
+                                    pane_size(terminal.size()?.into(), config.sidebar_width);
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    match &row.kind {
+                                        SidebarRowKind::TopLevel { top_level_id, .. } => {
+                                            manager.select_top_level(*top_level_id);
+                                            match manager.activate_or_attach_selected(pty_rows, pty_cols) {
+                                                Ok(_) => {
+                                                    save_managed_sessions(manager.managed_session_ids())?;
+                                                    state.focus = AppFocus::Terminal;
+                                                    footer_message = None
+                                                }
+                                                Err(error) => {
+                                                    footer_message = Some(format!("attach failed: {error}"))
+                                                }
+                                            }
+                                        }
+                                        SidebarRowKind::Child { .. } => {
+                                            footer_message = Some(
+                                                "child rows are selectable; attach not wired yet".into(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.view => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    match &row.kind {
+                                        SidebarRowKind::TopLevel {
+                                            session_id: Some(sid),
+                                            ..
+                                        } => {
+                                            let title = row.title.clone();
+                                            conversation.open(sid.clone(), title, AppFocus::Sidebar);
+                                            reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
+                                            footer_message = None;
+                                        }
+                                        SidebarRowKind::Child { session_id } => {
+                                            let title = row.title.clone();
+                                            conversation.open(session_id.clone(), title, AppFocus::Sidebar);
+                                            reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
+                                            footer_message = None;
+                                        }
+                                        _ => {
+                                            footer_message = Some(
+                                                "conversation view requires a session with a DB ID".into(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.files => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    if let Some(sid) = row.session_id.as_deref() {
+                                        match DbReader::open_default()
+                                            .and_then(|r| r.get_session_modified_files(sid))
+                                        {
+                                            Ok(files) if files.is_empty() => {
+                                                footer_message =
+                                                    Some("no files modified by this session".into());
+                                            }
+                                            Ok(files) => {
+                                                state.show_files = files;
+                                            }
+                                            Err(e) => {
+                                                footer_message = Some(format!("failed to read files: {e}"));
+                                            }
+                                        }
+                                    } else {
+                                        footer_message = Some("no session ID for this row".into());
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.diff => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    if let Some(sid) = row.session_id.as_deref() {
+                                        match resolve_session_diff(row, sid) {
+                                            Ok(diff) => {
+                                                let title = row.title.clone();
+                                                diff_view.open(
+                                                    sid.to_string(),
+                                                    title,
+                                                    diff,
+                                                    AppFocus::Sidebar,
+                                                );
+                                                let (doc, meta) = ui_diff::build_diff_document(
+                                                    diff_view.raw_diff(),
+                                                    content_width,
+                                                );
+                                                diff_view.replace_document(doc, meta, viewport_height);
+                                                reduce(&mut state, Action::SetFocus(AppFocus::Diff));
+                                                footer_message = None;
+                                            }
+                                            Err(msg) => {
+                                                footer_message = Some(msg);
+                                            }
+                                        }
+                                    } else {
+                                        footer_message = Some("no session ID for this row".into());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('/') => {
+                                let live_ids: HashSet<String> = manager
+                                    .sidebar_entries()
+                                    .iter()
+                                    .filter_map(|e| e.session_id.clone())
+                                    .collect();
+                                match SessionPickerState::load(live_ids) {
+                                    Ok(picker) if picker.total_count() > 0 => {
+                                        state.session_picker = Some(picker);
+                                    }
+                                    Ok(_) => {
+                                        footer_message = Some("no sessions found".into());
+                                    }
+                                    Err(error) => {
+                                        footer_message = Some(format!("search failed: {error}"));
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.history => {
+                                match MessagePickerState::load() {
+                                    Ok(picker) if picker.total_count() > 0 => {
+                                        state.message_picker = Some(picker);
+                                        state.session_picker = None;
+                                        footer_message = None;
+                                    }
+                                    Ok(_) => {
+                                        footer_message = Some("no message history found".into());
+                                    }
+                                    Err(error) => {
+                                        footer_message = Some(format!("history failed: {error}"));
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.kill => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    match row.kind {
+                                        SidebarRowKind::TopLevel { top_level_id, .. } => {
+                                            manager.select_top_level(top_level_id);
+                                            manager.request_kill_selected();
+                                            if let Some(summary) = manager.selected_summary() {
+                                                footer_message = Some(format!(
+                                                    "kill {}? y confirm / n cancel",
+                                                    summary.title
+                                                ));
+                                            }
+                                        }
+                                        SidebarRowKind::Child { .. } => {
+                                            footer_message =
+                                                Some("kill only supported on top-level sessions".into());
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.spawn => {
+                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
+                                    Ok(Some(cwd)) => {
+                                        let title = display_title_for_cwd(&cwd);
+                                        let (rows, cols) =
+                                            pane_size(terminal.size()?.into(), config.sidebar_width);
+                                        match manager.spawn_managed(cwd, title.clone(), rows, cols) {
+                                            Ok(_) => {
+                                                save_managed_sessions(manager.managed_session_ids())?;
+                                                state.focus = AppFocus::Terminal;
+                                                state.selected_sidebar_row = 0;
+                                                footer_message = Some(format!("spawned {title}"))
+                                            }
+                                            Err(error) => {
+                                                footer_message = Some(format!("spawn failed: {error}"))
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => footer_message = Some("spawn canceled".into()),
+                                    Err(error) => footer_message = Some(format!("picker failed: {error}")),
+                                }
+                            }
+                            KeyCode::Tab => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && row.has_children
+                                    && let Some(session_id) = row.session_id.clone()
+                                {
+                                    reduce(&mut state, Action::ToggleExpandSelected(session_id));
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                let (pty_rows, pty_cols) =
+                                    pane_size(terminal.size()?.into(), sidebar_width);
+                                match manager.refresh_active(pty_rows, pty_cols) {
+                                    Ok(true) => footer_message = Some("refreshed session".into()),
+                                    Ok(false) => {
+                                        footer_message = Some("no active session to refresh".into())
+                                    }
+                                    Err(error) => footer_message = Some(format!("refresh failed: {error}")),
+                                }
+                            }
+
+                            KeyCode::Char('c') => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    match &row.kind {
+                                        SidebarRowKind::TopLevel {
+                                            session_id: Some(sid),
+                                            ..
+                                        } => {
+                                            if let Some(cwd) = resolve_session_cwd(row) {
+                                                match commit_session_files(terminal, sid, &cwd) {
+                                                    Ok(Some(msg)) => footer_message = Some(msg),
+                                                    Ok(None) => {
+                                                        footer_message = Some("commit canceled".into())
+                                                    }
+                                                    Err(e) => {
+                                                        footer_message = Some(format!("commit failed: {e}"))
+                                                    }
+                                                }
+                                            } else {
+                                                footer_message = Some("session directory not found".into());
+                                            }
+                                        }
+                                        _ => {
+                                            footer_message =
+                                                Some("commit requires a top-level session with ID".into())
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('!') => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                    match &row.kind {
+                                        SidebarRowKind::TopLevel { .. } => {
+                                            if let Some(cwd) = resolve_session_cwd(row) {
+                                                match drop_to_bash(terminal, &cwd) {
+                                                    Ok(_) => footer_message = None,
+                                                    Err(error) => {
+                                                        footer_message =
+                                                            Some(format!("bash failed: {error}"))
+                                                    }
+                                                }
+                                            } else {
+                                                footer_message = Some("session directory not found".into());
+                                            }
+                                        }
+                                        SidebarRowKind::Child { .. } => {
+                                            footer_message = Some("bash only on top-level sessions".into());
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                reduce(&mut state, Action::ToggleSidebarCollapse);
+
+                                let new_sidebar_width = if state.panel_hidden {
+                                    0
+                                } else if state.sidebar_collapsed {
+                                    COLLAPSED_SIDEBAR_WIDTH
+                                } else {
+                                    config.sidebar_width
+                                };
+
+                                if diff_view.is_active() {
+                                    let new_content_width =
+                                        terminal.size()?.width.saturating_sub(new_sidebar_width);
+                                    let new_vp =
+                                        terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1) as usize;
+                                    let (doc, meta) = ui_diff::build_diff_document(
+                                        diff_view.raw_diff(),
+                                        new_content_width,
+                                    );
+                                    diff_view.replace_document(doc, meta, new_vp);
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.worktree => {
+                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
+                                    Ok(Some(repo_dir)) => {
+                                        match prompt_text_with_terminal(
+                                            terminal,
+                                            "Branch name (empty = repo root):",
+                                        )? {
+                                            Some(branch) if !branch.trim().is_empty() => {
+                                                match create_worktree(&repo_dir, branch.trim()) {
+                                                    Ok(worktree_dir) => {
+                                                        let title = display_title_for_cwd(&worktree_dir);
+                                                        let (rows, cols) = pane_size(
+                                                            terminal.size()?.into(),
+                                                            sidebar_width,
+                                                        );
+                                                        match manager.spawn_managed(
+                                                            worktree_dir,
+                                                            title.clone(),
+                                                            rows,
+                                                            cols,
+                                                        ) {
+                                                            Ok(_) => {
+                                                                save_managed_sessions(
+                                                                    manager.managed_session_ids(),
+                                                                )?;
+                                                                footer_message = Some(format!(
+                                                                    "spawned worktree {title}"
+                                                                ));
+                                                            }
+                                                            Err(error) => {
+                                                                footer_message =
+                                                                    Some(format!("spawn failed: {error}"))
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        footer_message =
+                                                            Some(format!("worktree failed: {error}"))
+                                                    }
+                                                }
+                                            }
+                                            Some(_) => {
+                                                let title = display_title_for_cwd(&repo_dir);
                                                 let (rows, cols) = pane_size(
                                                     terminal.size()?.into(),
-                                                    sidebar_width,
+                                                    config.sidebar_width,
                                                 );
                                                 match manager.spawn_managed(
-                                                    worktree_dir,
+                                                    repo_dir,
                                                     title.clone(),
                                                     rows,
                                                     cols,
@@ -720,9 +750,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                         save_managed_sessions(
                                                             manager.managed_session_ids(),
                                                         )?;
-                                                        footer_message = Some(format!(
-                                                            "spawned worktree {title}"
-                                                        ));
+                                                        footer_message = Some(format!("spawned {title}"));
                                                     }
                                                     Err(error) => {
                                                         footer_message =
@@ -730,297 +758,158 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     }
                                                 }
                                             }
-                                            Err(error) => {
-                                                footer_message =
-                                                    Some(format!("worktree failed: {error}"))
-                                            }
+                                            None => footer_message = Some("worktree canceled".into()),
                                         }
                                     }
-                                    Some(_) => {
-                                        let title = display_title_for_cwd(&repo_dir);
-                                        let (rows, cols) = pane_size(
-                                            terminal.size()?.into(),
-                                            config.sidebar_width,
-                                        );
-                                        match manager.spawn_managed(
-                                            repo_dir,
-                                            title.clone(),
-                                            rows,
-                                            cols,
-                                        ) {
-                                            Ok(_) => {
-                                                save_managed_sessions(
-                                                    manager.managed_session_ids(),
-                                                )?;
-                                                footer_message = Some(format!("spawned {title}"));
-                                            }
-                                            Err(error) => {
-                                                footer_message =
-                                                    Some(format!("spawn failed: {error}"))
-                                            }
-                                        }
-                                    }
-                                    None => footer_message = Some("worktree canceled".into()),
+                                    Ok(None) => footer_message = Some("worktree canceled".into()),
+                                    Err(error) => footer_message = Some(format!("picker failed: {error}")),
                                 }
                             }
-                            Ok(None) => footer_message = Some("worktree canceled".into()),
-                            Err(error) => footer_message = Some(format!("picker failed: {error}")),
+                            _ => {}
                         }
-                    }
-                    _ => {}
-                },
-                Event::Paste(text)
-                    if matches!(state.focus, AppFocus::Conversation)
-                        && conversation.is_searching() =>
-                {
-                    conversation.search_insert_str(&text, viewport_height);
-                }
-                Event::Key(key)
-                    if matches!(state.focus, AppFocus::Conversation)
-                        && conversation.is_searching() =>
-                {
-                    let vp = viewport_height;
-                    match key.code {
-                        KeyCode::Char(c) => {
-                            conversation.search_insert(c, vp);
-                        }
-                        KeyCode::Backspace => {
-                            conversation.search_backspace(vp);
-                        }
-                        KeyCode::Enter => {
-                            conversation.confirm_search();
-                        }
-                        KeyCode::Esc => {
-                            conversation.cancel_search();
-                        }
-                        _ => {}
-                    }
-                }
-                Event::Key(key) if matches!(state.focus, AppFocus::Conversation) => {
-                    let vp = viewport_height;
-                    match key.code {
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            conversation.scroll_up(1);
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            conversation.scroll_down(1, vp);
-                        }
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            conversation.scroll_up(1);
-                        }
-                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            conversation.scroll_down(1, vp);
-                        }
-                        KeyCode::Char('G') => {
-                            conversation.scroll_to_end(vp);
-                        }
-                        KeyCode::Char('g') => {
-                            conversation.scroll_to_top();
-                        }
-                        KeyCode::Char('/') => {
-                            conversation.start_search();
-                        }
-                        KeyCode::Char('n') => {
-                            conversation.next_match(vp);
-                        }
-                        KeyCode::Char('N') => {
-                            conversation.prev_match(vp);
-                        }
-                        KeyCode::PageUp | KeyCode::Char('u')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            conversation.scroll_up(vp.saturating_sub(1));
-                        }
-                        KeyCode::PageDown | KeyCode::Char('d')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            conversation.scroll_down(vp.saturating_sub(1), vp);
-                        }
-                        KeyCode::Char(c) if c == config.keybindings.view => {
-                            let return_focus = conversation.close();
-                            state.last_main_focus = AppFocus::Terminal;
-                            reduce(&mut state, Action::SetFocus(return_focus));
-                            footer_message = None;
-                        }
-                        KeyCode::Char(c) if c == config.keybindings.quit => {
-                            state.confirm_quit = true;
-                        }
-                        KeyCode::Esc => {
-                            let return_focus = conversation.close();
-                            state.last_main_focus = AppFocus::Terminal;
-                            reduce(&mut state, Action::SetFocus(return_focus));
-                            footer_message = None;
-                        }
-                        _ => {}
-                    }
-                }
-                Event::Paste(text)
-                    if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() =>
-                {
-                    diff_view.search_insert_str(&text, viewport_height);
-                }
-                Event::Key(key)
-                    if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() =>
-                {
-                    let vp = viewport_height;
-                    match key.code {
-                        KeyCode::Char(c) => {
-                            diff_view.search_insert(c, vp);
-                        }
-                        KeyCode::Backspace => {
-                            diff_view.search_backspace(vp);
-                        }
-                        KeyCode::Enter => {
-                            diff_view.confirm_search();
-                        }
-                        KeyCode::Esc => {
-                            diff_view.cancel_search();
-                        }
-                        _ => {}
-                    }
-                }
-                Event::Key(key) if matches!(state.focus, AppFocus::Diff) => {
-                    let vp = viewport_height;
-                    match key.code {
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            diff_view.move_cursor_up(1, vp);
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            diff_view.move_cursor_down(1, vp);
-                        }
-                        KeyCode::Char('G') => {
-                            diff_view.move_cursor_to_end(vp);
-                        }
-                        KeyCode::Char('g') => {
-                            diff_view.move_cursor_to_top(vp);
-                        }
-                        KeyCode::PageUp | KeyCode::Char('u')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            diff_view.move_cursor_up(vp.saturating_sub(1), vp);
-                        }
-                        KeyCode::PageDown | KeyCode::Char('d')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            diff_view.move_cursor_down(vp.saturating_sub(1), vp);
-                        }
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            diff_view.scroll_view_up(1, vp);
-                        }
-                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            diff_view.scroll_view_down(1, vp);
-                        }
-                        KeyCode::Char('v') => {
-                            diff_view.toggle_visual();
-                        }
-                        KeyCode::Char('/') if !diff_view.is_visual() => {
-                            diff_view.start_search();
-                        }
-                        KeyCode::Char('n') => {
-                            diff_view.next_match(vp);
-                        }
-                        KeyCode::Char('N') => {
-                            diff_view.prev_match(vp);
-                        }
-                        KeyCode::Enter if diff_view.is_visual() => {
-                            if let Some(text) = diff_view.format_selection() {
-                                diff_view.close();
+                    } else if matches!(state.focus, AppFocus::Conversation) {
+                        match handle_conversation_key(key, &mut conversation, &config.keybindings, viewport_height) {
+                            KeyAction::Consumed => {}
+                            KeyAction::Close => {
+                                let return_focus = conversation.close();
                                 state.last_main_focus = AppFocus::Terminal;
-                                reduce(&mut state, Action::SetFocus(AppFocus::Terminal));
+                                reduce(&mut state, Action::SetFocus(return_focus));
+                                footer_message = None;
+                            }
+                            KeyAction::PasteSelection(text) => {
+                                let return_focus = conversation.close();
+                                state.last_main_focus = AppFocus::Terminal;
+                                reduce(&mut state, Action::SetFocus(return_focus));
+                                footer_message = None;
                                 if let Some(pty) = manager.active_session_mut() {
                                     let _ = pty.send_paste(&text);
                                 }
-                                footer_message = None;
-                            } else {
+                            }
+                            KeyAction::SelectionEmpty => {
                                 footer_message = Some("No valid lines in selection".to_string());
                             }
+                            KeyAction::ConfirmQuit => {
+                                state.confirm_quit = true;
+                            }
                         }
-                        KeyCode::Enter => {}
-                        KeyCode::Char(c) if c == config.keybindings.diff => {
-                            let return_focus = diff_view.close();
-                            state.last_main_focus = AppFocus::Terminal;
-                            reduce(&mut state, Action::SetFocus(return_focus));
-                            footer_message = None;
-                        }
-                        KeyCode::Char(c) if c == config.keybindings.quit => {
-                            let return_focus = diff_view.close();
-                            state.last_main_focus = AppFocus::Terminal;
-                            reduce(&mut state, Action::SetFocus(return_focus));
-                            footer_message = None;
-                        }
-                        KeyCode::Esc => {
-                            if diff_view.is_visual() {
-                                diff_view.cancel_visual();
-                            } else {
+                    } else if matches!(state.focus, AppFocus::Diff) {
+                        match handle_diff_key(key, &mut diff_view, &config.keybindings, viewport_height) {
+                            KeyAction::Consumed => {}
+                            KeyAction::Close => {
                                 let return_focus = diff_view.close();
                                 state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));
                                 footer_message = None;
                             }
+                            KeyAction::PasteSelection(text) => {
+                                let return_focus = diff_view.close();
+                                state.last_main_focus = AppFocus::Terminal;
+                                reduce(&mut state, Action::SetFocus(return_focus));
+                                footer_message = None;
+                                if let Some(pty) = manager.active_session_mut() {
+                                    let _ = pty.send_paste(&text);
+                                }
+                            }
+                            KeyAction::SelectionEmpty => {
+                                footer_message = Some("No valid lines in selection".to_string());
+                            }
+                            KeyAction::ConfirmQuit => {
+                                state.confirm_quit = true;
+                            }
                         }
-                        _ => {}
-                    }
-                }
-                Event::Key(key) if matches!(state.focus, AppFocus::Terminal) => {
-                    if let Some(pty) = manager.active_session_mut()
+                    } else if matches!(state.focus, AppFocus::Terminal)
+                        && let Some(pty) = manager.active_session_mut()
                         && let Err(error) = pty.send_key(key)
                     {
                         footer_message = Some(format!("terminal write failed: {error}"));
                     }
                 }
-                Event::Paste(text) if matches!(state.focus, AppFocus::Terminal) => {
-                    if let Some(pty) = manager.active_session_mut()
+                Event::Paste(text) => {
+                    terminal_selection.clear();
+                    if matches!(state.focus, AppFocus::Conversation) && conversation.is_searching() {
+                        conversation.search_insert_str(&text, viewport_height);
+                    } else if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() {
+                        diff_view.search_insert_str(&text, viewport_height);
+                    } else if matches!(state.focus, AppFocus::Terminal)
+                        && let Some(pty) = manager.active_session_mut()
                         && let Err(error) = pty.send_paste(&text)
                     {
                         footer_message = Some(format!("paste failed: {error}"));
                     }
                 }
-                Event::Mouse(mouse)
-                    if matches!(mouse.kind, MouseEventKind::Down(_))
-                        && mouse.column < config.sidebar_width =>
-                {
-                    state.focus = AppFocus::Sidebar;
-                    let clicked_row = mouse.row.saturating_sub(1) as usize;
-                    if clicked_row < rows.len() {
-                        state.selected_sidebar_row = clicked_row;
+                Event::Mouse(mouse) => {
+                    let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    let surface_size = manager.active_session().map(|s| (s.surface.rows(), s.surface.cols()));
+                    
+                    let mut handled = false;
+                    if let Some((rows, cols)) = surface_size {
+                        match terminal_selection.handle_mouse(mouse, inner, rows, cols) {
+                            MouseResult::Claimed => {
+                                state.focus = AppFocus::Terminal;
+                                handled = true;
+                            }
+                            MouseResult::Finished => {
+                                let session = manager.active_session().unwrap();
+                                let snapshot = session.surface.snapshot();
+                                let wrapped = session.surface.wrapped_rows();
+                                if let Some(text) = terminal_selection.extract_text_from(&snapshot, &wrapped) {
+                                    if let Err(e) = clipboard::copy_to_clipboard(&text) {
+                                        footer_message = Some(format!("copy failed: {e}"));
+                                    }
+                                }
+                                state.focus = AppFocus::Terminal;
+                                handled = true;
+                            }
+                            MouseResult::Ignored => {}
+                        }
                     }
-                }
-                Event::Mouse(mouse)
-                    if matches!(
-                        mouse.kind,
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                    ) =>
-                {
-                    let scroll_amount = 3;
-                    match state.focus {
-                        AppFocus::Conversation => match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                conversation.scroll_up(scroll_amount);
+
+                    if !handled {
+                        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                            terminal_selection.clear();
+                        }
+                        if matches!(mouse.kind, MouseEventKind::Down(_)) && mouse.column < sidebar_width {
+                            state.focus = AppFocus::Sidebar;
+                            let clicked_row = mouse.row.saturating_sub(1) as usize;
+                            if clicked_row < rows.len() {
+                                state.selected_sidebar_row = clicked_row;
                             }
-                            MouseEventKind::ScrollDown => {
-                                conversation.scroll_down(scroll_amount, viewport_height);
+                        } else if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                            let scroll_amount = 3;
+                            match state.focus {
+                                AppFocus::Conversation => match mouse.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        conversation.scroll_up(scroll_amount);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        conversation.scroll_down(scroll_amount, viewport_height);
+                                    }
+                                    _ => {}
+                                },
+                                AppFocus::Diff => match mouse.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        diff_view.scroll_up(scroll_amount);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        diff_view.scroll_down(scroll_amount, viewport_height);
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
                             }
-                            _ => {}
-                        },
-                        AppFocus::Diff => match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                diff_view.scroll_up(scroll_amount);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                diff_view.scroll_down(scroll_amount, viewport_height);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
+                        }
                     }
                 }
                 Event::FocusGained => {
+                    terminal_selection.clear();
                     state.app_focused = true;
                 }
                 Event::FocusLost => {
+                    terminal_selection.clear();
                     state.app_focused = false;
                 }
                 Event::Resize(width, height) => {
+                    terminal_selection.clear();
                     let (pty_rows, pty_cols) = pane_size(
                         ratatui::layout::Rect::new(0, 0, width, height),
                         sidebar_width,
@@ -1037,7 +926,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         diff_view.replace_document(doc, meta, new_vp);
                     }
                 }
-                _ => {}
             }
 
             if matches!(state.focus, AppFocus::Terminal)
@@ -1048,7 +936,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         state.selected_sidebar_row = idx;
                     }
             prev_selected_kind = rows.get(state.selected_sidebar_row).map(|r| r.kind.clone());
-            sync_mouse_capture(terminal, state.focus, &mut mouse_captured);
         }
 
         Ok(())
@@ -1250,6 +1137,7 @@ fn leave_tui(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
+        DisableMouseCapture,
         crossterm::event::DisableFocusChange
     )?;
     terminal.show_cursor()?;
@@ -1263,26 +1151,10 @@ fn enter_tui(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         crossterm::event::EnableFocusChange
     )?;
     enable_raw_mode()?;
     terminal.clear()?;
     Ok(())
-}
-
-fn sync_mouse_capture(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    focus: AppFocus,
-    captured: &mut bool,
-) {
-    let want = matches!(focus, AppFocus::Conversation | AppFocus::Diff);
-    if want == *captured {
-        return;
-    }
-    if want {
-        let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
-    } else {
-        let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
-    }
-    *captured = want;
 }

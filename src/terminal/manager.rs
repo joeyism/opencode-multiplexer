@@ -60,7 +60,7 @@ impl PtyManager {
         cols: u16,
     ) -> anyhow::Result<u64> {
         use crate::ops::opencode::{
-            fetch_serve_session_ids, find_available_port, spawn_serve_daemon,
+            fetch_stable_session_ids, find_available_port, spawn_serve_daemon,
             wait_for_new_session_id, wait_for_serve_ready,
         };
         use crate::registry::{register_serve_process, update_serve_registry_tui_pid};
@@ -75,8 +75,11 @@ impl PtyManager {
             anyhow::bail!("opencode serve did not start within 10s on port {port}");
         }
 
-        // Snapshot session IDs on this serve BEFORE spawning TUI
-        let before_ids = fetch_serve_session_ids(port).unwrap_or_default();
+        // Snapshot session IDs on this serve BEFORE spawning TUI.
+        // Use the stabilized variant to wait for the serve to finish loading
+        // all sessions from the DB — a freshly started serve may initially
+        // return an incomplete set.
+        let before_ids = fetch_stable_session_ids(port).unwrap_or_default();
 
         // Spawn TUI client as a disposable PTY (always fresh, no -s flag)
         let pty = PtySession::spawn_managed(&cwd, rows, cols)?;
@@ -403,6 +406,8 @@ impl PtyManager {
                 map
             });
 
+        let mut matched_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
         for discovered in snapshot.sessions {
             // Try to find an existing session to update, in order of reliability:
             // 1. By session_id (exact DB identity — most reliable)
@@ -410,14 +415,31 @@ impl PtyManager {
             // 3. By serve port (only if not already matched — can be wrong when
             //    multiple serves share the same DB)
             // 4. By cwd for managed sessions with unresolved session_id
+            //
+            // Each entry can only be matched once per snapshot. This prevents
+            // multiple sessions from the same serve (shared DB) from
+            // repeatedly claiming and overwriting the same entry's session_id.
             let matched = self
                 .sessions
                 .find_by_session_id(&discovered.session_id)
+                .filter(|id| !matched_ids.contains(id))
                 .map(|id| (id, MatchKind::SessionId))
                 .or_else(|| {
                     discovered.process_pid.and_then(|pid| {
                         self.sessions
                             .find_by_process_pid(pid)
+                            .filter(|id| !matched_ids.contains(id))
+                            // Don't let PID matching claim unresolved entries —
+                            // when session_id is None, only the managed-cwd
+                            // matcher (which validates the directory) should
+                            // resolve the identity.
+                            .filter(|id| {
+                                self.sessions
+                                    .items()
+                                    .iter()
+                                    .find(|s| s.id == *id)
+                                    .is_some_and(|s| s.session_id.is_some())
+                            })
                             .map(|id| (id, MatchKind::ProcessPid))
                     })
                 })
@@ -425,23 +447,52 @@ impl PtyManager {
                     discovered.serve_port.and_then(|port| {
                         self.sessions
                             .find_by_serve_port(port)
+                            .filter(|id| !matched_ids.contains(id))
+                            // Same guard as above: don't claim unresolved entries by port.
+                            .filter(|id| {
+                                self.sessions
+                                    .items()
+                                    .iter()
+                                    .find(|s| s.id == *id)
+                                    .is_some_and(|s| s.session_id.is_some())
+                            })
                             .map(|id| (id, MatchKind::ServePort))
                     })
                 })
                 .or_else(|| {
                     // Match managed sessions that don't have a session_id yet by cwd.
+                    // Only allow non-heuristic sources — the heuristic GUESSES which
+                    // session a TUI process belongs to and is frequently wrong. Letting
+                    // a wrong guess claim an unresolved entry corrupts its identity.
+                    // Use ancestor-aware comparison: a worktree session at
+                    // `/repo/.worktrees/branch` should match a discovered session
+                    // whose cwd falls back to `/repo` (the project root).
+                    // Also require the discovered session to be at least as recent as
+                    // the managed entry — this prevents old sessions from the shared
+                    // DB (which happen to share the same cwd) from claiming the entry
+                    // before the genuinely new session is created.
+                    if matches!(discovered.source, DiscoverySource::TuiHeuristic) {
+                        return None;
+                    }
                     self.sessions
                         .items()
                         .iter()
                         .find(|s| {
-                            s.origin == SessionOrigin::Managed
+                            !matched_ids.contains(&s.id)
+                                && s.origin == SessionOrigin::Managed
                                 && s.session_id.is_none()
-                                && s.cwd == discovered.cwd
+                                && (s.cwd == discovered.cwd
+                                    || s.cwd.starts_with(&discovered.cwd)
+                                    || discovered.cwd.starts_with(&s.cwd))
+                                && discovered.time_updated.is_some_and(|dt| {
+                                    s.time_updated.is_none_or(|st| dt >= st)
+                                })
                         })
                         .map(|s| (s.id, MatchKind::ManagedCwd))
                 });
 
             if let Some((id, match_kind)) = matched {
+                matched_ids.insert(id);
                 if let Some(summary) = self.sessions.get_mut(id) {
                     // Guard: do not let a heuristic TUI discovery claim a managed
                     // session that has a serve backend. The heuristic
@@ -463,8 +514,10 @@ impl PtyManager {
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
                     summary.status = discovered.status;
-                    if summary.serve_pid != discovered.process_pid {
-                        summary.process_pid = discovered.process_pid;
+                    if let Some(pid) = discovered.process_pid {
+                        if Some(pid) != summary.serve_pid {
+                            summary.process_pid = Some(pid);
+                        }
                     }
                     summary.model = discovered.model.clone();
                     summary.preview = discovered.preview.clone();
@@ -485,21 +538,31 @@ impl PtyManager {
                 continue;
             }
 
-            self.register_placeholder(
-                discovered.cwd,
-                discovered.title,
-                discovered.status,
-                Some(discovered.session_id),
-                SessionOrigin::Discovered,
-                discovered.process_pid,
-                None,
-                discovered.serve_port,
-                discovered.model,
-                discovered.preview,
-                discovered.time_updated,
-                discovered.has_children,
-                discovered.children,
-            );
+            // Only create sidebar entries for explicitly identified sessions
+            // (TUI processes with -s flag). Serve discovery and heuristic TUI
+            // guessing are for metadata refresh of existing entries only — they
+            // should never create new entries. Serves sharing a DB can return
+            // hundreds of sessions, and heuristic guessing can pick wrong
+            // sessions entirely. Sessions enter the sidebar through
+            // spawn_managed, the session picker, or the managed sessions file.
+            if matches!(discovered.source, DiscoverySource::TuiExplicit) {
+                let placeholder_id = self.register_placeholder(
+                    discovered.cwd,
+                    discovered.title,
+                    discovered.status,
+                    Some(discovered.session_id),
+                    SessionOrigin::Discovered,
+                    discovered.process_pid,
+                    None,
+                    discovered.serve_port,
+                    discovered.model,
+                    discovered.preview,
+                    discovered.time_updated,
+                    discovered.has_children,
+                    discovered.children,
+                );
+                matched_ids.insert(placeholder_id);
+            }
         }
 
         // Pass 1: Flip dead managed "Working" sessions to Error.
@@ -548,7 +611,10 @@ impl PtyManager {
                                 .get(&session.cwd)
                                 .is_some_and(|ids| ids.iter().any(|id| id != sid))
                         });
-                        dead_serve && no_pty && (not_in_snapshot || replaced_in_cwd)
+                        session.session_id.is_some()
+                            && dead_serve
+                            && no_pty
+                            && (not_in_snapshot || replaced_in_cwd)
                     }
                 }
             })

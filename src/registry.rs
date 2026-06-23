@@ -96,7 +96,10 @@ pub fn cleanup_stale_serve_entries() -> anyhow::Result<Vec<ServeEntry>> {
 
 pub fn register_serve_process(port: u16, pid: u32, cwd: &Path) -> anyhow::Result<()> {
     let mut entries = load_serve_registry().unwrap_or_default();
-    entries.retain(|e| e.pid != pid);
+    // Remove entries with the same PID (reuse) or the same port (port recycled
+    // after previous serve died). This prevents stale entries from accumulating
+    // and ensures update_serve_registry_tui_pid finds the correct entry.
+    entries.retain(|e| e.pid != pid && e.port != port);
     entries.push(ServeEntry {
         port,
         pid,

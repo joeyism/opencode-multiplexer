@@ -16,6 +16,7 @@ pub struct RenderCell {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+    pub copyable: bool,
 }
 
 impl Default for RenderCell {
@@ -28,6 +29,7 @@ impl Default for RenderCell {
             italic: false,
             underline: false,
             strike: false,
+            copyable: true,
         }
     }
 }
@@ -102,14 +104,16 @@ impl TerminalSurface {
             }
 
             let cell = indexed.cell;
+            let (symbol, copyable) = cell_symbol(cell.c, cell.flags);
             output[row][col] = RenderCell {
-                symbol: cell_symbol(cell.c, cell.flags),
+                symbol,
                 fg: convert_ansi_color(cell.fg),
                 bg: convert_ansi_color(cell.bg),
                 bold: cell.flags.contains(Flags::BOLD) || cell.flags.contains(Flags::DIM_BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
                 underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
                 strike: cell.flags.contains(Flags::STRIKEOUT),
+                copyable,
             };
         }
 
@@ -122,12 +126,85 @@ impl TerminalSurface {
         let col = cursor.column.0.min(self.cols.saturating_sub(1));
         (row, col)
     }
+
+    pub fn wrapped_rows(&self) -> Vec<bool> {
+        use alacritty_terminal::index::Line;
+        (0..self.rows)
+            .map(|r| {
+                let row = &self.term.grid()[Line(r as i32)];
+                row.last().is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
+            })
+            .collect()
+    }
 }
 
-fn cell_symbol(ch: char, flags: Flags) -> String {
+fn cell_symbol(ch: char, flags: Flags) -> (String, bool) {
     if flags.contains(Flags::WIDE_CHAR_SPACER) || flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-        " ".into()
+        (" ".into(), false)
     } else {
-        ch.to_string()
+        (ch.to_string(), true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regular_char_is_copyable() {
+        let mut surface = TerminalSurface::new(1, 1);
+        surface.process(b"A");
+        let snapshot = surface.snapshot();
+        assert_eq!(snapshot[0][0].symbol, "A");
+        assert!(snapshot[0][0].copyable);
+    }
+
+    #[test]
+    fn space_is_copyable() {
+        let mut surface = TerminalSurface::new(1, 1);
+        surface.process(b" ");
+        let snapshot = surface.snapshot();
+        assert_eq!(snapshot[0][0].symbol, " ");
+        assert!(snapshot[0][0].copyable);
+    }
+
+    #[test]
+    fn default_render_cell_is_copyable() {
+        assert!(RenderCell::default().copyable);
+    }
+
+    #[test]
+    fn surface_clamps_zero_dimensions() {
+        let surface = TerminalSurface::new(0, 0);
+
+        assert_eq!(surface.rows(), 1);
+        assert_eq!(surface.cols(), 1);
+    }
+
+    #[test]
+    fn unwrapped_row_is_not_marked() {
+        let mut surface = TerminalSurface::new(2, 20);
+        surface.process(b"hello");
+        assert_eq!(surface.wrapped_rows(), vec![false, false]);
+    }
+
+    #[test]
+    fn wrapped_row_is_marked() {
+        let mut surface = TerminalSurface::new(2, 10);
+        // "1234567890123" should wrap: row 0 gets 1-10, row 1 gets 11-13
+        surface.process(b"1234567890123");
+        assert_eq!(surface.wrapped_rows(), vec![true, false]);
+    }
+
+    #[test]
+    fn multiple_wraps() {
+        let mut surface = TerminalSurface::new(4, 5);
+        // "abcdefghijklmnop"
+        // row 0: abcde (wrap)
+        // row 1: fghij (wrap)
+        // row 2: klmno (wrap)
+        // row 3: p     (no wrap)
+        surface.process(b"abcdefghijklmnop");
+        assert_eq!(surface.wrapped_rows(), vec![true, true, true, false]);
     }
 }

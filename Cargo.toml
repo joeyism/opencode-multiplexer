@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 alacritty_terminal = "0.26"
 anyhow = "1"
+arboard = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 crossterm = "0.28"
 portable-pty = "0.9"

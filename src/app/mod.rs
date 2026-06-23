@@ -1,6 +1,7 @@
 pub mod conversation;
 pub mod diff;
 pub mod focus;
+pub mod key_handler;
 pub mod message_picker;
 pub mod reducer;
 pub mod session_picker;

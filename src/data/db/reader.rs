@@ -219,6 +219,22 @@ impl DbReader {
             if latest_error > 0 {
                 return Ok(SessionStatus::Error);
             }
+
+            let message_error: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT json_extract(data, '$.error.name') FROM message WHERE id = ?1 AND json_extract(data, '$.error') IS NOT NULL",
+                    [message_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if message_error
+                .as_deref()
+                .is_some_and(|name| name != "MessageAbortedError")
+            {
+                return Ok(SessionStatus::Error);
+            }
         }
 
         let latest_message: Option<(Option<String>, Option<i64>)> = self.conn.query_row(
@@ -449,4 +465,109 @@ impl DbReader {
 fn default_db_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".local/share/opencode/opencode.db"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::sessions::SessionStatus;
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ocmux-rs-reader-{label}-{nanos}.db"))
+    }
+
+    fn init_db(path: &PathBuf) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                worktree TEXT NOT NULL,
+                name TEXT,
+                time_created INTEGER,
+                time_updated INTEGER
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                title TEXT,
+                directory TEXT,
+                permission TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                time_archived INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created INTEGER
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                time_created INTEGER
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn get_session_status_treats_message_error_as_error() {
+        let db_path = temp_db_path("message-error");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg1', 'sess1', '{"role":"assistant","error":{"name":"ContextOverflowError"}}', 200)"#,
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        assert_eq!(reader.get_session_status("sess1").unwrap(), SessionStatus::Error);
+    }
+
+    #[test]
+    fn get_session_status_ignores_message_aborted_error() {
+        let db_path = temp_db_path("message-aborted");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg1', 'sess1', '{"role":"assistant","time":{"completed":200},"error":{"name":"MessageAbortedError"}}', 200)"#,
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        assert_eq!(reader.get_session_status("sess1").unwrap(), SessionStatus::Idle);
+    }
 }

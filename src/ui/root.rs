@@ -12,12 +12,12 @@ use crate::{
         message_picker::MessagePickerState, session_picker::SessionPickerState,
     },
     config::Keybindings,
-    terminal::{manager::PtyManager, renderer::TerminalWidget},
+    terminal::{manager::PtyManager, renderer::TerminalWidget, selection::SelectionRange},
     ui::{
         diff::apply_cursor_and_selection,
         diff::highlight_search_matches,
         hints::footer_line,
-        layout::{centered_rect, split_root},
+        layout::{centered_rect, split_root, terminal_inner_rect},
         message_picker::render_message_picker,
         session_picker::render_session_picker,
         sidebar::{SidebarVisibleRow, render_sidebar, repo_root_name},
@@ -44,6 +44,7 @@ pub fn render(
     session_picker: Option<&mut SessionPickerState>,
     message_picker: Option<&mut MessagePickerState>,
     confirm_quit: bool,
+    terminal_selection: Option<SelectionRange>,
 ) {
     let layout = split_root(frame.area(), sidebar_width, 1);
     if !panel_hidden {
@@ -109,12 +110,7 @@ pub fn render(
         .title(Span::styled(title_text, main_border_style));
     frame.render_widget(block, layout.main);
 
-    let inner = Rect::new(
-        layout.main.x,
-        layout.main.y + 1,
-        layout.main.width,
-        layout.main.height.saturating_sub(1),
-    );
+    let inner = terminal_inner_rect(frame.area(), sidebar_width, 1);
     let _viewport_height = inner.height as usize;
 
     if matches!(focus, AppFocus::Conversation) && conversation.is_active() {
@@ -313,7 +309,10 @@ pub fn render(
         }
     } else if let Some(pty) = manager.active_session() {
         frame.render_widget(Paragraph::new(""), inner);
-        frame.render_widget(TerminalWidget::new(&pty.surface), inner);
+        frame.render_widget(
+            TerminalWidget::new(&pty.surface).with_selection(terminal_selection),
+            inner,
+        );
         if matches!(focus, AppFocus::Terminal) {
             let (cursor_row, cursor_col) = pty.surface.cursor();
             let x = inner.x + cursor_col as u16;
