@@ -69,6 +69,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     let config = load_config().unwrap_or_default();
     let mut notifier = Notifier::new(config.notifications);
     let _ = opencode_multiplexer::registry::cleanup_stale_serve_entries();
+    let _ = opencode_multiplexer::registry::cleanup_orphaned_serve_processes();
     let mut state = AppState::default();
     let mut manager = PtyManager::default();
     let mut footer_message: Option<String> = None;

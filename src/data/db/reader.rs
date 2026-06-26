@@ -23,7 +23,13 @@ impl DbReader {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
         .with_context(|| format!("failed to open sqlite db at {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self { conn })
+    }
+
+    /// Returns the busy_timeout in milliseconds. Used for tests and diagnostics.
+    pub fn busy_timeout_ms(&self) -> anyhow::Result<i64> {
+        Ok(self.conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
     }
 
     pub fn open_default() -> anyhow::Result<Self> {

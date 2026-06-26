@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Context;
+use crate::data::discovery::ps::{scan_serve_processes, ParsedServeProcess};
 
 pub fn load_managed_sessions() -> anyhow::Result<HashSet<String>> {
     load_managed_sessions_from_path(&default_managed_sessions_path()?)
@@ -156,4 +157,33 @@ pub(crate) fn kill_pid(pid: u32) {
         .arg("/PID")
         .arg(pid.to_string())
         .output();
+}
+
+/// Testable: given a list of serve processes and registry entries,
+/// return the PIDs of orphaned serves (not in the registry).
+pub fn find_orphaned_serve_pids(
+    serve_processes: &[ParsedServeProcess],
+    registry: &[ServeEntry],
+) -> Vec<u32> {
+    let registry_pids: HashSet<u32> = registry.iter().map(|e| e.pid).collect();
+    serve_processes
+        .iter()
+        .filter(|p| !registry_pids.contains(&p.pid))
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// Kill orphaned `opencode serve` processes (not in the serve registry).
+/// These are leftover daemons from previous ocmux sessions that were never
+/// cleaned up. They hammer the same SQLite DB as managed serves, causing
+/// lock contention. Called at startup after `cleanup_stale_serve_entries`.
+pub fn cleanup_orphaned_serve_processes() -> anyhow::Result<usize> {
+    let registry = load_serve_registry().unwrap_or_default();
+    let serve_processes = scan_serve_processes().unwrap_or_default();
+    let orphaned = find_orphaned_serve_pids(&serve_processes, &registry);
+    let count = orphaned.len();
+    for pid in &orphaned {
+        kill_pid(*pid);
+    }
+    Ok(count)
 }

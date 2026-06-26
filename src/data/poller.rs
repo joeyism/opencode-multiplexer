@@ -226,7 +226,10 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
             DiscoverySource::TuiExplicit,
             Some(proj.worktree.clone()),
             None,
-        )? {
+        )
+        .ok()
+        .flatten()
+        {
             sessions.push(info);
         }
     }
@@ -271,13 +274,26 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
             if seen.contains(&serve_session_id) {
                 continue;
             }
-            let Some(session) = reader.get_session_by_id(&serve_session_id)? else {
+            // Skip sessions that fail DB queries instead of aborting the entire
+            // snapshot. With 20+ serve processes hitting the same SQLite DB,
+            // individual queries can fail with "database is locked". A single
+            // failure should not cause us to lose all other serve discoveries.
+            let Some(session) = reader
+                .get_session_by_id(&serve_session_id)
+                .ok()
+                .flatten()
+            else {
                 continue;
             };
-            if !reader.is_top_level_session(&serve_session_id)? {
+            if !reader
+                .is_top_level_session(&serve_session_id)
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let status = reader.get_session_status(&serve_session_id)?;
+            let status = reader
+                .get_session_status(&serve_session_id)
+                .unwrap_or(crate::app::sessions::SessionStatus::Idle);
             seen.insert(serve_session_id.clone());
             let cwd = if session.directory.as_os_str().is_empty() {
                 if let Some(proj) = projects
@@ -297,13 +313,18 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
                 title: session.title.clone(),
                 status,
                 process_pid: Some(serve_process.pid),
-                model: reader.get_session_model(&serve_session_id)?,
+                model: reader.get_session_model(&serve_session_id).ok().flatten(),
                 preview: reader
-                    .get_last_message_preview(&serve_session_id)?
+                    .get_last_message_preview(&serve_session_id)
+                    .ok()
+                    .flatten()
                     .map(|preview| preview.text),
                 time_updated: Some(session.time_updated),
-                has_children: reader.has_child_sessions(&serve_session_id)?,
-                children: collect_children(&reader, &serve_session_id, 2)?,
+                has_children: reader
+                    .has_child_sessions(&serve_session_id)
+                    .unwrap_or(false),
+                children: collect_children(&reader, &serve_session_id, 2)
+                    .unwrap_or_default(),
                 serve_port: Some(serve_process.port),
                 source: DiscoverySource::Serve,
             });

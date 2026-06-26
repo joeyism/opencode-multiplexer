@@ -286,3 +286,26 @@ fn init_db(path: &PathBuf) -> Connection {
     .unwrap();
     conn
 }
+
+#[test]
+fn reader_sets_busy_timeout_on_open() {
+    let db_path = temp_db_path("busy_timeout");
+    let conn = init_db(&db_path);
+    conn.execute(
+        "INSERT INTO project VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Open DbReader — it must set a non-zero busy_timeout so reads
+    // wait for locked writes instead of failing instantly.
+    let reader = DbReader::open(&db_path).unwrap();
+    let busy_timeout = reader.busy_timeout_ms().unwrap();
+    assert!(
+        busy_timeout > 0,
+        "DbReader must set a non-zero busy_timeout, got: {busy_timeout}"
+    );
+
+    fs::remove_file(db_path).ok();
+}

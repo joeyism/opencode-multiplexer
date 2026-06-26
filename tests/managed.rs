@@ -2070,3 +2070,138 @@ fn unresolved_entry_not_claimed_by_old_session_with_same_cwd() {
 
     assert_eq!(manager.len(), 1);
 }
+
+#[test]
+fn serve_discovery_does_not_overwrite_entry_with_different_session_id() {
+    let mut manager = PtyManager::default();
+    let serve_pid = std::process::id();
+
+    // Managed entry with a known session_id and serve_pid.
+    // This simulates a managed session spawned via `n` that already has
+    // a resolved session_id and a serve backend.
+    let _id = manager.register_placeholder(
+        PathBuf::from("/tmp/correct-project"),
+        "Correct Title".into(),
+        SessionStatus::Idle,
+        Some("sess_correct".into()),
+        SessionOrigin::Managed,
+        None,
+        Some(serve_pid),
+        Some(4200),
+        None,
+        None,
+        Some(100),
+        false,
+        vec![],
+    );
+
+    // Serve discovery for a DIFFERENT session on the same serve.
+    // This simulates what happens when:
+    // 1. The managed session's TuiExplicit discovery fails (e.g., DB lock)
+    // 2. The serve returns sessions for its project, including a different session
+    // 3. The Serve discovery matches the entry by serve_pid (not session_id)
+    manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_wrong".into(),
+            cwd: PathBuf::from("/tmp/wrong-project"),
+            title: "Wrong Title".into(),
+            status: SessionStatus::Working,
+            process_pid: Some(serve_pid),
+            model: None,
+            preview: None,
+            time_updated: Some(200),
+            has_children: false,
+            children: vec![],
+            serve_port: Some(4200),
+            source: DiscoverySource::Serve,
+        }],
+    });
+
+    // Entry should keep its correct session_id, cwd, and title.
+    // The Serve discovery must NOT overwrite an entry that already has
+    // a different session_id, even if the serve_pid matches.
+    let summary = manager.sessions().items()[0].clone();
+    assert_eq!(
+        summary.session_id.as_deref(),
+        Some("sess_correct"),
+        "session_id must not be overwritten by a Serve discovery with a different session_id"
+    );
+    assert_eq!(
+        summary.title, "Correct Title",
+        "title must not be overwritten by a Serve discovery with a different session_id"
+    );
+    assert_eq!(
+        summary.cwd,
+        PathBuf::from("/tmp/correct-project"),
+        "cwd must not be overwritten by a Serve discovery with a different session_id"
+    );
+}
+
+#[test]
+fn registry_dirty_when_managed_session_id_is_resolved() {
+    let mut manager = PtyManager::default();
+    let serve_pid = std::process::id();
+
+    // Managed entry with unresolved session_id (e.g. from spawn_managed
+    // when wait_for_new_session_id timed out). This simulates the case
+    // where the entry was created but the session_id wasn't resolved yet.
+    manager.register_placeholder(
+        PathBuf::from("/tmp/project"),
+        "placeholder title".into(),
+        SessionStatus::Working,
+        None, // session_id unresolved
+        SessionOrigin::Managed,
+        Some(100), // TUI PID
+        Some(serve_pid),
+        Some(4200),
+        None,
+        None,
+        Some(100),
+        false,
+        vec![],
+    );
+
+    // Apply a snapshot that resolves the session_id via managed-cwd match.
+    // The discovery matches by cwd (not by session_id or PID) because
+    // the entry's serve_pid is the serve daemon's PID, while the
+    // discovery's process_pid is also the serve daemon's PID — but
+    // find_by_process_pid only matches entries that already have a
+    // session_id. So the match goes through the managed-cwd matcher.
+    //
+    // Actually, the PID matcher DOES match here (serve_pid == process_pid),
+    // but the guard blocks it when session_id is already set. When
+    // session_id is None, the guard does NOT block, and the match goes
+    // through.
+    let dirty = manager.apply_poll_snapshot(PollSnapshot {
+        sessions: vec![DiscoveredSessionInfo {
+            session_id: "sess_resolved".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            title: "Resolved Title".into(),
+            status: SessionStatus::Working,
+            process_pid: Some(serve_pid),
+            model: None,
+            preview: None,
+            time_updated: Some(200),
+            has_children: false,
+            children: vec![],
+            serve_port: Some(4200),
+            source: DiscoverySource::Serve,
+        }],
+    });
+
+    // The entry should now have the resolved session_id
+    let summary = manager.sessions().items()[0].clone();
+    assert_eq!(
+        summary.session_id.as_deref(),
+        Some("sess_resolved"),
+        "session_id should be resolved by the poll snapshot"
+    );
+
+    // registry_dirty must be true so the caller saves the managed sessions
+    // list (adding this session_id to managed-sessions.json for future
+    // poll_fast discovery).
+    assert!(
+        dirty,
+        "apply_poll_snapshot must return true (registry_dirty) when a managed session's session_id is resolved from None to Some, so the caller saves managed-sessions.json"
+    );
+}

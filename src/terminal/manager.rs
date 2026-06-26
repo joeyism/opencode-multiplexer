@@ -408,6 +408,14 @@ impl PtyManager {
 
         let mut matched_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+        // Track when a managed entry's session_id is resolved from None to Some,
+        // so the caller knows to persist managed-sessions.json. Without this,
+        // a session whose session_id was unresolved at spawn time would never
+        // be added to managed-sessions.json, and poll_fast could never discover
+        // it (it only discovers sessions in managed-sessions.json via the
+        // managed sessions loop).
+        let mut resolved_session_id: bool = false;
+
         for discovered in snapshot.sessions {
             // Try to find an existing session to update, in order of reliability:
             // 1. By session_id (exact DB identity — most reliable)
@@ -492,24 +500,31 @@ impl PtyManager {
                 });
 
             if let Some((id, match_kind)) = matched {
-                matched_ids.insert(id);
                 if let Some(summary) = self.sessions.get_mut(id) {
-                    // Guard: do not let a heuristic TUI discovery claim a managed
-                    // session that has a serve backend. The heuristic
-                    // (get_most_recent_session) can guess the wrong session.
-                    let is_heuristic = matches!(discovered.source, DiscoverySource::TuiHeuristic);
-                    let has_serve_backend =
-                        summary.origin == SessionOrigin::Managed && summary.serve_port.is_some();
-
-                    // Allow the heuristic if the session doesn't have an ID yet, to adopt the guessed ID
-                    if is_heuristic
-                        && has_serve_backend
-                        && summary.session_id.is_some()
+                    // Guard: once an entry has a session_id, only a discovery
+                    // with the SAME session_id may overwrite it. Non-session-id
+                    // matches (by PID, serve_port, or cwd) can guess the wrong
+                    // session — both the heuristic (get_most_recent_session) and
+                    // Serve discoveries (which return all sessions from the
+                    // serve's project, each tagged with the serve's PID/port).
+                    // Unresolved entries (session_id = None) are exempt so they
+                    // can still be resolved by PID/port/cwd matching.
+                    if summary.session_id.is_some()
                         && !matches!(match_kind, MatchKind::SessionId)
                     {
                         continue;
                     }
 
+                    // Detect session_id resolution (None → Some) for managed entries.
+                    // This signals the caller to persist managed-sessions.json so
+                    // future poll_fast cycles can discover this session.
+                    if summary.origin == SessionOrigin::Managed
+                        && summary.session_id.is_none()
+                    {
+                        resolved_session_id = true;
+                    }
+
+                    matched_ids.insert(id);
                     summary.session_id = Some(discovered.session_id.clone());
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
@@ -635,7 +650,7 @@ impl PtyManager {
             self.ptys.remove(&id);
         }
 
-        registry_dirty
+        registry_dirty || resolved_session_id
     }
 
     pub fn refresh_active(&mut self, rows: u16, cols: u16) -> anyhow::Result<bool> {
