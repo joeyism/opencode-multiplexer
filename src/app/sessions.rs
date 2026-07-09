@@ -129,6 +129,10 @@ impl SessionList {
         &self.sessions
     }
 
+    pub fn items_mut(&mut self) -> &mut [SessionSummary] {
+        &mut self.sessions
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected.min(self.sessions.len().saturating_sub(1))
     }

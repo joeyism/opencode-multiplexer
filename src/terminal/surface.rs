@@ -132,7 +132,8 @@ impl TerminalSurface {
         (0..self.rows)
             .map(|r| {
                 let row = &self.term.grid()[Line(r as i32)];
-                row.last().is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
+                row.last()
+                    .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
             })
             .collect()
     }

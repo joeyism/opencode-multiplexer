@@ -29,7 +29,9 @@ impl DbReader {
 
     /// Returns the busy_timeout in milliseconds. Used for tests and diagnostics.
     pub fn busy_timeout_ms(&self) -> anyhow::Result<i64> {
-        Ok(self.conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
+        Ok(self
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
     }
 
     pub fn open_default() -> anyhow::Result<Self> {
@@ -175,6 +177,19 @@ impl DbReader {
             )
             .optional()?;
         Ok(matches!(result, Some((None, None))))
+    }
+
+    /// Returns true if the session exists in the DB and is not archived.
+    /// Used by `apply_session_event` defensive check to detect when an
+    /// existing managed `session_id` is still the user's active session,
+    /// to avoid having plugin-created auxiliary sessions displace it.
+    pub fn session_is_active(&self, session_id: &str) -> anyhow::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session WHERE id = ?1 AND time_archived IS NULL LIMIT 1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn get_session_status(&self, session_id: &str) -> anyhow::Result<SessionStatus> {
@@ -550,7 +565,10 @@ mod tests {
         .unwrap();
 
         let reader = DbReader::open(&db_path).unwrap();
-        assert_eq!(reader.get_session_status("sess1").unwrap(), SessionStatus::Error);
+        assert_eq!(
+            reader.get_session_status("sess1").unwrap(),
+            SessionStatus::Error
+        );
     }
 
     #[test]
@@ -574,6 +592,56 @@ mod tests {
         .unwrap();
 
         let reader = DbReader::open(&db_path).unwrap();
-        assert_eq!(reader.get_session_status("sess1").unwrap(), SessionStatus::Idle);
+        assert_eq!(
+            reader.get_session_status("sess1").unwrap(),
+            SessionStatus::Idle
+        );
+    }
+
+    #[test]
+    fn session_is_active_returns_true_for_unarchived_session() {
+        let db_path = temp_db_path("is-active-true");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        assert!(reader.session_is_active("sess1").unwrap());
+    }
+
+    #[test]
+    fn session_is_active_returns_false_for_archived_session() {
+        let db_path = temp_db_path("is-active-archived");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        // time_archived = 1000 (non-null) — session is archived
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, 1000)",
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        assert!(!reader.session_is_active("sess1").unwrap());
+    }
+
+    #[test]
+    fn session_is_active_returns_false_for_missing_session() {
+        let db_path = temp_db_path("is-active-missing");
+        let _conn = init_db(&db_path);
+        let reader = DbReader::open(&db_path).unwrap();
+        assert!(!reader.session_is_active("nonexistent").unwrap());
     }
 }

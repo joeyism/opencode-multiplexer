@@ -2,14 +2,14 @@ pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     match arboard::Clipboard::new() {
         Ok(mut cb) => {
             if let Err(e) = cb.set_text(text.to_string()) {
-                fallback_copy(text).map_err(|fe| anyhow::anyhow!("arboard failed: {e}, fallback failed: {fe}"))
+                fallback_copy(text)
+                    .map_err(|fe| anyhow::anyhow!("arboard failed: {e}, fallback failed: {fe}"))
             } else {
                 Ok(())
             }
         }
-        Err(e) => {
-            fallback_copy(text).map_err(|fe| anyhow::anyhow!("arboard init failed: {e}, fallback failed: {fe}"))
-        }
+        Err(e) => fallback_copy(text)
+            .map_err(|fe| anyhow::anyhow!("arboard init failed: {e}, fallback failed: {fe}")),
     }
 }
 

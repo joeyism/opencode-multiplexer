@@ -28,18 +28,19 @@ impl PtySession {
         Self::spawn_command(cmd, rows, cols)
     }
 
-    pub fn spawn_managed(cwd: &Path, rows: u16, cols: u16) -> anyhow::Result<Self> {
-        let cmd = build_managed_session_command(cwd);
+    pub fn spawn_managed(cwd: &Path, port: u16, rows: u16, cols: u16) -> anyhow::Result<Self> {
+        let cmd = build_managed_session_command(cwd, port);
         Self::spawn_command(cmd, rows, cols)
     }
 
     pub fn spawn_replica(
         cwd: &Path,
         session_id: &str,
+        port: Option<u16>,
         rows: u16,
         cols: u16,
     ) -> anyhow::Result<Self> {
-        let cmd = build_replica_command(cwd, session_id);
+        let cmd = build_replica_command(cwd, session_id, port);
         Self::spawn_command(cmd, rows, cols)
     }
 

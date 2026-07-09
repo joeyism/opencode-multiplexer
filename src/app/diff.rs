@@ -713,10 +713,7 @@ mod tests_scroll_view {
 
     #[test]
     fn scroll_view_down_clamps_cursor() {
-        let mut state = DiffViewState::default();
-        state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
-        state.scroll = 0;
-        state.cursor = 0;
+        let mut state = DiffViewState { document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]), ..Default::default() };
 
         // Scroll down by 1 (content moves up). Viewport is 5 lines.
         // Visible lines: 1..5. Cursor is at 0.
@@ -728,10 +725,7 @@ mod tests_scroll_view {
 
     #[test]
     fn scroll_view_up_clamps_cursor() {
-        let mut state = DiffViewState::default();
-        state.document = make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
-        state.scroll = 5;
-        state.cursor = 9; // At the bottom of the viewport (5 + 5 - 1 = 9)
+        let mut state = DiffViewState { document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]), scroll: 5, cursor: 9, ..Default::default() };
 
         // Scroll up by 1 (content moves down). Viewport is 5 lines.
         // Visible lines: 5..9. Cursor is at 9.

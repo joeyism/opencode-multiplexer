@@ -14,23 +14,33 @@ use crossterm::{
 };
 use opencode_multiplexer::{
     app::{
-        Action, conversation::ConversationViewState, diff::DiffViewState, focus::AppFocus,
-        key_handler::{handle_conversation_key, handle_diff_key, KeyAction},
-        message_picker::MessagePickerState, reducer::reduce, session_picker::SessionPickerState,
-        sessions::SessionStatus, state::AppState,
+        Action,
+        conversation::ConversationViewState,
+        diff::DiffViewState,
+        focus::AppFocus,
+        key_handler::{KeyAction, handle_conversation_key, handle_diff_key},
+        message_picker::MessagePickerState,
+        reducer::reduce,
+        session_picker::SessionPickerState,
+        sessions::SessionStatus,
+        state::AppState,
     },
     config::load_config,
     data::{db::reader::DbReader, poller::start_poller},
     notify::Notifier,
     ops::git::{diff_worktree, fetch_session_diff_from_serve},
+    ops::opencode_events::{SessionCreatedEvent, SessionEventSubscriber},
     ops::worktree::create_worktree,
     ops::{fzf::pick_directory, opencode::display_title_for_cwd},
-    registry::save_managed_sessions,
-    terminal::{manager::PtyManager, selection::TerminalSelection, selection::MouseResult, clipboard},
+    registry::{load_serve_registry, save_managed_sessions},
+    terminal::{
+        clipboard, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
+    },
     ui::{
-        conversation, diff as ui_diff, root,
-        sidebar::{SidebarRowKind, flatten_sidebar_entries},
+        conversation, diff as ui_diff,
         layout::terminal_inner_rect,
+        root,
+        sidebar::{SidebarRowKind, flatten_sidebar_entries},
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -79,6 +89,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     let (poll_tx, poll_rx) = std::sync::mpsc::channel();
     let poller = start_poller(poll_tx);
 
+    // SSE event channel — receives session.created events from serve subscribers
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<(u16, SessionCreatedEvent)>();
+    let mut subscribers: Vec<SessionEventSubscriber> = Vec::new();
+
+    // Start SSE subscribers for existing serves from the registry
+    for entry in load_serve_registry().unwrap_or_default() {
+        subscribers.push(SessionEventSubscriber::start(entry.port, event_tx.clone()));
+    }
+
     let mut prev_selected_kind: Option<SidebarRowKind> = None;
     let result = (|| -> Result<(), Box<dyn Error>> {
         loop {
@@ -113,6 +132,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             notifier.record_notification(&discovered.session_id);
                         }
                     }
+                }
+            }
+
+            // Drain SSE session.created events
+            while let Ok((port, event)) = event_rx.try_recv() {
+                let dirty = manager.apply_session_event(port, &event);
+                if dirty {
+                    let _ = save_managed_sessions(manager.managed_session_ids());
                 }
             }
 
@@ -227,11 +254,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         match pty.send_paste(&text) {
                                             Ok(_) => footer_message = None,
                                             Err(error) => {
-                                                footer_message = Some(format!("paste failed: {error}"));
+                                                footer_message =
+                                                    Some(format!("paste failed: {error}"));
                                             }
                                         }
                                     } else {
-                                        footer_message = Some("no active session to paste into".into());
+                                        footer_message =
+                                            Some("no active session to paste into".into());
                                     }
                                 }
                             }
@@ -274,8 +303,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         .and_then(|r| r.get_session_status(&entry.session_id))
                                     {
                                         Ok(status) => {
-                                            let (rows, cols) =
-                                                pane_size(terminal.size()?.into(), config.sidebar_width);
+                                            let (rows, cols) = pane_size(
+                                                terminal.size()?.into(),
+                                                config.sidebar_width,
+                                            );
                                             match manager.attach_arbitrary_session(
                                                 entry.session_id,
                                                 entry.dir_path,
@@ -286,7 +317,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 cols,
                                             ) {
                                                 Ok(_) => {
-                                                    save_managed_sessions(manager.managed_session_ids())?;
+                                                    save_managed_sessions(
+                                                        manager.managed_session_ids(),
+                                                    )?;
                                                     state.focus = AppFocus::Terminal;
                                                     state.selected_sidebar_row = 0;
                                                     footer_message = None;
@@ -298,7 +331,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             }
                                         }
                                         Err(error) => {
-                                            footer_message = Some(format!("status lookup failed: {error}"));
+                                            footer_message =
+                                                Some(format!("status lookup failed: {error}"));
                                         }
                                     }
                                 }
@@ -329,7 +363,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         && !matches!(state.focus, AppFocus::Terminal)
                     {
                         reduce(&mut state, Action::ToggleHelp)
-                    } else if state.show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char(_)) {
+                    } else if state.show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char(_))
+                    {
                         state.show_help = false;
                     } else if !state.show_files.is_empty()
                         && matches!(key.code, KeyCode::Esc | KeyCode::Char(_))
@@ -371,8 +406,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 terminal.size()?.width.saturating_sub(new_sidebar_width);
                             let new_vp =
                                 terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1) as usize;
-                            let (doc, meta) =
-                                ui_diff::build_diff_document(diff_view.raw_diff(), new_content_width);
+                            let (doc, meta) = ui_diff::build_diff_document(
+                                diff_view.raw_diff(),
+                                new_content_width,
+                            );
                             diff_view.replace_document(doc, meta, new_vp);
                         }
 
@@ -430,20 +467,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     match &row.kind {
                                         SidebarRowKind::TopLevel { top_level_id, .. } => {
                                             manager.select_top_level(*top_level_id);
-                                            match manager.activate_or_attach_selected(pty_rows, pty_cols) {
+                                            match manager
+                                                .activate_or_attach_selected(pty_rows, pty_cols)
+                                            {
                                                 Ok(_) => {
-                                                    save_managed_sessions(manager.managed_session_ids())?;
+                                                    save_managed_sessions(
+                                                        manager.managed_session_ids(),
+                                                    )?;
                                                     state.focus = AppFocus::Terminal;
                                                     footer_message = None
                                                 }
                                                 Err(error) => {
-                                                    footer_message = Some(format!("attach failed: {error}"))
+                                                    footer_message =
+                                                        Some(format!("attach failed: {error}"))
                                                 }
                                             }
                                         }
                                         SidebarRowKind::Child { .. } => {
                                             footer_message = Some(
-                                                "child rows are selectable; attach not wired yet".into(),
+                                                "child rows are selectable; attach not wired yet"
+                                                    .into(),
                                             );
                                         }
                                     }
@@ -457,19 +500,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             ..
                                         } => {
                                             let title = row.title.clone();
-                                            conversation.open(sid.clone(), title, AppFocus::Sidebar);
-                                            reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
+                                            conversation.open(
+                                                sid.clone(),
+                                                title,
+                                                AppFocus::Sidebar,
+                                            );
+                                            reduce(
+                                                &mut state,
+                                                Action::SetFocus(AppFocus::Conversation),
+                                            );
                                             footer_message = None;
                                         }
                                         SidebarRowKind::Child { session_id } => {
                                             let title = row.title.clone();
-                                            conversation.open(session_id.clone(), title, AppFocus::Sidebar);
-                                            reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
+                                            conversation.open(
+                                                session_id.clone(),
+                                                title,
+                                                AppFocus::Sidebar,
+                                            );
+                                            reduce(
+                                                &mut state,
+                                                Action::SetFocus(AppFocus::Conversation),
+                                            );
                                             footer_message = None;
                                         }
                                         _ => {
                                             footer_message = Some(
-                                                "conversation view requires a session with a DB ID".into(),
+                                                "conversation view requires a session with a DB ID"
+                                                    .into(),
                                             );
                                         }
                                     }
@@ -482,14 +540,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             .and_then(|r| r.get_session_modified_files(sid))
                                         {
                                             Ok(files) if files.is_empty() => {
-                                                footer_message =
-                                                    Some("no files modified by this session".into());
+                                                footer_message = Some(
+                                                    "no files modified by this session".into(),
+                                                );
                                             }
                                             Ok(files) => {
                                                 state.show_files = files;
                                             }
                                             Err(e) => {
-                                                footer_message = Some(format!("failed to read files: {e}"));
+                                                footer_message =
+                                                    Some(format!("failed to read files: {e}"));
                                             }
                                         }
                                     } else {
@@ -513,8 +573,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     diff_view.raw_diff(),
                                                     content_width,
                                                 );
-                                                diff_view.replace_document(doc, meta, viewport_height);
-                                                reduce(&mut state, Action::SetFocus(AppFocus::Diff));
+                                                diff_view.replace_document(
+                                                    doc,
+                                                    meta,
+                                                    viewport_height,
+                                                );
+                                                reduce(
+                                                    &mut state,
+                                                    Action::SetFocus(AppFocus::Diff),
+                                                );
                                                 footer_message = None;
                                             }
                                             Err(msg) => {
@@ -573,32 +640,57 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             }
                                         }
                                         SidebarRowKind::Child { .. } => {
-                                            footer_message =
-                                                Some("kill only supported on top-level sessions".into());
+                                            footer_message = Some(
+                                                "kill only supported on top-level sessions".into(),
+                                            );
                                         }
                                     }
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.spawn => {
-                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
+                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth)
+                                {
                                     Ok(Some(cwd)) => {
                                         let title = display_title_for_cwd(&cwd);
-                                        let (rows, cols) =
-                                            pane_size(terminal.size()?.into(), config.sidebar_width);
-                                        match manager.spawn_managed(cwd, title.clone(), rows, cols) {
-                                            Ok(_) => {
-                                                save_managed_sessions(manager.managed_session_ids())?;
+                                        let (rows, cols) = pane_size(
+                                            terminal.size()?.into(),
+                                            config.sidebar_width,
+                                        );
+                                        match manager.spawn_managed(cwd, title.clone(), rows, cols)
+                                        {
+                                            Ok(id) => {
+                                                save_managed_sessions(
+                                                    manager.managed_session_ids(),
+                                                )?;
+                                                if let Some(summary) = manager
+                                                    .sessions()
+                                                    .items()
+                                                    .iter()
+                                                    .find(|s| s.id == id)
+                                                {
+                                                    if let Some(port) = summary.serve_port {
+                                                        subscribers.push(
+                                                            SessionEventSubscriber::start(
+                                                                port,
+                                                                event_tx.clone(),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
                                                 state.focus = AppFocus::Terminal;
                                                 state.selected_sidebar_row = 0;
                                                 footer_message = Some(format!("spawned {title}"))
                                             }
                                             Err(error) => {
-                                                footer_message = Some(format!("spawn failed: {error}"))
+                                                footer_message =
+                                                    Some(format!("spawn failed: {error}"))
                                             }
                                         }
                                     }
                                     Ok(None) => footer_message = Some("spawn canceled".into()),
-                                    Err(error) => footer_message = Some(format!("picker failed: {error}")),
+                                    Err(error) => {
+                                        footer_message = Some(format!("picker failed: {error}"))
+                                    }
                                 }
                             }
                             KeyCode::Tab => {
@@ -617,7 +709,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     Ok(false) => {
                                         footer_message = Some("no active session to refresh".into())
                                     }
-                                    Err(error) => footer_message = Some(format!("refresh failed: {error}")),
+                                    Err(error) => {
+                                        footer_message = Some(format!("refresh failed: {error}"))
+                                    }
                                 }
                             }
 
@@ -632,19 +726,24 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 match commit_session_files(terminal, sid, &cwd) {
                                                     Ok(Some(msg)) => footer_message = Some(msg),
                                                     Ok(None) => {
-                                                        footer_message = Some("commit canceled".into())
+                                                        footer_message =
+                                                            Some("commit canceled".into())
                                                     }
                                                     Err(e) => {
-                                                        footer_message = Some(format!("commit failed: {e}"))
+                                                        footer_message =
+                                                            Some(format!("commit failed: {e}"))
                                                     }
                                                 }
                                             } else {
-                                                footer_message = Some("session directory not found".into());
+                                                footer_message =
+                                                    Some("session directory not found".into());
                                             }
                                         }
                                         _ => {
-                                            footer_message =
-                                                Some("commit requires a top-level session with ID".into())
+                                            footer_message = Some(
+                                                "commit requires a top-level session with ID"
+                                                    .into(),
+                                            )
                                         }
                                     }
                                 }
@@ -662,11 +761,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     }
                                                 }
                                             } else {
-                                                footer_message = Some("session directory not found".into());
+                                                footer_message =
+                                                    Some("session directory not found".into());
                                             }
                                         }
                                         SidebarRowKind::Child { .. } => {
-                                            footer_message = Some("bash only on top-level sessions".into());
+                                            footer_message =
+                                                Some("bash only on top-level sessions".into());
                                         }
                                     }
                                 }
@@ -686,7 +787,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     let new_content_width =
                                         terminal.size()?.width.saturating_sub(new_sidebar_width);
                                     let new_vp =
-                                        terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1) as usize;
+                                        terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1)
+                                            as usize;
                                     let (doc, meta) = ui_diff::build_diff_document(
                                         diff_view.raw_diff(),
                                         new_content_width,
@@ -695,7 +797,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.worktree => {
-                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth) {
+                                match pick_directory_with_terminal(terminal, config.spawn_maxdepth)
+                                {
                                     Ok(Some(repo_dir)) => {
                                         match prompt_text_with_terminal(
                                             terminal,
@@ -704,7 +807,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             Some(branch) if !branch.trim().is_empty() => {
                                                 match create_worktree(&repo_dir, branch.trim()) {
                                                     Ok(worktree_dir) => {
-                                                        let title = display_title_for_cwd(&worktree_dir);
+                                                        let title =
+                                                            display_title_for_cwd(&worktree_dir);
                                                         let (rows, cols) = pane_size(
                                                             terminal.size()?.into(),
                                                             sidebar_width,
@@ -715,23 +819,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                             rows,
                                                             cols,
                                                         ) {
-                                                            Ok(_) => {
+                                                            Ok(id) => {
                                                                 save_managed_sessions(
                                                                     manager.managed_session_ids(),
                                                                 )?;
+                                                                if let Some(summary) = manager
+                                                                    .sessions()
+                                                                    .items()
+                                                                    .iter()
+                                                                    .find(|s| s.id == id)
+                                                                {
+                                                                    if let Some(port) =
+                                                                        summary.serve_port
+                                                                    {
+                                                                        subscribers.push(
+                                                                            SessionEventSubscriber::start(port, event_tx.clone()),
+                                                                        );
+                                                                    }
+                                                                }
                                                                 footer_message = Some(format!(
                                                                     "spawned worktree {title}"
                                                                 ));
                                                             }
                                                             Err(error) => {
-                                                                footer_message =
-                                                                    Some(format!("spawn failed: {error}"))
+                                                                footer_message = Some(format!(
+                                                                    "spawn failed: {error}"
+                                                                ))
                                                             }
                                                         }
                                                     }
                                                     Err(error) => {
-                                                        footer_message =
-                                                            Some(format!("worktree failed: {error}"))
+                                                        footer_message = Some(format!(
+                                                            "worktree failed: {error}"
+                                                        ))
                                                     }
                                                 }
                                             }
@@ -747,11 +867,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     rows,
                                                     cols,
                                                 ) {
-                                                    Ok(_) => {
+                                                    Ok(id) => {
                                                         save_managed_sessions(
                                                             manager.managed_session_ids(),
                                                         )?;
-                                                        footer_message = Some(format!("spawned {title}"));
+                                                        if let Some(summary) = manager
+                                                            .sessions()
+                                                            .items()
+                                                            .iter()
+                                                            .find(|s| s.id == id)
+                                                        {
+                                                            if let Some(port) = summary.serve_port {
+                                                                subscribers.push(
+                                                                    SessionEventSubscriber::start(
+                                                                        port,
+                                                                        event_tx.clone(),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }
+                                                        footer_message =
+                                                            Some(format!("spawned {title}"));
                                                     }
                                                     Err(error) => {
                                                         footer_message =
@@ -759,17 +895,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     }
                                                 }
                                             }
-                                            None => footer_message = Some("worktree canceled".into()),
+                                            None => {
+                                                footer_message = Some("worktree canceled".into())
+                                            }
                                         }
                                     }
                                     Ok(None) => footer_message = Some("worktree canceled".into()),
-                                    Err(error) => footer_message = Some(format!("picker failed: {error}")),
+                                    Err(error) => {
+                                        footer_message = Some(format!("picker failed: {error}"))
+                                    }
                                 }
                             }
                             _ => {}
                         }
                     } else if matches!(state.focus, AppFocus::Conversation) {
-                        match handle_conversation_key(key, &mut conversation, &config.keybindings, viewport_height) {
+                        match handle_conversation_key(
+                            key,
+                            &mut conversation,
+                            &config.keybindings,
+                            viewport_height,
+                        ) {
                             KeyAction::Consumed => {}
                             KeyAction::Close => {
                                 let return_focus = conversation.close();
@@ -794,7 +939,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             }
                         }
                     } else if matches!(state.focus, AppFocus::Diff) {
-                        match handle_diff_key(key, &mut diff_view, &config.keybindings, viewport_height) {
+                        match handle_diff_key(
+                            key,
+                            &mut diff_view,
+                            &config.keybindings,
+                            viewport_height,
+                        ) {
                             KeyAction::Consumed => {}
                             KeyAction::Close => {
                                 let return_focus = diff_view.close();
@@ -827,7 +977,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 }
                 Event::Paste(text) => {
                     terminal_selection.clear();
-                    if matches!(state.focus, AppFocus::Conversation) && conversation.is_searching() {
+                    if matches!(state.focus, AppFocus::Conversation) && conversation.is_searching()
+                    {
                         conversation.search_insert_str(&text, viewport_height);
                     } else if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() {
                         diff_view.search_insert_str(&text, viewport_height);
@@ -840,8 +991,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 }
                 Event::Mouse(mouse) => {
                     let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
-                    let surface_size = manager.active_session().map(|s| (s.surface.rows(), s.surface.cols()));
-                    
+                    let surface_size = manager
+                        .active_session()
+                        .map(|s| (s.surface.rows(), s.surface.cols()));
+
                     let mut handled = false;
                     if let Some((rows, cols)) = surface_size {
                         match terminal_selection.handle_mouse(mouse, inner, rows, cols) {
@@ -853,7 +1006,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 let session = manager.active_session().unwrap();
                                 let snapshot = session.surface.snapshot();
                                 let wrapped = session.surface.wrapped_rows();
-                                if let Some(text) = terminal_selection.extract_text_from(&snapshot, &wrapped) {
+                                if let Some(text) =
+                                    terminal_selection.extract_text_from(&snapshot, &wrapped)
+                                {
                                     if let Err(e) = clipboard::copy_to_clipboard(&text) {
                                         footer_message = Some(format!("copy failed: {e}"));
                                     }
@@ -869,13 +1024,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         if matches!(mouse.kind, MouseEventKind::Down(_)) {
                             terminal_selection.clear();
                         }
-                        if matches!(mouse.kind, MouseEventKind::Down(_)) && mouse.column < sidebar_width {
+                        if matches!(mouse.kind, MouseEventKind::Down(_))
+                            && mouse.column < sidebar_width
+                        {
                             state.focus = AppFocus::Sidebar;
                             let clicked_row = mouse.row.saturating_sub(1) as usize;
                             if clicked_row < rows.len() {
                                 state.selected_sidebar_row = clicked_row;
                             }
-                        } else if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+                        } else if matches!(
+                            mouse.kind,
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        ) {
                             let scroll_amount = 3;
                             match state.focus {
                                 AppFocus::Conversation => match mouse.kind {
@@ -944,6 +1104,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
 
     manager.shutdown_local_ptys();
     poller.stop();
+    // Drop subscribers: each sends a best-effort stop and detaches its thread
+    // (joining would hang on the blocking SSE read). Threads die at process exit.
+    subscribers.clear();
 
     result
 }

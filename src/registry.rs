@@ -4,8 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::data::discovery::ps::{ParsedServeProcess, scan_serve_processes};
 use anyhow::Context;
-use crate::data::discovery::ps::{scan_serve_processes, ParsedServeProcess};
 
 pub fn load_managed_sessions() -> anyhow::Result<HashSet<String>> {
     load_managed_sessions_from_path(&default_managed_sessions_path()?)

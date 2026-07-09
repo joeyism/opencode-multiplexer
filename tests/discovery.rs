@@ -95,12 +95,21 @@ fn regular_process_parser_ignores_serve_processes() {
 
 #[test]
 fn find_orphaned_serve_pids_returns_pids_not_in_registry() {
-    use opencode_multiplexer::registry::{find_orphaned_serve_pids, ServeEntry};
+    use opencode_multiplexer::registry::{ServeEntry, find_orphaned_serve_pids};
 
     let serve_processes = vec![
-        ParsedServeProcess { pid: 100, port: 4200 },
-        ParsedServeProcess { pid: 200, port: 4201 },
-        ParsedServeProcess { pid: 300, port: 4202 },
+        ParsedServeProcess {
+            pid: 100,
+            port: 4200,
+        },
+        ParsedServeProcess {
+            pid: 200,
+            port: 4201,
+        },
+        ParsedServeProcess {
+            pid: 300,
+            port: 4202,
+        },
     ];
 
     // Registry has PID 100 and 300 — 200 is orphaned
@@ -125,11 +134,12 @@ fn find_orphaned_serve_pids_returns_pids_not_in_registry() {
 
 #[test]
 fn find_orphaned_serve_pids_empty_when_all_registered() {
-    use opencode_multiplexer::registry::{find_orphaned_serve_pids, ServeEntry};
+    use opencode_multiplexer::registry::{ServeEntry, find_orphaned_serve_pids};
 
-    let serve_processes = vec![
-        ParsedServeProcess { pid: 100, port: 4200 },
-    ];
+    let serve_processes = vec![ParsedServeProcess {
+        pid: 100,
+        port: 4200,
+    }];
     let registry = vec![ServeEntry {
         port: 4200,
         pid: 100,
@@ -143,11 +153,17 @@ fn find_orphaned_serve_pids_empty_when_all_registered() {
 
 #[test]
 fn find_orphaned_serve_pids_all_orphaned_when_registry_empty() {
-    use opencode_multiplexer::registry::{find_orphaned_serve_pids, ServeEntry};
+    use opencode_multiplexer::registry::{ServeEntry, find_orphaned_serve_pids};
 
     let serve_processes = vec![
-        ParsedServeProcess { pid: 100, port: 4200 },
-        ParsedServeProcess { pid: 200, port: 4201 },
+        ParsedServeProcess {
+            pid: 100,
+            port: 4200,
+        },
+        ParsedServeProcess {
+            pid: 200,
+            port: 4201,
+        },
     ];
     let registry: Vec<ServeEntry> = vec![];
 

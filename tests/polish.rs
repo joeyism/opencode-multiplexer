@@ -95,11 +95,7 @@ fn serve_visibility_depends_only_on_top_level() {
             is_managed: false,
             status,
         };
-        assert!(
-            should_include_serve_session(&info),
-            "top-level should be included regardless of status {:?}",
-            status
-        );
+        assert!(should_include_serve_session(&info), "top-level should be included regardless of status {status:?}");
     }
     for status in [
         SessionStatus::Working,
@@ -112,11 +108,7 @@ fn serve_visibility_depends_only_on_top_level() {
             is_managed: true,
             status,
         };
-        assert!(
-            should_include_serve_session(&info),
-            "top-level managed should be included regardless of status {:?}",
-            status
-        );
+        assert!(should_include_serve_session(&info), "top-level managed should be included regardless of status {status:?}");
     }
     for status in [
         SessionStatus::Working,
@@ -129,11 +121,7 @@ fn serve_visibility_depends_only_on_top_level() {
             is_managed: false,
             status,
         };
-        assert!(
-            !should_include_serve_session(&info),
-            "non-top-level should be excluded regardless of status {:?}",
-            status
-        );
+        assert!(!should_include_serve_session(&info), "non-top-level should be excluded regardless of status {status:?}");
     }
     for status in [
         SessionStatus::Working,
@@ -146,11 +134,7 @@ fn serve_visibility_depends_only_on_top_level() {
             is_managed: true,
             status,
         };
-        assert!(
-            !should_include_serve_session(&info),
-            "non-top-level should be excluded regardless of managed {:?}",
-            status
-        );
+        assert!(!should_include_serve_session(&info), "non-top-level should be excluded regardless of managed {status:?}");
     }
 }
 

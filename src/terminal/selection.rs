@@ -1,6 +1,6 @@
-use crossterm::event::{MouseEvent, MouseEventKind, MouseButton};
-use ratatui::layout::Rect;
 use crate::terminal::surface::RenderCell;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionPoint {
@@ -107,8 +107,12 @@ impl TerminalSelection {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if pane.contains((mouse.column, mouse.row).into()) {
-                    let col = (mouse.column as usize).saturating_sub(pane.x as usize).min(surface_cols.saturating_sub(1));
-                    let row = (mouse.row as usize).saturating_sub(pane.y as usize).min(surface_rows.saturating_sub(1));
+                    let col = (mouse.column as usize)
+                        .saturating_sub(pane.x as usize)
+                        .min(surface_cols.saturating_sub(1));
+                    let row = (mouse.row as usize)
+                        .saturating_sub(pane.y as usize)
+                        .min(surface_rows.saturating_sub(1));
                     self.begin(SelectionPoint { row, col });
                     MouseResult::Claimed
                 } else {
@@ -118,8 +122,12 @@ impl TerminalSelection {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.dragging {
-                    let col = (mouse.column as usize).saturating_sub(pane.x as usize).min(surface_cols.saturating_sub(1));
-                    let row = (mouse.row as usize).saturating_sub(pane.y as usize).min(surface_rows.saturating_sub(1));
+                    let col = (mouse.column as usize)
+                        .saturating_sub(pane.x as usize)
+                        .min(surface_cols.saturating_sub(1));
+                    let row = (mouse.row as usize)
+                        .saturating_sub(pane.y as usize)
+                        .min(surface_rows.saturating_sub(1));
                     self.update(SelectionPoint { row, col });
                     MouseResult::Claimed
                 } else {
@@ -128,8 +136,12 @@ impl TerminalSelection {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.dragging {
-                    let col = (mouse.column as usize).saturating_sub(pane.x as usize).min(surface_cols.saturating_sub(1));
-                    let row = (mouse.row as usize).saturating_sub(pane.y as usize).min(surface_rows.saturating_sub(1));
+                    let col = (mouse.column as usize)
+                        .saturating_sub(pane.x as usize)
+                        .min(surface_cols.saturating_sub(1));
+                    let row = (mouse.row as usize)
+                        .saturating_sub(pane.y as usize)
+                        .min(surface_rows.saturating_sub(1));
                     self.update(SelectionPoint { row, col });
                     self.finish();
                     MouseResult::Finished
@@ -141,8 +153,13 @@ impl TerminalSelection {
         }
     }
 
-    pub fn extract_text_from(&self, snapshot: &[Vec<RenderCell>], wrapped: &[bool]) -> Option<String> {
-        self.range().map(|r| extract_selection_text(snapshot, r, wrapped))
+    pub fn extract_text_from(
+        &self,
+        snapshot: &[Vec<RenderCell>],
+        wrapped: &[bool],
+    ) -> Option<String> {
+        self.range()
+            .map(|r| extract_selection_text(snapshot, r, wrapped))
     }
 }
 
@@ -155,13 +172,25 @@ pub fn extract_selection_text(
     let mut current_line = String::new();
 
     for r in range.start.row..=range.end.row {
-        if r >= snapshot.len() { break; }
+        if r >= snapshot.len() {
+            break;
+        }
         let row_data = &snapshot[r];
-        let start_col = if r == range.start.row { range.start.col } else { 0 };
-        let end_col = if r == range.end.row { range.end.col } else { row_data.len().saturating_sub(1) };
+        let start_col = if r == range.start.row {
+            range.start.col
+        } else {
+            0
+        };
+        let end_col = if r == range.end.row {
+            range.end.col
+        } else {
+            row_data.len().saturating_sub(1)
+        };
 
         for c in start_col..=end_col {
-            if c >= row_data.len() { break; }
+            if c >= row_data.len() {
+                break;
+            }
             if row_data[c].copyable {
                 current_line.push_str(&row_data[c].symbol);
             }
@@ -192,35 +221,50 @@ mod tests {
 
     #[test]
     fn normalize_forward_same_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 2 }, SelectionPoint { row: 0, col: 5 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 2 },
+            SelectionPoint { row: 0, col: 5 },
+        );
         assert_eq!(r.start.col, 2);
         assert_eq!(r.end.col, 5);
     }
 
     #[test]
     fn normalize_reverse_same_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 5 }, SelectionPoint { row: 0, col: 2 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 5 },
+            SelectionPoint { row: 0, col: 2 },
+        );
         assert_eq!(r.start.col, 2);
         assert_eq!(r.end.col, 5);
     }
 
     #[test]
     fn normalize_forward_multi_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 1, col: 3 }, SelectionPoint { row: 3, col: 7 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 1, col: 3 },
+            SelectionPoint { row: 3, col: 7 },
+        );
         assert_eq!(r.start.row, 1);
         assert_eq!(r.end.row, 3);
     }
 
     #[test]
     fn normalize_reverse_multi_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 3, col: 7 }, SelectionPoint { row: 1, col: 3 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 3, col: 7 },
+            SelectionPoint { row: 1, col: 3 },
+        );
         assert_eq!(r.start.row, 1);
         assert_eq!(r.end.row, 3);
     }
 
     #[test]
     fn contains_single_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 2 }, SelectionPoint { row: 0, col: 5 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 2 },
+            SelectionPoint { row: 0, col: 5 },
+        );
         assert!(r.contains(0, 2));
         assert!(r.contains(0, 4));
         assert!(r.contains(0, 5));
@@ -231,7 +275,10 @@ mod tests {
 
     #[test]
     fn contains_multi_row() {
-        let r = SelectionRange::new(SelectionPoint { row: 1, col: 5 }, SelectionPoint { row: 3, col: 2 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 1, col: 5 },
+            SelectionPoint { row: 3, col: 2 },
+        );
         // Row 1
         assert!(!r.contains(1, 4));
         assert!(r.contains(1, 5));
@@ -249,50 +296,107 @@ mod tests {
     }
 
     fn mock_snapshot(data: Vec<Vec<(&str, bool)>>) -> Vec<Vec<RenderCell>> {
-        data.into_iter().map(|row| {
-            row.into_iter().map(|(sym, cp)| RenderCell {
-                symbol: sym.to_string(),
-                copyable: cp,
-                ..Default::default()
-            }).collect()
-        }).collect()
+        data.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|(sym, cp)| RenderCell {
+                        symbol: sym.to_string(),
+                        copyable: cp,
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
     fn extraction_basics() {
         let snap = mock_snapshot(vec![
-            vec![("h", true), ("e", true), ("l", true), ("l", true), ("o", true), (" ", true), (" ", true)],
-            vec![("w", true), ("o", true), ("r", true), ("l", true), ("d", true), (" ", true), (" ", true)],
+            vec![
+                ("h", true),
+                ("e", true),
+                ("l", true),
+                ("l", true),
+                ("o", true),
+                (" ", true),
+                (" ", true),
+            ],
+            vec![
+                ("w", true),
+                ("o", true),
+                ("r", true),
+                ("l", true),
+                ("d", true),
+                (" ", true),
+                (" ", true),
+            ],
         ]);
 
         // Single row partial
-        let r1 = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 0, col: 4 });
-        assert_eq!(extract_selection_text(&snap, r1, &vec![false, false]), "hello");
+        let r1 = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 0, col: 4 },
+        );
+        assert_eq!(
+            extract_selection_text(&snap, r1, &[false, false]),
+            "hello"
+        );
 
         // Multi row
-        let r2 = SelectionRange::new(SelectionPoint { row: 0, col: 3 }, SelectionPoint { row: 1, col: 2 });
-        assert_eq!(extract_selection_text(&snap, r2, &vec![false, false]), "lo\nwor");
+        let r2 = SelectionRange::new(
+            SelectionPoint { row: 0, col: 3 },
+            SelectionPoint { row: 1, col: 2 },
+        );
+        assert_eq!(
+            extract_selection_text(&snap, r2, &[false, false]),
+            "lo\nwor"
+        );
     }
 
     #[test]
     fn extraction_skips_non_copyable_and_trims() {
-        let snap = mock_snapshot(vec![
-            vec![("A", true), (" ", false), ("B", true), (" ", true), (" ", true)],
-        ]);
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 0, col: 4 });
-        assert_eq!(extract_selection_text(&snap, r, &vec![false]), "AB");
+        let snap = mock_snapshot(vec![vec![
+            ("A", true),
+            (" ", false),
+            ("B", true),
+            (" ", true),
+            (" ", true),
+        ]]);
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 0, col: 4 },
+        );
+        assert_eq!(extract_selection_text(&snap, r, &[false]), "AB");
     }
 
     #[test]
     fn extraction_joins_wrapped_rows() {
         let snap = mock_snapshot(vec![
-            vec![("p", true), ("a", true), ("r", true), ("t", true), (" ", true)],
-            vec![("o", true), ("n", true), ("e", true), (" ", true), (" ", true)],
+            vec![
+                ("p", true),
+                ("a", true),
+                ("r", true),
+                ("t", true),
+                (" ", true),
+            ],
+            vec![
+                ("o", true),
+                ("n", true),
+                ("e", true),
+                (" ", true),
+                (" ", true),
+            ],
         ]);
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 1, col: 2 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 1, col: 2 },
+        );
         // Wrapped: part + one -> "partone"
-        assert_eq!(extract_selection_text(&snap, r, &vec![true, false]), "part one");
-        
+        assert_eq!(
+            extract_selection_text(&snap, r, &[true, false]),
+            "part one"
+        );
+
         // Wait, "part one" or "partone"?
         // In my mock snapshot, row 0 col 4 is " ". If it's a real space it should stay if row wraps.
     }
@@ -300,13 +404,31 @@ mod tests {
     #[test]
     fn extraction_wrapped_does_not_trim_intermediate() {
         let snap = mock_snapshot(vec![
-            vec![("h", true), ("e", true), ("l", true), ("l", true), (" ", true)], // wraps here
-            vec![("o", true), (" ", true), (" ", true), (" ", true), (" ", true)],
+            vec![
+                ("h", true),
+                ("e", true),
+                ("l", true),
+                ("l", true),
+                (" ", true),
+            ], // wraps here
+            vec![
+                ("o", true),
+                (" ", true),
+                (" ", true),
+                (" ", true),
+                (" ", true),
+            ],
         ]);
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 1, col: 0 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 1, col: 0 },
+        );
         // Row 0 is wrapped. We should NOT trim it.
         // Result should be "hell " + "o" -> "hell o"
-        assert_eq!(extract_selection_text(&snap, r, &vec![true, false]), "hell o");
+        assert_eq!(
+            extract_selection_text(&snap, r, &[true, false]),
+            "hell o"
+        );
     }
 
     #[test]
@@ -316,10 +438,16 @@ mod tests {
             vec![("B", true), (" ", true)], // doesn't wrap
             vec![("C", true), (" ", true)], // doesn't wrap
         ]);
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 2, col: 0 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 2, col: 0 },
+        );
         // Row 0-1 wrapped -> "A B"
         // Row 2 is separate line -> "C"
-        assert_eq!(extract_selection_text(&snap, r, &vec![true, false, false]), "A B\nC");
+        assert_eq!(
+            extract_selection_text(&snap, r, &[true, false, false]),
+            "A B\nC"
+        );
     }
 
     #[test]
@@ -328,20 +456,33 @@ mod tests {
             vec![("h", true), ("e", true), (" ", true)], // wraps
             vec![("l", true), ("l", true), ("o", true)], // wraps, but end of selection
         ]);
-        let r = SelectionRange::new(SelectionPoint { row: 0, col: 0 }, SelectionPoint { row: 1, col: 2 });
+        let r = SelectionRange::new(
+            SelectionPoint { row: 0, col: 0 },
+            SelectionPoint { row: 1, col: 2 },
+        );
         // Result: "he " + "llo" -> "he llo"
-        assert_eq!(extract_selection_text(&snap, r, &vec![true, true]), "he llo");
+        assert_eq!(
+            extract_selection_text(&snap, r, &[true, true]),
+            "he llo"
+        );
     }
 
     #[test]
     fn mouse_handling_claimed() {
         let mut sel = TerminalSelection::default();
         let pane = Rect::new(10, 10, 20, 20);
-        
+
         // Down inside
         let res = sel.handle_mouse(
-            MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 15, row: 15, modifiers: KeyModifiers::empty() },
-            pane, 20, 20
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 15,
+                row: 15,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
         );
         assert_eq!(res, MouseResult::Claimed);
         assert!(sel.dragging);
@@ -349,16 +490,30 @@ mod tests {
 
         // Drag inside
         let res = sel.handle_mouse(
-            MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 17, row: 16, modifiers: KeyModifiers::empty() },
-            pane, 20, 20
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 17,
+                row: 16,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
         );
         assert_eq!(res, MouseResult::Claimed);
         assert_eq!(sel.head, Some(SelectionPoint { row: 6, col: 7 }));
 
         // Up inside
         let res = sel.handle_mouse(
-            MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 17, row: 16, modifiers: KeyModifiers::empty() },
-            pane, 20, 20
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 17,
+                row: 16,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
         );
         assert_eq!(res, MouseResult::Finished);
         assert!(!sel.dragging);

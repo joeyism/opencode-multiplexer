@@ -278,11 +278,7 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
             // snapshot. With 20+ serve processes hitting the same SQLite DB,
             // individual queries can fail with "database is locked". A single
             // failure should not cause us to lose all other serve discoveries.
-            let Some(session) = reader
-                .get_session_by_id(&serve_session_id)
-                .ok()
-                .flatten()
-            else {
+            let Some(session) = reader.get_session_by_id(&serve_session_id).ok().flatten() else {
                 continue;
             };
             if !reader
@@ -323,8 +319,7 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
                 has_children: reader
                     .has_child_sessions(&serve_session_id)
                     .unwrap_or(false),
-                children: collect_children(&reader, &serve_session_id, 2)
-                    .unwrap_or_default(),
+                children: collect_children(&reader, &serve_session_id, 2).unwrap_or_default(),
                 serve_port: Some(serve_process.port),
                 source: DiscoverySource::Serve,
             });

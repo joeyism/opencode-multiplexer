@@ -1,13 +1,35 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    fs::OpenOptions,
+    io::Write,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     app::sessions::{SessionList, SessionOrigin, SessionStatus, SessionSummary},
+    data::db::reader::DbReader,
     data::poller::{ChildSessionInfo, DiscoverySource, PollSnapshot},
     registry::is_pid_alive,
     ui::sidebar::{ChildSidebarEntry, SidebarEntry},
 };
 
 use super::pty::PtySession;
+
+fn identity_log(msg: impl Display) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = PathBuf::from(home).join(".config/ocmux/identity-debug.log");
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let _ = OpenOptions::new().create(true).append(true).open(path).and_then(|mut file| {
+        writeln!(file, "{ts} {msg}")
+    });
+}
 
 #[derive(Default)]
 pub struct PtyManager {
@@ -59,10 +81,7 @@ impl PtyManager {
         rows: u16,
         cols: u16,
     ) -> anyhow::Result<u64> {
-        use crate::ops::opencode::{
-            fetch_stable_session_ids, find_available_port, spawn_serve_daemon,
-            wait_for_new_session_id, wait_for_serve_ready,
-        };
+        use crate::ops::opencode::{find_available_port, spawn_serve_daemon, wait_for_serve_ready};
         use crate::registry::{register_serve_process, update_serve_registry_tui_pid};
 
         // Spawn serve daemon as persistent backend
@@ -75,32 +94,27 @@ impl PtyManager {
             anyhow::bail!("opencode serve did not start within 10s on port {port}");
         }
 
-        // Snapshot session IDs on this serve BEFORE spawning TUI.
-        // Use the stabilized variant to wait for the serve to finish loading
-        // all sessions from the DB — a freshly started serve may initially
-        // return an incomplete set.
-        let before_ids = fetch_stable_session_ids(port).unwrap_or_default();
-
-        // Spawn TUI client as a disposable PTY (always fresh, no -s flag)
-        let pty = PtySession::spawn_managed(&cwd, rows, cols)?;
+        // Spawn TUI client attached to our serve via `opencode attach`.
+        // The session_id will be resolved by the SSE subscriber listening for
+        // `session.created` events on this serve's /event stream — the TUI
+        // creates a session lazily (on first message, not startup), so the
+        // old before/after diff approach would time out.
+        let pty = PtySession::spawn_managed(&cwd, port, rows, cols)?;
         let process_pid = pty.process_id();
         if let Some(pid) = process_pid {
             let _ = update_serve_registry_tui_pid(port, pid);
         }
 
-        // Resolve session_id via before/after diff on the home serve port.
-        // The TUI creates a new session on this serve — detect it by diffing.
-        let session_id = wait_for_new_session_id(port, &before_ids, 10);
-
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
+        let cwd_for_log = cwd.clone();
         let id = self.sessions.push(
             cwd,
             title,
             SessionStatus::Working,
-            session_id,
+            None,
             SessionOrigin::Managed,
             process_pid,
             Some(serve_pid),
@@ -112,6 +126,7 @@ impl PtyManager {
             vec![],
         );
         self.ptys.insert(id, Some(pty));
+        identity_log(format!("spawn_managed entry={id} port={port} cwd={cwd_for_log:?} initial session_id=None"));
         self.sessions.select_last();
         self.sessions.activate_selected();
         Ok(id)
@@ -128,7 +143,13 @@ impl PtyManager {
                 return Ok(());
             };
             if let Some(session_id) = summary.session_id.as_deref() {
-                let pty = PtySession::spawn_replica(&summary.cwd, session_id, rows, cols)?;
+                let pty = PtySession::spawn_replica(
+                    &summary.cwd,
+                    session_id,
+                    summary.serve_port,
+                    rows,
+                    cols,
+                )?;
                 let process_pid = pty.process_id();
                 if let Some(slot) = self.ptys.get_mut(&selected_id) {
                     *slot = Some(pty);
@@ -156,7 +177,7 @@ impl PtyManager {
         rows: u16,
         cols: u16,
     ) -> anyhow::Result<()> {
-        let pty = PtySession::spawn_replica(&cwd, &session_id, rows, cols)?;
+        let pty = PtySession::spawn_replica(&cwd, &session_id, None, rows, cols)?;
         let process_pid = pty.process_id();
 
         if let Some(existing_id) = self.sessions.find_by_session_id(&session_id) {
@@ -383,9 +404,6 @@ impl PtyManager {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum MatchKind {
             SessionId,
-            ProcessPid,
-            ServePort,
-            ManagedCwd,
         }
 
         let keep_ids: std::collections::HashSet<String> = snapshot
@@ -408,124 +426,31 @@ impl PtyManager {
 
         let mut matched_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        // Track when a managed entry's session_id is resolved from None to Some,
-        // so the caller knows to persist managed-sessions.json. Without this,
-        // a session whose session_id was unresolved at spawn time would never
-        // be added to managed-sessions.json, and poll_fast could never discover
-        // it (it only discovers sessions in managed-sessions.json via the
-        // managed sessions loop).
-        let mut resolved_session_id: bool = false;
-
         for discovered in snapshot.sessions {
-            // Try to find an existing session to update, in order of reliability:
-            // 1. By session_id (exact DB identity — most reliable)
-            // 2. By process PID (matches process_pid or serve_pid)
-            // 3. By serve port (only if not already matched — can be wrong when
-            //    multiple serves share the same DB)
-            // 4. By cwd for managed sessions with unresolved session_id
-            //
-            // Each entry can only be matched once per snapshot. This prevents
-            // multiple sessions from the same serve (shared DB) from
-            // repeatedly claiming and overwriting the same entry's session_id.
+            // Match existing sessions only by exact session_id.
+            // Each entry can only be matched once per snapshot.
             let matched = self
                 .sessions
                 .find_by_session_id(&discovered.session_id)
                 .filter(|id| !matched_ids.contains(id))
-                .map(|id| (id, MatchKind::SessionId))
-                .or_else(|| {
-                    discovered.process_pid.and_then(|pid| {
-                        self.sessions
-                            .find_by_process_pid(pid)
-                            .filter(|id| !matched_ids.contains(id))
-                            // Don't let PID matching claim unresolved entries —
-                            // when session_id is None, only the managed-cwd
-                            // matcher (which validates the directory) should
-                            // resolve the identity.
-                            .filter(|id| {
-                                self.sessions
-                                    .items()
-                                    .iter()
-                                    .find(|s| s.id == *id)
-                                    .is_some_and(|s| s.session_id.is_some())
-                            })
-                            .map(|id| (id, MatchKind::ProcessPid))
-                    })
-                })
-                .or_else(|| {
-                    discovered.serve_port.and_then(|port| {
-                        self.sessions
-                            .find_by_serve_port(port)
-                            .filter(|id| !matched_ids.contains(id))
-                            // Same guard as above: don't claim unresolved entries by port.
-                            .filter(|id| {
-                                self.sessions
-                                    .items()
-                                    .iter()
-                                    .find(|s| s.id == *id)
-                                    .is_some_and(|s| s.session_id.is_some())
-                            })
-                            .map(|id| (id, MatchKind::ServePort))
-                    })
-                })
-                .or_else(|| {
-                    // Match managed sessions that don't have a session_id yet by cwd.
-                    // Only allow non-heuristic sources — the heuristic GUESSES which
-                    // session a TUI process belongs to and is frequently wrong. Letting
-                    // a wrong guess claim an unresolved entry corrupts its identity.
-                    // Use ancestor-aware comparison: a worktree session at
-                    // `/repo/.worktrees/branch` should match a discovered session
-                    // whose cwd falls back to `/repo` (the project root).
-                    // Also require the discovered session to be at least as recent as
-                    // the managed entry — this prevents old sessions from the shared
-                    // DB (which happen to share the same cwd) from claiming the entry
-                    // before the genuinely new session is created.
-                    if matches!(discovered.source, DiscoverySource::TuiHeuristic) {
-                        return None;
-                    }
-                    self.sessions
-                        .items()
-                        .iter()
-                        .find(|s| {
-                            !matched_ids.contains(&s.id)
-                                && s.origin == SessionOrigin::Managed
-                                && s.session_id.is_none()
-                                && (s.cwd == discovered.cwd
-                                    || s.cwd.starts_with(&discovered.cwd)
-                                    || discovered.cwd.starts_with(&s.cwd))
-                                && discovered.time_updated.is_some_and(|dt| {
-                                    s.time_updated.is_none_or(|st| dt >= st)
-                                })
-                        })
-                        .map(|s| (s.id, MatchKind::ManagedCwd))
-                });
+                .map(|id| (id, MatchKind::SessionId));
 
             if let Some((id, match_kind)) = matched {
                 if let Some(summary) = self.sessions.get_mut(id) {
                     // Guard: once an entry has a session_id, only a discovery
                     // with the SAME session_id may overwrite it. Non-session-id
-                    // matches (by PID, serve_port, or cwd) can guess the wrong
-                    // session — both the heuristic (get_most_recent_session) and
-                    // Serve discoveries (which return all sessions from the
-                    // serve's project, each tagged with the serve's PID/port).
-                    // Unresolved entries (session_id = None) are exempt so they
-                    // can still be resolved by PID/port/cwd matching.
-                    if summary.session_id.is_some()
-                        && !matches!(match_kind, MatchKind::SessionId)
-                    {
+                    // matches can guess the wrong session — both the heuristic
+                    // (get_most_recent_session) and Serve discoveries (which
+                    // return all sessions from the serve's project, each tagged
+                    // with the serve's PID/port).
+                    if summary.session_id.is_some() && !matches!(match_kind, MatchKind::SessionId) {
                         continue;
                     }
 
-                    // Detect session_id resolution (None → Some) for managed entries.
-                    // This signals the caller to persist managed-sessions.json so
-                    // future poll_fast cycles can discover this session.
-                    if summary.origin == SessionOrigin::Managed
-                        && summary.session_id.is_none()
-                    {
-                        resolved_session_id = true;
-                    }
-
                     matched_ids.insert(id);
+                    let old = summary.session_id.clone();
                     summary.session_id = Some(discovered.session_id.clone());
+                    identity_log(format!("poll_session_id_match entry={}: {:?} -> {:?} (title={:?})", id, old, summary.session_id, summary.title));
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
                     summary.status = discovered.status;
@@ -650,7 +575,89 @@ impl PtyManager {
             self.ptys.remove(&id);
         }
 
-        registry_dirty || resolved_session_id
+        registry_dirty
+    }
+
+    /// Apply an authoritative `session.created` event from the serve's SSE
+    /// stream.
+    ///
+    /// This is the primary identity-resolution path for managed sessions using
+    /// `opencode attach`.  When the TUI creates a new session (either on first
+    /// message or via `/new`), the serve emits `session.created` on its SSE
+    /// stream.  This method updates the managed entry's `session_id`,
+    /// bypassing the immutability guard in `apply_poll_snapshot` because SSE
+    /// events from the serve the TUI is attached to are authoritative — not
+    /// guesses.
+    ///
+    /// Returns `true` when the managed-sessions registry must be persisted
+    /// (i.e. the `session_id` actually changed — `None` to a new id, or one
+    /// id to a different id).  Re-emit events for the same id return `false`.
+    /// Without this, a `/new` would leave the previous `session_id` orphaned
+    /// in `managed-sessions.json`, and the next poll would resurrect it as a
+    /// duplicate sidebar entry.
+    pub fn apply_session_event(
+        &mut self,
+        port: u16,
+        event: &crate::ops::opencode_events::SessionCreatedEvent,
+    ) -> bool {
+        if event.parent_id.is_some() {
+            return false;
+        }
+
+        let Some(summary) = self
+            .sessions
+            .items_mut()
+            .iter_mut()
+            .find(|s| s.origin == SessionOrigin::Managed && s.serve_port == Some(port))
+        else {
+            return false;
+        };
+
+        let old = summary.session_id.clone();
+        let new_id = event.session_id.clone();
+
+        // Defensive: if the entry already has a session_id that's still active
+        // in the DB, don't switch to a new one.  This prevents plugin-created
+        // auxiliary sessions (e.g. opencode-ledger extraction sessions) from
+        // displacing the user's primary session.  The plugin's primary fix is
+        // to set `parentID` on those sessions (so the parent_id filter at the
+        // top of this method rejects them) — this check is belt-and-suspenders
+        // for plugins that don't set parentID.
+        //
+        // Tradeoff: if opencode does NOT archive the old session on /new,
+        // this will block the legitimate /new switch.  If observed in
+        // practice, loosen the check (e.g. only block when the new session
+        // has zero user messages).
+        //
+        // Safe fallback: if the DB is unavailable, the check is skipped and
+        // the existing behavior is preserved.
+        if let Some(old_id) = old.as_deref() {
+            if old_id != new_id.as_str() {
+                let old_active = DbReader::open_default()
+                    .ok()
+                    .and_then(|r| r.session_is_active(old_id).ok())
+                    .unwrap_or(false);
+                if old_active {
+                    identity_log(format!(
+                        "apply_session_event DEFENSIVE SKIP port={port} entry={}: \
+                         old session {old_id:?} still active, ignoring new session {new_id:?}",
+                        summary.id
+                    ));
+                    return false;
+                }
+            }
+        }
+
+        let dirty = old.as_deref() != Some(new_id.as_str());
+        summary.session_id = Some(new_id.clone());
+        identity_log(format!(
+            "apply_session_event port={port} entry={}: {:?} -> {:?} (dirty={dirty})",
+            summary.id, old, summary.session_id
+        ));
+        if old.is_none() {
+            eprintln!("managed session resolved on port {port} -> {new_id}");
+        }
+        dirty
     }
 
     pub fn refresh_active(&mut self, rows: u16, cols: u16) -> anyhow::Result<bool> {
@@ -676,7 +683,8 @@ impl PtyManager {
         }
 
         // Spawn fresh replica
-        let pty = PtySession::spawn_replica(&summary.cwd, session_id, rows, cols)?;
+        let pty =
+            PtySession::spawn_replica(&summary.cwd, session_id, summary.serve_port, rows, cols)?;
         if let Some(slot) = self.ptys.get_mut(&active_id) {
             *slot = Some(pty);
         }
@@ -716,5 +724,146 @@ fn convert_child(child: &ChildSessionInfo) -> ChildSidebarEntry {
         time_updated: child.time_updated,
         has_children: child.has_children,
         children: child.children.iter().map(convert_child).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn register_managed(
+        manager: &mut PtyManager,
+        session_id: Option<&str>,
+        serve_port: Option<u16>,
+    ) -> u64 {
+        manager.register_placeholder(
+            PathBuf::from("/tmp/proj"),
+            "title".into(),
+            SessionStatus::Working,
+            session_id.map(String::from),
+            SessionOrigin::Managed,
+            None,
+            Some(1234),
+            serve_port,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn apply_session_event_signals_dirty_on_session_id_change() {
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, Some("ses_old"), Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_new".into(),
+            parent_id: None,
+        };
+        let dirty = manager.apply_session_event(4200, &event);
+
+        assert!(
+            dirty,
+            "Some -> Some-different transition must signal dirty so managed-sessions.json is re-saved"
+        );
+        assert_eq!(
+            manager.sessions().items()[0].session_id.as_deref(),
+            Some("ses_new")
+        );
+    }
+
+    #[test]
+    fn apply_session_event_noop_returns_false() {
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, Some("ses_same"), Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_same".into(),
+            parent_id: None,
+        };
+        let dirty = manager.apply_session_event(4200, &event);
+
+        assert!(!dirty, "no-op event must not signal dirty");
+    }
+
+    #[test]
+    fn apply_session_event_none_to_some_still_returns_true() {
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, None, Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_first".into(),
+            parent_id: None,
+        };
+        let dirty = manager.apply_session_event(4200, &event);
+
+        assert!(dirty, "None -> Some transition must continue to signal dirty");
+        assert_eq!(
+            manager.sessions().items()[0].session_id.as_deref(),
+            Some("ses_first")
+        );
+    }
+
+    #[test]
+    fn apply_session_event_no_matching_port_returns_false() {
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, Some("ses_x"), Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_y".into(),
+            parent_id: None,
+        };
+        let dirty = manager.apply_session_event(4201, &event);
+
+        assert!(!dirty, "no managed entry on this port returns false");
+        assert_eq!(
+            manager.sessions().items()[0].session_id.as_deref(),
+            Some("ses_x"),
+            "unrelated entry must not be mutated"
+        );
+    }
+
+    #[test]
+    fn apply_session_event_child_event_returns_false() {
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, Some("ses_parent"), Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_child".into(),
+            parent_id: Some("ses_parent".into()),
+        };
+        let dirty = manager.apply_session_event(4200, &event);
+
+        assert!(!dirty, "child session events must be ignored");
+        assert_eq!(
+            manager.sessions().items()[0].session_id.as_deref(),
+            Some("ses_parent")
+        );
+    }
+
+    #[test]
+    fn apply_session_event_defensive_check_inactive_without_db() {
+        // Documents the safe-fallback behavior: in a test environment (no real
+        // opencode DB at the default path), the defensive check cannot
+        // determine whether the old session is active, so it falls through
+        // and allows the reassignment.  This preserves the original behavior
+        // when the DB is unavailable.  In production with a real opencode DB,
+        // the check blocks reassignments when the old session is still active.
+        let mut manager = PtyManager::default();
+        register_managed(&mut manager, Some("ses_old"), Some(4200));
+
+        let event = crate::ops::opencode_events::SessionCreatedEvent {
+            session_id: "ses_new".into(),
+            parent_id: None,
+        };
+        let dirty = manager.apply_session_event(4200, &event);
+
+        assert!(dirty, "without DB access, reassignment proceeds");
+        assert_eq!(
+            manager.sessions().items()[0].session_id.as_deref(),
+            Some("ses_new")
+        );
     }
 }

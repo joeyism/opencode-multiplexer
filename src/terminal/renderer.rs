@@ -1,6 +1,11 @@
-use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget, style::{Color, Style}};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    widgets::Widget,
+};
 
-use crate::terminal::{surface::TerminalSurface, selection::SelectionRange};
+use crate::terminal::{selection::SelectionRange, surface::TerminalSurface};
 
 pub struct TerminalWidget<'a> {
     surface: &'a TerminalSurface,
@@ -9,7 +14,10 @@ pub struct TerminalWidget<'a> {
 
 impl<'a> TerminalWidget<'a> {
     pub fn new(surface: &'a TerminalSurface) -> Self {
-        Self { surface, selection: None }
+        Self {
+            surface,
+            selection: None,
+        }
     }
 
     pub fn with_selection(mut self, selection: Option<SelectionRange>) -> Self {

@@ -175,11 +175,16 @@ fn confirming_kill_removes_selected_and_promotes_neighbor() {
 }
 
 #[test]
-fn managed_session_command_uses_opencode_binary_in_target_directory() {
+fn managed_session_command_attaches_to_serve() {
     let cwd = PathBuf::from("/tmp/example-repo");
-    let command = build_managed_session_command(&cwd);
+    let command = build_managed_session_command(&cwd, 4200);
 
     assert_eq!(command.get_argv()[0].to_string_lossy(), "opencode");
+    assert_eq!(command.get_argv()[1].to_string_lossy(), "attach");
+    assert_eq!(
+        command.get_argv()[2].to_string_lossy(),
+        "http://localhost:4200"
+    );
     assert_eq!(
         command.get_cwd().map(|p| p.to_string_lossy().to_string()),
         Some(cwd.display().to_string())
@@ -187,9 +192,24 @@ fn managed_session_command_uses_opencode_binary_in_target_directory() {
 }
 
 #[test]
-fn replica_command_uses_session_flag() {
+fn replica_command_attaches_to_serve_with_session() {
     let cwd = PathBuf::from("/tmp/example-repo");
-    let command = build_replica_command(&cwd, "sess_123");
+    let command = build_replica_command(&cwd, "sess_123", Some(4200));
+
+    assert_eq!(command.get_argv()[0].to_string_lossy(), "opencode");
+    assert_eq!(command.get_argv()[1].to_string_lossy(), "attach");
+    assert_eq!(
+        command.get_argv()[2].to_string_lossy(),
+        "http://localhost:4200"
+    );
+    assert_eq!(command.get_argv()[3].to_string_lossy(), "--session");
+    assert_eq!(command.get_argv()[4].to_string_lossy(), "sess_123");
+}
+
+#[test]
+fn replica_command_falls_back_when_no_serve_port() {
+    let cwd = PathBuf::from("/tmp/example-repo");
+    let command = build_replica_command(&cwd, "sess_123", None);
 
     assert_eq!(command.get_argv()[0].to_string_lossy(), "opencode");
     assert_eq!(command.get_argv()[1].to_string_lossy(), "-s");
@@ -411,7 +431,7 @@ fn sidebar_entries_sort_top_level_sessions_by_recent_update_first() {
 }
 
 #[test]
-fn unresolved_managed_entry_not_claimed_by_serve_pid() {
+fn unresolved_managed_entry_waits_for_sse_not_cwd() {
     let mut manager = PtyManager::default();
     let serve_pid = std::process::id(); // live PID
 
@@ -433,15 +453,14 @@ fn unresolved_managed_entry_not_claimed_by_serve_pid() {
         vec![],
     );
 
-    // poll_full discovers old sessions from the same serve (shared DB).
-    // These have the same process_pid (the serve's PID) but a different cwd.
-    // Without the guard, the first old session would claim the entry via serve_pid.
+    // Poll discovers two sessions in the same cwd, but the managed entry must
+    // remain unresolved until SSE provides its identity.
     manager.apply_poll_snapshot(PollSnapshot {
         sessions: vec![
             DiscoveredSessionInfo {
-                session_id: "sess_old".into(),
-                cwd: PathBuf::from("/tmp/different-worktree"),
-                title: "Old Session".into(),
+                session_id: "sess_wrong".into(),
+                cwd: PathBuf::from("/tmp/new-worktree"),
+                title: "Wrong Session".into(),
                 status: SessionStatus::Idle,
                 process_pid: Some(serve_pid),
                 model: None,
@@ -450,9 +469,8 @@ fn unresolved_managed_entry_not_claimed_by_serve_pid() {
                 has_children: false,
                 children: vec![],
                 serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+                source: DiscoverySource::TuiExplicit,
             },
-            // The real new session — same cwd as the managed entry.
             DiscoveredSessionInfo {
                 session_id: "sess_real".into(),
                 cwd: PathBuf::from("/tmp/new-worktree"),
@@ -465,27 +483,21 @@ fn unresolved_managed_entry_not_claimed_by_serve_pid() {
                 has_children: false,
                 children: vec![],
                 serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+                source: DiscoverySource::TuiExplicit,
             },
         ],
     });
 
-    // The managed entry should be claimed by the real session (matching cwd),
-    // NOT by the old session from a different directory.
     let entry = manager
         .sessions()
         .items()
         .iter()
         .find(|s| s.id == id)
         .unwrap();
-    assert_eq!(
-        entry.session_id.as_deref(),
-        Some("sess_real"),
-        "managed entry should be resolved by the session with matching cwd, not by serve_pid"
-    );
-    assert_eq!(entry.title, "Real Session");
+    assert_eq!(entry.session_id.as_deref(), None);
+    assert_eq!(entry.title, "new-worktree");
 
-    assert_eq!(manager.len(), 2);
+    assert_eq!(manager.len(), 3);
 }
 
 #[test]
@@ -1017,7 +1029,7 @@ fn idle_serve_session_survives_cache_merge() {
         has_children: false,
         children: vec![],
         serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+        source: DiscoverySource::TuiExplicit,
     }];
 
     let merged = merge_cached_serve_sessions_with_reader(fast, &cached, &reader).unwrap();
@@ -1643,7 +1655,11 @@ fn heuristic_pid_match_blocked_then_explicit_match_does_not_duplicate() {
     });
 
     // The real session should be updated in place; no duplicate placeholder.
-    assert_eq!(manager.len(), 1, "explicit session_id match must not create a duplicate after a blocked heuristic PID match");
+    assert_eq!(
+        manager.len(),
+        1,
+        "explicit session_id match must not create a duplicate after a blocked heuristic PID match"
+    );
     let summary = manager.sessions().items()[0].clone();
     assert_eq!(summary.id, id);
     assert_eq!(summary.session_id.as_deref(), Some("sess_real"));
@@ -1687,7 +1703,7 @@ fn serve_discovery_cannot_steal_session_identity() {
                 has_children: false,
                 children: vec![],
                 serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+                source: DiscoverySource::TuiExplicit,
             },
             DiscoveredSessionInfo {
                 session_id: "sess_intruder".into(),
@@ -1701,7 +1717,7 @@ fn serve_discovery_cannot_steal_session_identity() {
                 has_children: false,
                 children: vec![],
                 serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+                source: DiscoverySource::TuiExplicit,
             },
         ],
     });
@@ -1849,7 +1865,7 @@ fn multiple_serve_sessions_do_not_overwrite_existing_entries() {
                 has_children: false,
                 children: vec![],
                 serve_port: Some(4200),
-            source: DiscoverySource::TuiExplicit,
+                source: DiscoverySource::TuiExplicit,
             },
             DiscoveredSessionInfo {
                 session_id: "sess_b".into(),
@@ -1885,115 +1901,32 @@ fn multiple_serve_sessions_do_not_overwrite_existing_entries() {
     // All three entries should keep their correct session_ids.
     assert_eq!(manager.len(), 3);
 
-    let a = manager.sessions().items().iter().find(|s| s.id == id_a).unwrap();
+    let a = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id_a)
+        .unwrap();
     assert_eq!(a.session_id.as_deref(), Some("sess_a"));
     assert_eq!(a.title, "Updated A");
 
-    let b = manager.sessions().items().iter().find(|s| s.id == id_b).unwrap();
+    let b = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id_b)
+        .unwrap();
     assert_eq!(b.session_id.as_deref(), Some("sess_b"));
     assert_eq!(b.title, "Updated B");
 
-    let c = manager.sessions().items().iter().find(|s| s.id == id_c).unwrap();
+    let c = manager
+        .sessions()
+        .items()
+        .iter()
+        .find(|s| s.id == id_c)
+        .unwrap();
     assert_eq!(c.session_id.as_deref(), Some("sess_c"));
     assert_eq!(c.title, "Updated C");
-}
-
-#[test]
-fn pick_most_recent_session_id_returns_latest() {
-    use opencode_multiplexer::data::db::reader::DbReader;
-    use opencode_multiplexer::ops::opencode::pick_most_recent_session_id_with_reader;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let db_path = std::env::temp_dir().join(format!("ocmux-rs-pick-recent-{nanos}.db"));
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        r#"
-        CREATE TABLE project (
-            id TEXT PRIMARY KEY,
-            worktree TEXT NOT NULL,
-            name TEXT,
-            time_created INTEGER,
-            time_updated INTEGER
-        );
-        CREATE TABLE session (
-            id TEXT PRIMARY KEY,
-            project_id TEXT NOT NULL,
-            parent_id TEXT,
-            title TEXT,
-            directory TEXT,
-            permission TEXT,
-            time_created INTEGER,
-            time_updated INTEGER,
-            time_archived INTEGER
-        );
-        CREATE TABLE message (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            data TEXT NOT NULL,
-            time_created INTEGER
-        );
-        CREATE TABLE part (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            data TEXT NOT NULL,
-            time_created INTEGER
-        );
-        "#,
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
-        [],
-    )
-    .unwrap();
-    // Three sessions with different time_created values.
-    // get_session_by_id returns `last_interaction` as time_updated,
-    // which falls back to time_created when no messages exist.
-    conn.execute(
-        "INSERT INTO session VALUES ('sess_old', 'proj1', NULL, 'Old', '/tmp/proj', NULL, 100, 100, NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO session VALUES ('sess_mid', 'proj1', NULL, 'Mid', '/tmp/proj', NULL, 200, 200, NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO session VALUES ('sess_new', 'proj1', NULL, 'New', '/tmp/proj', NULL, 300, 300, NULL)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let reader = DbReader::open(&db_path).unwrap();
-    let ids = vec![
-        "sess_old".to_string(),
-        "sess_mid".to_string(),
-        "sess_new".to_string(),
-    ];
-    let result = pick_most_recent_session_id_with_reader(&ids, &reader);
-    assert_eq!(
-        result.as_deref(),
-        Some("sess_new"),
-        "should pick the session with the highest time_updated"
-    );
-
-    // Also works with a subset.
-    let ids = vec!["sess_old".to_string(), "sess_mid".to_string()];
-    let result = pick_most_recent_session_id_with_reader(&ids, &reader);
-    assert_eq!(result.as_deref(), Some("sess_mid"));
-
-    // Returns None for empty input.
-    let result = pick_most_recent_session_id_with_reader(&[], &reader);
-    assert!(result.is_none());
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 #[test]
@@ -2061,12 +1994,8 @@ fn unresolved_entry_not_claimed_by_old_session_with_same_cwd() {
         .iter()
         .find(|s| s.id == id)
         .unwrap();
-    assert_eq!(
-        entry.session_id.as_deref(),
-        Some("sess_q3_intel"),
-        "should be claimed by the recent session, not the old one"
-    );
-    assert_eq!(entry.title, "Q3 Intelligence");
+    assert_eq!(entry.session_id.as_deref(), None);
+    assert_eq!(entry.title, "delorean");
 
     assert_eq!(manager.len(), 1);
 }
@@ -2161,17 +2090,8 @@ fn registry_dirty_when_managed_session_id_is_resolved() {
         vec![],
     );
 
-    // Apply a snapshot that resolves the session_id via managed-cwd match.
-    // The discovery matches by cwd (not by session_id or PID) because
-    // the entry's serve_pid is the serve daemon's PID, while the
-    // discovery's process_pid is also the serve daemon's PID — but
-    // find_by_process_pid only matches entries that already have a
-    // session_id. So the match goes through the managed-cwd matcher.
-    //
-    // Actually, the PID matcher DOES match here (serve_pid == process_pid),
-    // but the guard blocks it when session_id is already set. When
-    // session_id is None, the guard does NOT block, and the match goes
-    // through.
+    // Poll snapshots no longer resolve an unresolved managed entry; SSE owns
+    // identity resolution now.
     let dirty = manager.apply_poll_snapshot(PollSnapshot {
         sessions: vec![DiscoveredSessionInfo {
             session_id: "sess_resolved".into(),
@@ -2189,19 +2109,8 @@ fn registry_dirty_when_managed_session_id_is_resolved() {
         }],
     });
 
-    // The entry should now have the resolved session_id
     let summary = manager.sessions().items()[0].clone();
-    assert_eq!(
-        summary.session_id.as_deref(),
-        Some("sess_resolved"),
-        "session_id should be resolved by the poll snapshot"
-    );
+    assert_eq!(summary.session_id.as_deref(), None);
 
-    // registry_dirty must be true so the caller saves the managed sessions
-    // list (adding this session_id to managed-sessions.json for future
-    // poll_fast discovery).
-    assert!(
-        dirty,
-        "apply_poll_snapshot must return true (registry_dirty) when a managed session's session_id is resolved from None to Some, so the caller saves managed-sessions.json"
-    );
+    assert!(!dirty);
 }
