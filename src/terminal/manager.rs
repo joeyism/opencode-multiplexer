@@ -461,10 +461,10 @@ impl PtyManager {
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
                     summary.status = discovered.status;
-                    if let Some(pid) = discovered.process_pid {
-                        if Some(pid) != summary.serve_pid {
-                            summary.process_pid = Some(pid);
-                        }
+                    if let Some(pid) = discovered.process_pid
+                        && Some(pid) != summary.serve_pid
+                    {
+                        summary.process_pid = Some(pid);
                     }
                     summary.model = discovered.model.clone();
                     summary.preview = discovered.preview.clone();
@@ -638,20 +638,20 @@ impl PtyManager {
         //
         // Safe fallback: if the DB is unavailable, the check is skipped and
         // the existing behavior is preserved.
-        if let Some(old_id) = old.as_deref() {
-            if old_id != new_id.as_str() {
-                let old_active = DbReader::open_default()
-                    .ok()
-                    .and_then(|r| r.session_is_active(old_id).ok())
-                    .unwrap_or(false);
-                if old_active {
-                    identity_log(format!(
-                        "apply_session_event DEFENSIVE SKIP port={port} entry={}: \
+        if let Some(old_id) = old.as_deref()
+            && old_id != new_id.as_str()
+        {
+            let old_active = DbReader::open_default()
+                .ok()
+                .and_then(|r| r.session_is_active(old_id).ok())
+                .unwrap_or(false);
+            if old_active {
+                identity_log(format!(
+                    "apply_session_event DEFENSIVE SKIP port={port} entry={}: \
                          old session {old_id:?} still active, ignoring new session {new_id:?}",
-                        summary.id
-                    ));
-                    return false;
-                }
+                    summary.id
+                ));
+                return false;
             }
         }
 
