@@ -337,10 +337,7 @@ mod tests {
             SelectionPoint { row: 0, col: 0 },
             SelectionPoint { row: 0, col: 4 },
         );
-        assert_eq!(
-            extract_selection_text(&snap, r1, &[false, false]),
-            "hello"
-        );
+        assert_eq!(extract_selection_text(&snap, r1, &[false, false]), "hello");
 
         // Multi row
         let r2 = SelectionRange::new(
@@ -392,10 +389,7 @@ mod tests {
             SelectionPoint { row: 1, col: 2 },
         );
         // Wrapped: part + one -> "partone"
-        assert_eq!(
-            extract_selection_text(&snap, r, &[true, false]),
-            "part one"
-        );
+        assert_eq!(extract_selection_text(&snap, r, &[true, false]), "part one");
 
         // Wait, "part one" or "partone"?
         // In my mock snapshot, row 0 col 4 is " ". If it's a real space it should stay if row wraps.
@@ -425,10 +419,7 @@ mod tests {
         );
         // Row 0 is wrapped. We should NOT trim it.
         // Result should be "hell " + "o" -> "hell o"
-        assert_eq!(
-            extract_selection_text(&snap, r, &[true, false]),
-            "hell o"
-        );
+        assert_eq!(extract_selection_text(&snap, r, &[true, false]), "hell o");
     }
 
     #[test]
@@ -461,10 +452,7 @@ mod tests {
             SelectionPoint { row: 1, col: 2 },
         );
         // Result: "he " + "llo" -> "he llo"
-        assert_eq!(
-            extract_selection_text(&snap, r, &[true, true]),
-            "he llo"
-        );
+        assert_eq!(extract_selection_text(&snap, r, &[true, true]), "he llo");
     }
 
     #[test]

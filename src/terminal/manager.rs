@@ -26,9 +26,11 @@ fn identity_log(msg: impl Display) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    let _ = OpenOptions::new().create(true).append(true).open(path).and_then(|mut file| {
-        writeln!(file, "{ts} {msg}")
-    });
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{ts} {msg}"));
 }
 
 #[derive(Default)]
@@ -126,7 +128,9 @@ impl PtyManager {
             vec![],
         );
         self.ptys.insert(id, Some(pty));
-        identity_log(format!("spawn_managed entry={id} port={port} cwd={cwd_for_log:?} initial session_id=None"));
+        identity_log(format!(
+            "spawn_managed entry={id} port={port} cwd={cwd_for_log:?} initial session_id=None"
+        ));
         self.sessions.select_last();
         self.sessions.activate_selected();
         Ok(id)
@@ -450,7 +454,10 @@ impl PtyManager {
                     matched_ids.insert(id);
                     let old = summary.session_id.clone();
                     summary.session_id = Some(discovered.session_id.clone());
-                    identity_log(format!("poll_session_id_match entry={}: {:?} -> {:?} (title={:?})", id, old, summary.session_id, summary.title));
+                    identity_log(format!(
+                        "poll_session_id_match entry={}: {:?} -> {:?} (title={:?})",
+                        id, old, summary.session_id, summary.title
+                    ));
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
                     summary.status = discovered.status;
@@ -799,7 +806,10 @@ mod tests {
         };
         let dirty = manager.apply_session_event(4200, &event);
 
-        assert!(dirty, "None -> Some transition must continue to signal dirty");
+        assert!(
+            dirty,
+            "None -> Some transition must continue to signal dirty"
+        );
         assert_eq!(
             manager.sessions().items()[0].session_id.as_deref(),
             Some("ses_first")
