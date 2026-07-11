@@ -428,15 +428,14 @@ fn fetch_recent_serve_session_ids(port: u16) -> anyhow::Result<Vec<String>> {
             let updated = entry.pointer("/time/updated")?;
             let updated_epoch = if let Some(value) = updated.as_u64() {
                 normalize_epoch_secs(value)
-            } else if let Some(value) = updated.as_str() {
+            } else {
+                let value = updated.as_str()?;
                 normalize_epoch_secs(
                     value
                         .parse::<u64>()
                         .ok()
                         .or_else(|| chrono_like_epoch(value))?,
                 )
-            } else {
-                return None;
             };
             (updated_epoch > cutoff).then_some(id)
         })
