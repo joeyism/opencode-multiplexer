@@ -40,10 +40,10 @@ impl Widget for TerminalWidget<'_> {
                 let y = area.y + row as u16;
 
                 let mut style = cell.style();
-                if let Some(ref sel) = self.selection {
-                    if sel.contains(row, col) {
-                        style = style.patch(selection_style);
-                    }
+                if let Some(ref sel) = self.selection
+                    && sel.contains(row, col)
+                {
+                    style = style.patch(selection_style);
                 }
 
                 buf[(x, y)].set_symbol(&cell.symbol).set_style(style);
