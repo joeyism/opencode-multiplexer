@@ -3,6 +3,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Working,
+    SubagentsWorking,
     NeedsInput,
     Idle,
     Error,

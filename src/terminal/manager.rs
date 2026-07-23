@@ -514,7 +514,8 @@ impl PtyManager {
             .iter()
             .filter(|session| {
                 session.origin == SessionOrigin::Managed
-                    && session.status == SessionStatus::Working
+                    && (session.status == SessionStatus::Working
+                        || session.status == SessionStatus::SubagentsWorking)
                     && session.serve_pid.is_some_and(|pid| !is_pid_alive(pid))
             })
             .map(|session| session.id)

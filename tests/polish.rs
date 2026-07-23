@@ -83,9 +83,11 @@ fn worktree_plan_creates_new_branch_from_base_when_missing() {
     );
 }
 
+#[test]
 fn serve_visibility_depends_only_on_top_level() {
     for status in [
         SessionStatus::Working,
+        SessionStatus::SubagentsWorking,
         SessionStatus::NeedsInput,
         SessionStatus::Idle,
         SessionStatus::Error,
@@ -99,6 +101,7 @@ fn serve_visibility_depends_only_on_top_level() {
     }
     for status in [
         SessionStatus::Working,
+        SessionStatus::SubagentsWorking,
         SessionStatus::NeedsInput,
         SessionStatus::Idle,
         SessionStatus::Error,
@@ -112,6 +115,7 @@ fn serve_visibility_depends_only_on_top_level() {
     }
     for status in [
         SessionStatus::Working,
+        SessionStatus::SubagentsWorking,
         SessionStatus::NeedsInput,
         SessionStatus::Idle,
         SessionStatus::Error,
@@ -125,6 +129,7 @@ fn serve_visibility_depends_only_on_top_level() {
     }
     for status in [
         SessionStatus::Working,
+        SessionStatus::SubagentsWorking,
         SessionStatus::NeedsInput,
         SessionStatus::Idle,
         SessionStatus::Error,

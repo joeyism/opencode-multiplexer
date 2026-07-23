@@ -85,4 +85,32 @@ fn format_body_varies_by_status() {
         Notifier::format_body(SessionStatus::Working),
         "Session is working"
     );
+    assert_eq!(
+        Notifier::format_body(SessionStatus::SubagentsWorking),
+        "Subagents are working"
+    );
+}
+
+#[test]
+fn subagents_working_to_idle_is_interesting() {
+    assert!(Notifier::is_interesting_transition(
+        SessionStatus::SubagentsWorking,
+        SessionStatus::Idle
+    ));
+}
+
+#[test]
+fn subagents_working_to_needs_input_is_interesting() {
+    assert!(Notifier::is_interesting_transition(
+        SessionStatus::SubagentsWorking,
+        SessionStatus::NeedsInput
+    ));
+}
+
+#[test]
+fn subagents_working_to_error_is_interesting() {
+    assert!(Notifier::is_interesting_transition(
+        SessionStatus::SubagentsWorking,
+        SessionStatus::Error
+    ));
 }

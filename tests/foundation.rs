@@ -281,3 +281,130 @@ fn surface_clamps_zero_dimensions() {
     assert_eq!(surface.rows(), 1);
     assert_eq!(surface.cols(), 1);
 }
+
+#[test]
+fn subagents_working_status_uses_cyan_dot() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let entries = vec![SidebarEntry {
+        top_level_id: 1,
+        session_id: Some("sess_1".into()),
+        cwd: std::path::PathBuf::from("/tmp/delorean"),
+        title: "Subagent Test".into(),
+        status: opencode_multiplexer::app::sessions::SessionStatus::SubagentsWorking,
+        time_updated: Some(now - 30),
+        active: true,
+        origin: opencode_multiplexer::app::sessions::SessionOrigin::Managed,
+        has_children: true,
+        children: vec![],
+    }];
+
+    let rows = flatten_sidebar_entries(&entries, &HashSet::new());
+    let backend = TestBackend::new(30, 4);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            frame.render_widget(
+                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 25, true),
+                Rect::new(0, 0, 30, 4),
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    // Dot is usually at (0, 1) in expanded sidebar (indent 0)
+    assert_eq!(buffer[(0, 1)].symbol(), "●");
+    assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
+}
+
+#[test]
+fn subagents_working_status_uses_cyan_dot_when_collapsed() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let entries = vec![SidebarEntry {
+        top_level_id: 1,
+        session_id: Some("sess_1".into()),
+        cwd: std::path::PathBuf::from("/tmp/delorean"),
+        title: "Subagent Test".into(),
+        status: opencode_multiplexer::app::sessions::SessionStatus::SubagentsWorking,
+        time_updated: Some(now - 30),
+        active: true,
+        origin: opencode_multiplexer::app::sessions::SessionOrigin::Managed,
+        has_children: false,
+        children: vec![],
+    }];
+
+    let rows = flatten_sidebar_entries(&entries, &HashSet::new());
+    let backend = TestBackend::new(20, 4);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            frame.render_widget(
+                render_sidebar(&rows, 0, AppFocus::Sidebar, true, 15, true),
+                Rect::new(0, 0, 20, 4),
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(0, 1)].symbol(), "●");
+    assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
+}
+
+#[test]
+fn subagents_working_status_stays_cyan_when_selected() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let entries = vec![SidebarEntry {
+        top_level_id: 1,
+        session_id: Some("sess_1".into()),
+        cwd: std::path::PathBuf::from("/tmp/delorean"),
+        title: "Subagent Test".into(),
+        status: opencode_multiplexer::app::sessions::SessionStatus::SubagentsWorking,
+        time_updated: Some(now - 30),
+        active: false,
+        origin: opencode_multiplexer::app::sessions::SessionOrigin::Managed,
+        has_children: false,
+        children: vec![],
+    }];
+
+    let rows = flatten_sidebar_entries(&entries, &HashSet::new());
+    let backend = TestBackend::new(30, 4);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            frame.render_widget(
+                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 25, true),
+                Rect::new(0, 0, 30, 4),
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    // The dot at (0, 1) should be Cyan, even though the row is selected (Cyan background)
+    // Actually, sidebar_row_style sets fg(Color::Black).bg(Color::Cyan) for selected row.
+    // BUT render_row renders the dot Span SEPARATELY from the label Span.
+    // Dot span: Span::styled(format!("{symbol} "), Style::default().fg(color))
+    // Label span: Span::styled(left, row_style)
+    // So the dot should NOT have the selection background if it's not part of the label style.
+    // Let's verify this.
+    assert_eq!(buffer[(0, 1)].symbol(), "●");
+    assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
+    assert_eq!(buffer[(0, 1)].bg, Color::Reset);
+    
+    // The label starts at (2, 1) because of symbol + " "
+    // Prefix for top-level is "  " (active=false, has_children=false)
+    // So label content starts at (4, 1)?
+    // Prefix is format!("{indent}{active_prefix}{marker}");
+    // indent="", active_prefix="  ", marker="  " -> "    "
+    // So symbol "●" at (0, 1), " " at (1, 1), "    " at (2, 1) to (5, 1).
+    // Let's check (6, 1) for label content.
+    assert_eq!(buffer[(6, 1)].bg, Color::Cyan);
+    assert_eq!(buffer[(6, 1)].fg, Color::Black);
+}

@@ -193,6 +193,68 @@ impl DbReader {
     }
 
     pub fn get_session_status(&self, session_id: &str) -> anyhow::Result<SessionStatus> {
+        self.get_session_status_recursive(session_id, &mut std::collections::HashSet::new())
+    }
+
+    fn get_session_status_recursive(
+        &self,
+        session_id: &str,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> anyhow::Result<SessionStatus> {
+        if !visited.insert(session_id.to_string()) {
+            return Ok(SessionStatus::Idle);
+        }
+
+        let local = self.get_local_session_status(session_id)?;
+        if local == SessionStatus::NeedsInput {
+            return Ok(SessionStatus::NeedsInput);
+        }
+
+        let mut best_child = SessionStatus::Idle;
+        let children = self.get_child_sessions(session_id, 100, 0)?;
+        for child in children {
+            let child_status = self.get_session_status_recursive(&child.id, visited)?;
+            best_child = self.rollup_status(best_child, child_status, true);
+            if best_child == SessionStatus::NeedsInput {
+                return Ok(SessionStatus::NeedsInput);
+            }
+        }
+
+        Ok(self.rollup_status(local, best_child, false))
+    }
+
+    fn rollup_status(
+        &self,
+        base: SessionStatus,
+        new: SessionStatus,
+        is_child: bool,
+    ) -> SessionStatus {
+        let new_effective = if is_child {
+            match new {
+                SessionStatus::Working | SessionStatus::SubagentsWorking => {
+                    SessionStatus::SubagentsWorking
+                }
+                _ => new,
+            }
+        } else {
+            new
+        };
+
+        // Precedence: NeedsInput > Error > Working > SubagentsWorking > Idle
+        match (base, new_effective) {
+            (SessionStatus::NeedsInput, _) | (_, SessionStatus::NeedsInput) => {
+                SessionStatus::NeedsInput
+            }
+            (SessionStatus::Error, _) | (_, SessionStatus::Error) => SessionStatus::Error,
+            (SessionStatus::Working, _) | (_, SessionStatus::Working) => SessionStatus::Working,
+            (SessionStatus::SubagentsWorking, _) | (_, SessionStatus::SubagentsWorking) => {
+                SessionStatus::SubagentsWorking
+            }
+            _ => SessionStatus::Idle,
+        }
+    }
+
+    fn get_local_session_status(&self, session_id: &str) -> anyhow::Result<SessionStatus> {
         let latest_message_id: Option<String> = self
             .conn
             .query_row(
@@ -203,8 +265,9 @@ impl DbReader {
             .optional()?;
 
         if let Some(message_id) = latest_message_id.as_deref() {
+            // Check for NeedsInput: tool status 'running' or 'pending'
             let latest_running: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.tool') IN ('question', 'plan_exit') AND json_extract(p.data, '$.state.status') = 'running' AND p.message_id = ?2",
+                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND p.message_id = ?2 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.tool') IN ('question', 'plan_exit') AND json_extract(p.data, '$.state.status') = 'running'",
                 params![session_id, message_id],
                 |row| row.get(0),
             )?;
@@ -212,28 +275,19 @@ impl DbReader {
                 return Ok(SessionStatus::NeedsInput);
             }
 
+            // Detect 'pending' status on ANY tool call part (fixing permission detection)
             let latest_pending: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.tool') IN ('question', 'plan_exit') AND json_extract(p.data, '$.state.status') = 'pending' AND p.message_id = ?2",
+                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND p.message_id = ?2 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.state.status') = 'pending'",
                 params![session_id, message_id],
                 |row| row.get(0),
             )?;
             if latest_pending > 0 {
                 return Ok(SessionStatus::NeedsInput);
             }
-        }
 
-        let child_running: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = m.session_id WHERE s.parent_id = ?1 AND s.time_archived IS NULL AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.tool') IN ('question', 'plan_exit') AND json_extract(p.data, '$.state.status') = 'running'",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        if child_running > 0 {
-            return Ok(SessionStatus::NeedsInput);
-        }
-
-        if let Some(message_id) = latest_message_id.as_deref() {
+            // Check for Error
             let latest_error: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.state.status') = 'error' AND p.message_id = ?2",
+                "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND p.message_id = ?2 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.state.status') = 'error'",
                 params![session_id, message_id],
                 |row| row.get(0),
             )?;
@@ -269,8 +323,7 @@ impl DbReader {
             Some((Some(role), completed)) if role == "assistant" && completed.is_none() => {
                 Ok(SessionStatus::Working)
             }
-            Some(_) => Ok(SessionStatus::Idle),
-            None => Ok(SessionStatus::Idle),
+            _ => Ok(SessionStatus::Idle),
         }
     }
 
@@ -638,10 +691,134 @@ mod tests {
     }
 
     #[test]
-    fn session_is_active_returns_false_for_missing_session() {
-        let db_path = temp_db_path("is-active-missing");
-        let _conn = init_db(&db_path);
+    fn get_session_status_detects_any_pending_tool_as_needs_input() {
+        let db_path = temp_db_path("pending-tool");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg1', 'sess1', '{"role":"assistant"}', 200)"#,
+            [],
+        )
+        .unwrap();
+        // A tool that is NOT question/plan_exit, but is pending
+        conn.execute(
+            r#"INSERT INTO part VALUES ('part1', 'sess1', 'msg1', '{"type":"tool","tool":"edit","state":{"status":"pending"}}', 200)"#,
+            [],
+        )
+        .unwrap();
+
         let reader = DbReader::open(&db_path).unwrap();
-        assert!(!reader.session_is_active("nonexistent").unwrap());
+        assert_eq!(
+            reader.get_session_status("sess1").unwrap(),
+            SessionStatus::NeedsInput
+        );
+    }
+
+    #[test]
+    fn get_session_status_rollups_child_status() {
+        let db_path = temp_db_path("rollup");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        
+        // Parent session (Idle)
+        conn.execute(
+            "INSERT INTO session VALUES ('parent', 'proj1', NULL, 'Parent', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg-p', 'parent', '{"role":"assistant","time":{"completed":200}}', 200)"#,
+            [],
+        )
+        .unwrap();
+
+        // Child session (Working)
+        conn.execute(
+            "INSERT INTO session VALUES ('child', 'proj1', 'parent', 'Child', '/tmp/proj/child', NULL, 150, 250, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg-c', 'child', '{"role":"assistant"}', 250)"#,
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        
+        // Child should be Working
+        assert_eq!(
+            reader.get_session_status("child").unwrap(),
+            SessionStatus::Working
+        );
+        
+        // Parent should be SubagentsWorking
+        assert_eq!(
+            reader.get_session_status("parent").unwrap(),
+            SessionStatus::SubagentsWorking
+        );
+        
+        // If child becomes NeedsInput, parent should become NeedsInput
+        conn.execute(
+            r#"INSERT INTO part VALUES ('part-c', 'child', 'msg-c', '{"type":"tool","tool":"question","state":{"status":"running"}}', 260)"#,
+            [],
+        )
+        .unwrap();
+        
+        assert_eq!(
+            reader.get_session_status("parent").unwrap(),
+            SessionStatus::NeedsInput
+        );
+    }
+
+    #[test]
+    fn get_session_status_ignores_archived_children() {
+        let db_path = temp_db_path("rollup-archived");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        
+        // Parent session (Idle)
+        conn.execute(
+            "INSERT INTO session VALUES ('parent', 'proj1', NULL, 'Parent', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+
+        // Archived Child session (Working)
+        conn.execute(
+            "INSERT INTO session VALUES ('child', 'proj1', 'parent', 'Child', '/tmp/proj/child', NULL, 150, 250, 1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg-c', 'child', '{"role":"assistant"}', 250)"#,
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        
+        // Parent should be Idle because child is archived
+        assert_eq!(
+            reader.get_session_status("parent").unwrap(),
+            SessionStatus::Idle
+        );
     }
 }

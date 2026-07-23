@@ -385,6 +385,7 @@ fn render_row(
 ) -> Line<'static> {
     let (symbol, color) = match row.status {
         SessionStatus::Working => ("●", Color::Green),
+        SessionStatus::SubagentsWorking => ("●", Color::Cyan),
         SessionStatus::NeedsInput => ("◐", Color::Yellow),
         SessionStatus::Idle => ("○", Color::DarkGray),
         SessionStatus::Error => ("✗", Color::Red),

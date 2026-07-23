@@ -26,6 +26,9 @@ impl Notifier {
             (SessionStatus::Working, SessionStatus::Idle)
                 | (SessionStatus::Working, SessionStatus::NeedsInput)
                 | (SessionStatus::Working, SessionStatus::Error)
+                | (SessionStatus::SubagentsWorking, SessionStatus::Idle)
+                | (SessionStatus::SubagentsWorking, SessionStatus::NeedsInput)
+                | (SessionStatus::SubagentsWorking, SessionStatus::Error)
         )
     }
 
@@ -78,6 +81,7 @@ impl Notifier {
             SessionStatus::NeedsInput => "Session needs your input",
             SessionStatus::Error => "Session encountered an error",
             SessionStatus::Working => "Session is working",
+            SessionStatus::SubagentsWorking => "Subagents are working",
         }
     }
 }
