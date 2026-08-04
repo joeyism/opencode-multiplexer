@@ -387,12 +387,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 .apply_local_removal(&result.deleted_session_ids);
                                             manager_state.pending_delete = None;
 
-                                            if let Some(active_sid) = manager.active_session_id() {
-                                                if result.deleted_session_ids.contains(&active_sid)
-                                                {
-                                                    manager.detach_active();
-                                                    state.focus = AppFocus::Sidebar;
-                                                }
+                                            if let Some(active_sid) = manager.active_session_id()
+                                                && result.deleted_session_ids.contains(&active_sid)
+                                            {
+                                                manager.detach_active();
+                                                state.focus = AppFocus::Sidebar;
                                             }
 
                                             save_managed_sessions(manager.managed_session_ids())?;
@@ -1131,10 +1130,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 col,
                                 row,
                                 mouse.modifiers,
-                            ) {
-                                if let Some(pty) = manager.active_session_mut() {
-                                    let _ = pty.send_bytes(&bytes);
-                                }
+                            ) && let Some(pty) = manager.active_session_mut()
+                            {
+                                let _ = pty.send_bytes(&bytes);
                             }
                         } else if matches!(
                             mouse.kind,
@@ -1176,12 +1174,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             mouse.modifiers,
                                         ) {
                                             terminal_selection.clear();
-                                            if let Some(pty) = manager.active_session_mut() {
-                                                if let Err(error) = pty.send_bytes(&bytes) {
-                                                    footer_message = Some(format!(
-                                                        "mouse scroll failed: {error}"
-                                                    ));
-                                                }
+                                            if let Some(pty) = manager.active_session_mut()
+                                                && let Err(error) = pty.send_bytes(&bytes)
+                                            {
+                                                footer_message =
+                                                    Some(format!("mouse scroll failed: {error}"));
                                             }
                                         }
                                     }

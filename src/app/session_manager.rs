@@ -188,10 +188,10 @@ impl SessionManagerState {
     }
 
     pub fn toggle_select(&mut self) {
-        if let Some(id) = self.current_entry().map(|e| e.session_id.clone()) {
-            if !self.selected_ids.remove(&id) {
-                self.selected_ids.insert(id);
-            }
+        if let Some(id) = self.current_entry().map(|e| e.session_id.clone())
+            && !self.selected_ids.remove(&id)
+        {
+            self.selected_ids.insert(id);
         }
     }
 
