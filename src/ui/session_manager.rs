@@ -97,54 +97,89 @@ pub fn render_session_manager(frame: &mut Frame, picker: &mut SessionManagerStat
     let rows: Vec<Row> = visible
         .iter()
         .enumerate()
-        .map(|(i, (entry, repo_idx, title_idx, dir_idx, is_live, is_selected))| {
-            let row_idx = i + picker.scroll_offset;
-            let current = row_idx == picker.selected;
+        .map(
+            |(i, (entry, repo_idx, title_idx, dir_idx, is_live, is_selected))| {
+                let row_idx = i + picker.scroll_offset;
+                let current = row_idx == picker.selected;
 
-            let (normal_style, highlight_style) = if current {
-                (Style::default().fg(Color::White).bg(Color::DarkGray), selected_matched_style)
-            } else {
-                (Style::default().fg(Color::White), matched_style)
-            };
+                let (normal_style, highlight_style) = if current {
+                    (
+                        Style::default().fg(Color::White).bg(Color::DarkGray),
+                        selected_matched_style,
+                    )
+                } else {
+                    (Style::default().fg(Color::White), matched_style)
+                };
 
-            let checkbox = if *is_selected { "•" } else { " " };
-            let live_dot = if *is_live {
-                Span::styled(" ●", Style::default().fg(Color::Green))
-            } else {
-                Span::raw("  ")
-            };
+                let checkbox = if *is_selected { "•" } else { " " };
+                let live_dot = if *is_live {
+                    Span::styled(" ●", Style::default().fg(Color::Green))
+                } else {
+                    Span::raw("  ")
+                };
 
-            let checkbox_cell = Cell::from(Line::from(vec![
-                Span::styled(checkbox, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                live_dot,
-            ]));
+                let checkbox_cell = Cell::from(Line::from(vec![
+                    Span::styled(
+                        checkbox,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    live_dot,
+                ]));
 
-            let repo_cell = Cell::from(highlight_text(&entry.repo, repo_idx, normal_style, highlight_style));
-            let title_cell = Cell::from(highlight_text(&entry.title, title_idx, normal_style, highlight_style));
-            let dir_cell = Cell::from(highlight_text(&entry.directory, dir_idx, normal_style, highlight_style));
-            
-            let count_style = if current {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let count_cell = Cell::from(Span::styled(entry.user_message_count.to_string(), count_style));
+                let repo_cell = Cell::from(highlight_text(
+                    &entry.repo,
+                    repo_idx,
+                    normal_style,
+                    highlight_style,
+                ));
+                let title_cell = Cell::from(highlight_text(
+                    &entry.title,
+                    title_idx,
+                    normal_style,
+                    highlight_style,
+                ));
+                let dir_cell = Cell::from(highlight_text(
+                    &entry.directory,
+                    dir_idx,
+                    normal_style,
+                    highlight_style,
+                ));
 
-            let time = relative_time_from_updated(Some(entry.time_updated));
-            let time_style = if current {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let time_cell = Cell::from(Span::styled(time, time_style));
+                let count_style = if current {
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let count_cell = Cell::from(Span::styled(
+                    entry.user_message_count.to_string(),
+                    count_style,
+                ));
 
-            let row = Row::new(vec![checkbox_cell, repo_cell, title_cell, dir_cell, count_cell, time_cell]);
-            if current {
-                row.style(selected_style)
-            } else {
-                row
-            }
-        })
+                let time = relative_time_from_updated(Some(entry.time_updated));
+                let time_style = if current {
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let time_cell = Cell::from(Span::styled(time, time_style));
+
+                let row = Row::new(vec![
+                    checkbox_cell,
+                    repo_cell,
+                    title_cell,
+                    dir_cell,
+                    count_cell,
+                    time_cell,
+                ]);
+                if current {
+                    row.style(selected_style)
+                } else {
+                    row
+                }
+            },
+        )
         .collect();
 
     let widths = [
@@ -160,12 +195,12 @@ pub fn render_session_manager(frame: &mut Frame, picker: &mut SessionManagerStat
     frame.render_widget(table, table_area);
 
     let footer = if let Some(pending) = &picker.pending_delete {
-        Line::from(vec![
-            Span::styled(
-                pending_delete_message(pending),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-        ])
+        Line::from(vec![Span::styled(
+            pending_delete_message(pending),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
     } else {
         Line::from(vec![
             Span::styled(" Tab", Style::default().fg(Color::Cyan)),

@@ -27,7 +27,10 @@ use opencode_multiplexer::{
         state::AppState,
     },
     config::load_config,
-    data::{db::{reader::DbReader, writer::DbWriter}, poller::start_poller},
+    data::{
+        db::{reader::DbReader, writer::DbWriter},
+        poller::start_poller,
+    },
     notify::Notifier,
     ops::git::{diff_worktree, fetch_session_diff_from_serve},
     ops::opencode_events::{SessionCreatedEvent, SessionEventSubscriber},
@@ -376,15 +379,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         .iter()
                                         .filter_map(|e| e.session_id.clone())
                                         .collect();
-                                    match DbWriter::open_default()
-                                        .and_then(|mut w| w.delete_sessions(&pending.session_ids, &live_ids))
-                                    {
+                                    match DbWriter::open_default().and_then(|mut w| {
+                                        w.delete_sessions(&pending.session_ids, &live_ids)
+                                    }) {
                                         Ok(result) => {
-                                            manager_state.apply_local_removal(&result.deleted_session_ids);
+                                            manager_state
+                                                .apply_local_removal(&result.deleted_session_ids);
                                             manager_state.pending_delete = None;
-                                            
+
                                             if let Some(active_sid) = manager.active_session_id() {
-                                                if result.deleted_session_ids.contains(&active_sid) {
+                                                if result.deleted_session_ids.contains(&active_sid)
+                                                {
                                                     manager.detach_active();
                                                     state.focus = AppFocus::Sidebar;
                                                 }
@@ -399,7 +404,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                             ));
                                         }
                                         Err(error) => {
-                                            footer_message = Some(format!("delete failed: {error}"));
+                                            footer_message =
+                                                Some(format!("delete failed: {error}"));
                                             manager_state.pending_delete = None;
                                         }
                                     }
@@ -1120,9 +1126,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     | MouseEventKind::Up(MouseButton::Right | MouseButton::Middle)
                             )
                         {
-                            if let Some(bytes) =
-                                input::mouse_event_to_sgr_bytes(mouse.kind, col, row, mouse.modifiers)
-                            {
+                            if let Some(bytes) = input::mouse_event_to_sgr_bytes(
+                                mouse.kind,
+                                col,
+                                row,
+                                mouse.modifiers,
+                            ) {
                                 if let Some(pty) = manager.active_session_mut() {
                                     let _ = pty.send_bytes(&bytes);
                                 }
@@ -1142,43 +1151,44 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     }
                                     _ => {}
                                 },
-                                        AppFocus::Diff => match mouse.kind {
-                                            MouseEventKind::ScrollUp => {
-                                                diff_view.scroll_view_up(scroll_amount, viewport_height);
-                                            }
-                                            MouseEventKind::ScrollDown => {
-                                                diff_view.scroll_view_down(scroll_amount, viewport_height);
-                                            }
-                                            _ => {}
-                                        },
-                                        AppFocus::Terminal => {
-                                            if let Some((col, row)) = input::screen_to_pty_cell(
-                                                mouse.column,
-                                                mouse.row,
-                                                inner.x,
-                                                inner.y,
-                                                inner.width,
-                                                inner.height,
-                                            ) {
-                                                if let Some(bytes) = input::mouse_scroll_to_sgr_bytes(
-                                                    mouse.kind,
-                                                    col,
-                                                    row,
-                                                    mouse.modifiers,
-                                                ) {
-                                                    terminal_selection.clear();
-                                                    if let Some(pty) = manager.active_session_mut() {
-                                                        if let Err(error) = pty.send_bytes(&bytes) {
-                                                            footer_message =
-                                                                Some(format!("mouse scroll failed: {error}"));
-                                                        }
-                                                    }
+                                AppFocus::Diff => match mouse.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        diff_view.scroll_view_up(scroll_amount, viewport_height);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        diff_view.scroll_view_down(scroll_amount, viewport_height);
+                                    }
+                                    _ => {}
+                                },
+                                AppFocus::Terminal => {
+                                    if let Some((col, row)) = input::screen_to_pty_cell(
+                                        mouse.column,
+                                        mouse.row,
+                                        inner.x,
+                                        inner.y,
+                                        inner.width,
+                                        inner.height,
+                                    ) {
+                                        if let Some(bytes) = input::mouse_scroll_to_sgr_bytes(
+                                            mouse.kind,
+                                            col,
+                                            row,
+                                            mouse.modifiers,
+                                        ) {
+                                            terminal_selection.clear();
+                                            if let Some(pty) = manager.active_session_mut() {
+                                                if let Err(error) = pty.send_bytes(&bytes) {
+                                                    footer_message = Some(format!(
+                                                        "mouse scroll failed: {error}"
+                                                    ));
                                                 }
                                             }
                                         }
-                                        _ => {}
                                     }
                                 }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Event::FocusGained => {

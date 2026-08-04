@@ -386,7 +386,7 @@ fn subagents_working_status_stays_cyan_when_selected() {
     assert_eq!(buffer[(0, 1)].symbol(), "●");
     assert_eq!(buffer[(0, 1)].fg, Color::Cyan);
     assert_eq!(buffer[(0, 1)].bg, Color::Reset);
-    
+
     // The label starts at (2, 1) because of symbol + " "
     // Prefix for top-level is "  " (active=false, has_children=false)
     // So label content starts at (4, 1)?

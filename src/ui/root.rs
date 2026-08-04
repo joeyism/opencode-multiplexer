@@ -51,13 +51,7 @@ pub fn render(
     let layout = split_root(frame.area(), sidebar_width, 1);
     if !panel_hidden {
         frame.render_widget(
-            render_sidebar(
-                rows,
-                selected,
-                focus,
-                sidebar_width,
-                app_focused,
-            ),
+            render_sidebar(rows, selected, focus, sidebar_width, app_focused),
             layout.sidebar,
         );
     }

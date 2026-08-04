@@ -1,6 +1,6 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 use std::sync::Arc;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use nucleo::{
     Config, Nucleo,
@@ -25,7 +25,11 @@ pub enum ManagerCommand {
     Nop,
 }
 
-pub fn manager_key_to_command(key: KeyEvent, has_pending: bool, has_selection: bool) -> ManagerCommand {
+pub fn manager_key_to_command(
+    key: KeyEvent,
+    has_pending: bool,
+    has_selection: bool,
+) -> ManagerCommand {
     if has_pending {
         return match key.code {
             KeyCode::Char('y') => ManagerCommand::ConfirmDelete,
@@ -45,17 +49,32 @@ pub fn manager_key_to_command(key: KeyEvent, has_pending: bool, has_selection: b
         KeyCode::Up => ManagerCommand::Up,
         KeyCode::Down => ManagerCommand::Down,
         KeyCode::Tab => ManagerCommand::Toggle,
-        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => ManagerCommand::SelectAll,
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => ManagerCommand::Clear,
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => ManagerCommand::RequestDelete,
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ManagerCommand::SelectAll
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ManagerCommand::Clear
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ManagerCommand::RequestDelete
+        }
         KeyCode::Delete => ManagerCommand::RequestDelete,
         KeyCode::Backspace => ManagerCommand::Backspace,
-        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => ManagerCommand::Insert(c),
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            ManagerCommand::Insert(c)
+        }
         _ => ManagerCommand::Nop,
     }
 }
 
-pub type VisibleEntry = (SessionManagerEntry, Vec<u32>, Vec<u32>, Vec<u32>, bool, bool);
+pub type VisibleEntry = (
+    SessionManagerEntry,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<u32>,
+    bool,
+    bool,
+);
 
 #[derive(Debug, Clone)]
 pub struct SessionManagerEntry {
@@ -193,7 +212,9 @@ impl SessionManagerState {
 
     pub fn request_delete(&mut self) {
         let targets = if self.selected_ids.is_empty() {
-            self.current_entry().map(|e| vec![e.session_id.clone()]).unwrap_or_default()
+            self.current_entry()
+                .map(|e| vec![e.session_id.clone()])
+                .unwrap_or_default()
         } else {
             let mut ids: Vec<String> = self.selected_ids.iter().cloned().collect();
             ids.sort();
@@ -204,7 +225,9 @@ impl SessionManagerState {
             return;
         }
 
-        let total_msgs = self.entries.iter()
+        let total_msgs = self
+            .entries
+            .iter()
             .filter(|e| targets.contains(&e.session_id))
             .map(|e| e.user_message_count)
             .sum();
@@ -221,9 +244,10 @@ impl SessionManagerState {
 
     pub fn apply_local_removal(&mut self, deleted_ids: &[String]) {
         let deleted_set: HashSet<_> = deleted_ids.iter().collect();
-        self.entries.retain(|e| !deleted_set.contains(&e.session_id));
+        self.entries
+            .retain(|e| !deleted_set.contains(&e.session_id));
         self.selected_ids.retain(|id| !deleted_set.contains(id));
-        
+
         // Rebuild matcher
         let mut matcher = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), Some(1), 1);
         let injector = matcher.injector();
@@ -268,18 +292,11 @@ impl SessionManagerState {
             let haystack = item.matcher_columns[0].slice(..);
             if let Some(score) = pattern.score(haystack, &mut scorer) {
                 let entry = &self.entries[entry_idx];
-                scored.push((
-                    score,
-                    entry.time_updated,
-                    entry_idx,
-                ));
+                scored.push((score, entry.time_updated, entry_idx));
             }
         }
 
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-        });
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         scored.into_iter().map(|(_, _, idx)| idx).collect()
     }
@@ -388,7 +405,7 @@ mod tests {
     fn space_toggles_selection() {
         let mut state = SessionManagerState::from_entries(
             vec![test_entry("s1", "T1"), test_entry("s2", "T2")],
-            HashSet::new()
+            HashSet::new(),
         );
         state.toggle_select();
         assert!(state.selected_ids.contains("s1"));
@@ -400,7 +417,7 @@ mod tests {
     fn select_all_matched_only_selects_filtered() {
         let mut state = SessionManagerState::from_entries(
             vec![test_entry("s1", "foo"), test_entry("s2", "bar")],
-            HashSet::new()
+            HashSet::new(),
         );
         state.insert_char('f');
         state.tick();
@@ -413,7 +430,7 @@ mod tests {
     fn typing_does_not_clear_selection() {
         let mut state = SessionManagerState::from_entries(
             vec![test_entry("s1", "foo"), test_entry("s2", "bar")],
-            HashSet::new()
+            HashSet::new(),
         );
         state.toggle_select();
         assert!(state.selected_ids.contains("s1"));
@@ -427,31 +444,62 @@ mod tests {
         let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
 
         // Plain typing
-        assert_eq!(manager_key_to_command(k(KeyCode::Char('a')), false, false), ManagerCommand::Insert('a'));
-        assert_eq!(manager_key_to_command(k(KeyCode::Char('d')), false, false), ManagerCommand::Insert('d'));
-        
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Char('a')), false, false),
+            ManagerCommand::Insert('a')
+        );
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Char('d')), false, false),
+            ManagerCommand::Insert('d')
+        );
+
         // Multi-select actions
-        assert_eq!(manager_key_to_command(k(KeyCode::Tab), false, false), ManagerCommand::Toggle);
-        assert_eq!(manager_key_to_command(ctrl('a'), false, false), ManagerCommand::SelectAll);
-        assert_eq!(manager_key_to_command(ctrl('u'), false, true), ManagerCommand::Clear);
-        assert_eq!(manager_key_to_command(ctrl('d'), false, false), ManagerCommand::RequestDelete);
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Tab), false, false),
+            ManagerCommand::Toggle
+        );
+        assert_eq!(
+            manager_key_to_command(ctrl('a'), false, false),
+            ManagerCommand::SelectAll
+        );
+        assert_eq!(
+            manager_key_to_command(ctrl('u'), false, true),
+            ManagerCommand::Clear
+        );
+        assert_eq!(
+            manager_key_to_command(ctrl('d'), false, false),
+            ManagerCommand::RequestDelete
+        );
 
         // Esc behavior
-        assert_eq!(manager_key_to_command(k(KeyCode::Esc), false, true), ManagerCommand::Clear);
-        assert_eq!(manager_key_to_command(k(KeyCode::Esc), false, false), ManagerCommand::Close);
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Esc), false, true),
+            ManagerCommand::Clear
+        );
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Esc), false, false),
+            ManagerCommand::Close
+        );
 
         // Pending delete
-        assert_eq!(manager_key_to_command(k(KeyCode::Char('y')), true, false), ManagerCommand::ConfirmDelete);
-        assert_eq!(manager_key_to_command(k(KeyCode::Char('n')), true, false), ManagerCommand::CancelPending);
-        assert_eq!(manager_key_to_command(k(KeyCode::Esc), true, false), ManagerCommand::CancelPending);
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Char('y')), true, false),
+            ManagerCommand::ConfirmDelete
+        );
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Char('n')), true, false),
+            ManagerCommand::CancelPending
+        );
+        assert_eq!(
+            manager_key_to_command(k(KeyCode::Esc), true, false),
+            ManagerCommand::CancelPending
+        );
     }
 
     #[test]
     fn request_delete_targets_current_if_no_selection() {
-        let mut state = SessionManagerState::from_entries(
-            vec![test_entry("s1", "T1")],
-            HashSet::new()
-        );
+        let mut state =
+            SessionManagerState::from_entries(vec![test_entry("s1", "T1")], HashSet::new());
         state.request_delete();
         assert_eq!(state.pending_delete.unwrap().session_ids, vec!["s1"]);
     }

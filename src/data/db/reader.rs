@@ -88,7 +88,7 @@ impl DbReader {
             JOIN project p ON p.id = s.project_id
             WHERE s.parent_id IS NULL
             ORDER BY last_interaction DESC
-            LIMIT 500"
+            LIMIT 500",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(DbManagedSession {
@@ -864,7 +864,7 @@ mod tests {
             [],
         )
         .unwrap();
-        
+
         // Parent session (Idle)
         conn.execute(
             "INSERT INTO session VALUES ('parent', 'proj1', NULL, 'Parent', '/tmp/proj', NULL, 100, 200, NULL)",
@@ -890,26 +890,26 @@ mod tests {
         .unwrap();
 
         let reader = DbReader::open(&db_path).unwrap();
-        
+
         // Child should be Working
         assert_eq!(
             reader.get_session_status("child", None).unwrap(),
             SessionStatus::Working
         );
-        
+
         // Parent should be SubagentsWorking
         assert_eq!(
             reader.get_session_status("parent", None).unwrap(),
             SessionStatus::SubagentsWorking
         );
-        
+
         // If child becomes NeedsInput, parent should become NeedsInput
         conn.execute(
             r#"INSERT INTO part VALUES ('part-c', 'child', 'msg-c', '{"type":"tool","tool":"question","state":{"status":"running"}}', 260)"#,
             [],
         )
         .unwrap();
-        
+
         assert_eq!(
             reader.get_session_status("parent", None).unwrap(),
             SessionStatus::NeedsInput
@@ -925,7 +925,7 @@ mod tests {
             [],
         )
         .unwrap();
-        
+
         // Parent session (Idle)
         conn.execute(
             "INSERT INTO session VALUES ('parent', 'proj1', NULL, 'Parent', '/tmp/proj', NULL, 100, 200, NULL)",
@@ -946,7 +946,7 @@ mod tests {
         .unwrap();
 
         let reader = DbReader::open(&db_path).unwrap();
-        
+
         // Parent should be Idle because child is archived
         assert_eq!(
             reader.get_session_status("parent", None).unwrap(),

@@ -490,7 +490,7 @@ fn session_status_error_precedence() {
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_err', 'sess_err_work', 'msg_1', '{\"type\":\"tool\",\"tool\":\"edit\",\"state\":{\"status\":\"error\"}}', 11)",
         [],
     ).unwrap();
-    
+
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
         reader.get_session_status("sess_err_work", None).unwrap(),
@@ -502,7 +502,7 @@ fn session_status_error_precedence() {
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_needs', 'sess_err_work', 'msg_1', '{\"type\":\"tool\",\"tool\":\"question\",\"state\":{\"status\":\"running\"}}', 12)",
         [],
     ).unwrap();
-    
+
     assert_eq!(
         reader.get_session_status("sess_err_work", None).unwrap(),
         SessionStatus::NeedsInput
@@ -526,9 +526,12 @@ fn session_status_full_precedence_chain() {
         "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('main', 'proj_1', NULL, 'Main', '/tmp/repo', '{}', 1, 10, NULL)",
         [],
     ).unwrap();
-    
+
     let reader = DbReader::open(&db_path).unwrap();
-    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Idle);
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::Idle
+    );
 
     // Add Subagent (Working) -> SubagentsWorking
     conn.execute(
@@ -539,28 +542,40 @@ fn session_status_full_precedence_chain() {
         "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_sub', 'sub', '{\"role\":\"user\"}', 20)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::SubagentsWorking);
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::SubagentsWorking
+    );
 
     // Make Main (Working) -> Working wins over SubagentsWorking
     conn.execute(
         "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_main', 'main', '{\"role\":\"user\"}', 30)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Working);
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::Working
+    );
 
     // Make Main (Error) -> Error wins over Working
     conn.execute(
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_err', 'main', 'msg_main', '{\"type\":\"tool\",\"tool\":\"edit\",\"state\":{\"status\":\"error\"}}', 31)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Error);
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::Error
+    );
 
     // Make Main (NeedsInput) -> NeedsInput wins over Error
     conn.execute(
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_needs', 'main', 'msg_main', '{\"type\":\"tool\",\"tool\":\"question\",\"state\":{\"status\":\"running\"}}', 32)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::NeedsInput);
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::NeedsInput
+    );
 
     fs::remove_file(db_path).ok();
 }
@@ -931,12 +946,13 @@ fn list_sessions_for_manager_returns_top_level_with_subtree_message_counts() {
         [],
     )
     .unwrap();
-    
+
     // parent1 -> child1 (2 msgs total: 1 parent, 1 child)
     conn.execute(
         "INSERT INTO session VALUES ('p1', 'proj1', NULL, 'P1', '/tmp/repo', NULL, 100, 100, NULL)",
         [],
-    ).unwrap();
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO session VALUES ('c1', 'proj1', 'p1', 'C1', '/tmp/repo/c1', NULL, 110, 110, NULL)",
         [],
@@ -944,21 +960,24 @@ fn list_sessions_for_manager_returns_top_level_with_subtree_message_counts() {
     conn.execute(
         r#"INSERT INTO message VALUES ('m1', 'p1', '{"role":"user"}', 105)"#,
         [],
-    ).unwrap();
+    )
+    .unwrap();
     conn.execute(
         r#"INSERT INTO message VALUES ('m2', 'c1', '{"role":"user"}', 115)"#,
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // parent2 (0 msgs)
     conn.execute(
         "INSERT INTO session VALUES ('p2', 'proj1', NULL, 'P2', '/tmp/repo', NULL, 50, 50, NULL)",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     let reader = DbReader::open(&db_path).unwrap();
     let sessions = reader.list_sessions_for_manager().unwrap();
-    
+
     assert_eq!(sessions.len(), 2);
     // ordered by last_interaction DESC: p1 (115) then p2 (50)
     assert_eq!(sessions[0].id, "p1");

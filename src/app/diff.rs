@@ -1012,9 +1012,7 @@ mod tests_scroll_view {
     fn scroll_view_down_does_not_move_cursor_while_still_visible() {
         // Viewport-led: cursor stays put if it remains on-screen.
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 2, // visible in vp=5 at scroll=0 (lines 0..4)
             scroll: 0,
             ..Default::default()
@@ -1027,9 +1025,7 @@ mod tests_scroll_view {
     #[test]
     fn scroll_view_up_does_not_move_cursor_while_still_visible() {
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 5,
             scroll: 3, // visible 3..7, cursor 5 on-screen
             ..Default::default()
@@ -1042,9 +1038,7 @@ mod tests_scroll_view {
     #[test]
     fn scroll_view_down_clamps_cursor_when_leaving_top() {
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 0,
             scroll: 0,
             ..Default::default()
@@ -1057,9 +1051,7 @@ mod tests_scroll_view {
     #[test]
     fn scroll_view_up_clamps_cursor_when_leaving_bottom() {
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 9,
             scroll: 5, // visible 5..9
             ..Default::default()
@@ -1100,9 +1092,7 @@ mod tests_scroll_view {
     #[test]
     fn scroll_view_during_visual_updates_selection_when_clamped() {
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 0,
             scroll: 0,
             ..Default::default()
@@ -1118,9 +1108,7 @@ mod tests_scroll_view {
         // Documents the OLD mouse API pitfall: scroll_up leaves cursor off-screen.
         // After Fix B mouse must not call this. Keep the method behavior explicit.
         let mut state = DiffViewState {
-            document: make_document(&[
-                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-            ]),
+            document: make_document(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]),
             cursor: 0,
             scroll: 0,
             ..Default::default()

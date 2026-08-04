@@ -243,37 +243,24 @@ mod tests {
 
     #[test]
     fn scroll_down_encodes_sgr_button_65() {
-        let bytes = mouse_scroll_to_sgr_bytes(
-            MouseEventKind::ScrollDown,
-            1,
-            1,
-            KeyModifiers::NONE,
-        )
-        .unwrap();
+        let bytes = mouse_scroll_to_sgr_bytes(MouseEventKind::ScrollDown, 1, 1, KeyModifiers::NONE)
+            .unwrap();
         assert_eq!(bytes, b"\x1b[<65;1;1M");
     }
 
     #[test]
     fn scroll_with_ctrl_adds_16_to_button() {
-        let bytes = mouse_scroll_to_sgr_bytes(
-            MouseEventKind::ScrollUp,
-            2,
-            4,
-            KeyModifiers::CONTROL,
-        )
-        .unwrap();
+        let bytes =
+            mouse_scroll_to_sgr_bytes(MouseEventKind::ScrollUp, 2, 4, KeyModifiers::CONTROL)
+                .unwrap();
         assert_eq!(bytes, b"\x1b[<80;2;4M"); // 64 + 16
     }
 
     #[test]
     fn non_scroll_kinds_return_none() {
-        assert!(mouse_scroll_to_sgr_bytes(
-            MouseEventKind::Moved,
-            1,
-            1,
-            KeyModifiers::NONE,
-        )
-        .is_none());
+        assert!(
+            mouse_scroll_to_sgr_bytes(MouseEventKind::Moved, 1, 1, KeyModifiers::NONE,).is_none()
+        );
     }
 
     #[test]
@@ -291,7 +278,13 @@ mod tests {
     #[test]
     fn left_press_encodes_button_0_m_uppercase() {
         assert_eq!(
-            mouse_event_to_sgr_bytes(MouseEventKind::Down(MouseButton::Left), 4, 7, KeyModifiers::NONE).unwrap(),
+            mouse_event_to_sgr_bytes(
+                MouseEventKind::Down(MouseButton::Left),
+                4,
+                7,
+                KeyModifiers::NONE
+            )
+            .unwrap(),
             b"\x1b[<0;4;7M"
         );
     }
@@ -299,7 +292,13 @@ mod tests {
     #[test]
     fn left_release_encodes_button_0_m_lowercase() {
         assert_eq!(
-            mouse_event_to_sgr_bytes(MouseEventKind::Up(MouseButton::Left), 4, 7, KeyModifiers::NONE).unwrap(),
+            mouse_event_to_sgr_bytes(
+                MouseEventKind::Up(MouseButton::Left),
+                4,
+                7,
+                KeyModifiers::NONE
+            )
+            .unwrap(),
             b"\x1b[<0;4;7m"
         );
     }
@@ -307,15 +306,27 @@ mod tests {
     #[test]
     fn right_press_encodes_button_2() {
         assert_eq!(
-            mouse_event_to_sgr_bytes(MouseEventKind::Down(MouseButton::Right), 1, 1, KeyModifiers::NONE).unwrap(),
+            mouse_event_to_sgr_bytes(
+                MouseEventKind::Down(MouseButton::Right),
+                1,
+                1,
+                KeyModifiers::NONE
+            )
+            .unwrap(),
             b"\x1b[<2;1;1M"
         );
     }
 
     #[test]
     fn drag_returns_none() {
-        assert!(mouse_event_to_sgr_bytes(
-            MouseEventKind::Drag(MouseButton::Left), 1, 1, KeyModifiers::NONE
-        ).is_none());
+        assert!(
+            mouse_event_to_sgr_bytes(
+                MouseEventKind::Drag(MouseButton::Left),
+                1,
+                1,
+                KeyModifiers::NONE
+            )
+            .is_none()
+        );
     }
 }

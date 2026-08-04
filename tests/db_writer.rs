@@ -4,8 +4,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, params};
 use opencode_multiplexer::data::db::writer::DbWriter;
+use rusqlite::{Connection, params};
 
 fn temp_db_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -107,7 +107,10 @@ fn insert_user_message(conn: &Connection, id: &str, session_id: &str, text: &str
             format!("part_{id}"),
             session_id,
             id,
-            format!(r#"{{"type":"text","text":{}}}"#, serde_json::to_string(text).unwrap()),
+            format!(
+                r#"{{"type":"text","text":{}}}"#,
+                serde_json::to_string(text).unwrap()
+            ),
             t
         ],
     )
@@ -119,9 +122,7 @@ fn writer_enables_foreign_keys_on_open() {
     let db_path = temp_db_path("fk_pragma");
     let _ = init_db(&db_path);
     let writer = DbWriter::open(&db_path).unwrap();
-    let on: i64 = writer
-        .pragma_foreign_keys()
-        .expect("pragma query");
+    let on: i64 = writer.pragma_foreign_keys().expect("pragma query");
     assert_eq!(on, 1, "DbWriter must enable PRAGMA foreign_keys");
     fs::remove_file(db_path).ok();
 }
@@ -145,13 +146,21 @@ fn delete_session_removes_messages_and_parts() {
     drop(writer);
 
     let conn = Connection::open(&db_path).unwrap();
-    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0)).unwrap();
-    let messages: i64 = conn.query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0)).unwrap();
-    let parts: i64 = conn.query_row("SELECT COUNT(*) FROM part", [], |r| r.get(0)).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+        .unwrap();
+    let messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .unwrap();
+    let parts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM part", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(sessions, 1);
     assert_eq!(messages, 1);
     assert_eq!(parts, 1);
-    let remaining: String = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+    let remaining: String = conn
+        .query_row("SELECT id FROM session", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(remaining, "sess_a");
     fs::remove_file(db_path).ok();
 }
@@ -176,7 +185,8 @@ fn delete_also_removes_todo_rows() {
     conn.execute(
         "INSERT INTO todo (id, session_id, data) VALUES ('t1', 'sess', '{}')",
         [],
-    ).unwrap();
+    )
+    .unwrap();
     drop(conn);
 
     let live = std::collections::HashSet::new();
@@ -184,7 +194,9 @@ fn delete_also_removes_todo_rows() {
     writer.delete_sessions(&["sess".into()], &live).unwrap();
 
     let conn = Connection::open(&db_path).unwrap();
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM todo", [], |r| r.get(0)).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM todo", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 0);
     fs::remove_file(db_path).ok();
 }
@@ -194,12 +206,12 @@ fn delete_parent_removes_child_and_grandchild_sessions_and_their_messages() {
     let db_path = temp_db_path("delete_subtree");
     let conn = init_db(&db_path);
     insert_project(&conn, "proj", "/tmp/repo");
-    
+
     // parent -> child -> grand
     insert_session(&conn, "parent", "proj", None, "P", 1);
     insert_session(&conn, "child", "proj", Some("parent"), "C", 2);
     insert_session(&conn, "grand", "proj", Some("child"), "G", 3);
-    
+
     insert_user_message(&conn, "msg_p", "parent", "p", 1);
     insert_user_message(&conn, "msg_c", "child", "c", 2);
     insert_user_message(&conn, "msg_g", "grand", "g", 3);
@@ -212,14 +224,18 @@ fn delete_parent_removes_child_and_grandchild_sessions_and_their_messages() {
     let mut writer = DbWriter::open(&db_path).unwrap();
     let live = std::collections::HashSet::new();
     let result = writer.delete_sessions(&["parent".into()], &live).unwrap();
-    
+
     let mut deleted = result.deleted_session_ids;
     deleted.sort();
     assert_eq!(deleted, vec!["child", "grand", "parent"]);
 
     let conn = Connection::open(&db_path).unwrap();
-    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0)).unwrap();
-    let messages: i64 = conn.query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0)).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+        .unwrap();
+    let messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(sessions, 1); // only sibling
     assert_eq!(messages, 1); // only sibling's msg
     fs::remove_file(db_path).ok();
@@ -239,9 +255,13 @@ fn delete_child_only_leaves_parent() {
     writer.delete_sessions(&["child".into()], &live).unwrap();
 
     let conn = Connection::open(&db_path).unwrap();
-    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0)).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(sessions, 1);
-    let remaining: String = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+    let remaining: String = conn
+        .query_row("SELECT id FROM session", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(remaining, "parent");
     fs::remove_file(db_path).ok();
 }
@@ -257,17 +277,23 @@ fn bulk_delete_skips_live_sessions_deletes_others() {
 
     let mut live = std::collections::HashSet::new();
     live.insert("sess_live".into());
-    
+
     let mut writer = DbWriter::open(&db_path).unwrap();
-    let result = writer.delete_sessions(&["sess_live".into(), "sess_dead".into()], &live).unwrap();
-    
+    let result = writer
+        .delete_sessions(&["sess_live".into(), "sess_dead".into()], &live)
+        .unwrap();
+
     assert_eq!(result.deleted_session_ids, vec!["sess_dead"]);
     assert_eq!(result.skipped_live_ids, vec!["sess_live"]);
 
     let conn = Connection::open(&db_path).unwrap();
-    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0)).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(sessions, 1);
-    let remaining: String = conn.query_row("SELECT id FROM session", [], |r| r.get(0)).unwrap();
+    let remaining: String = conn
+        .query_row("SELECT id FROM session", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(remaining, "sess_live");
     fs::remove_file(db_path).ok();
 }
@@ -277,20 +303,23 @@ fn deleting_junk_session_removes_its_messages_from_history_query() {
     let db_path = temp_db_path("history_integration");
     let conn = init_db(&db_path);
     insert_project(&conn, "proj", "/tmp/repo");
-    
+
     insert_session(&conn, "sess1", "proj", None, "S1", 100);
     insert_session(&conn, "sess2", "proj", None, "S2", 200);
-    
+
     insert_user_message(&conn, "m1", "sess1", "review comments from A", 100);
     insert_user_message(&conn, "m2", "sess2", "hello world", 200);
     drop(conn);
 
     use opencode_multiplexer::data::db::reader::DbReader;
-    
+
     let reader = DbReader::open(&db_path).unwrap();
     let msgs = reader.get_all_user_messages().unwrap();
     assert_eq!(msgs.len(), 2);
-    assert!(msgs.iter().any(|m| m.text.contains("review comments from A")));
+    assert!(
+        msgs.iter()
+            .any(|m| m.text.contains("review comments from A"))
+    );
     drop(reader);
 
     let mut writer = DbWriter::open(&db_path).unwrap();
@@ -301,7 +330,11 @@ fn deleting_junk_session_removes_its_messages_from_history_query() {
     let reader = DbReader::open(&db_path).unwrap();
     let msgs = reader.get_all_user_messages().unwrap();
     assert_eq!(msgs.len(), 1);
-    assert!(!msgs.iter().any(|m| m.text.contains("review comments from A")));
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.text.contains("review comments from A"))
+    );
     assert_eq!(msgs[0].text, "hello world");
     fs::remove_file(db_path).ok();
 }
@@ -310,7 +343,7 @@ fn deleting_junk_session_removes_its_messages_from_history_query() {
 fn writer_sets_busy_timeout_on_open() {
     let db_path = temp_db_path("busy_timeout");
     let _ = init_db(&db_path);
-    
+
     let writer = DbWriter::open(&db_path).unwrap();
     let busy_timeout = writer.busy_timeout_ms().unwrap();
     assert!(
@@ -320,4 +353,3 @@ fn writer_sets_busy_timeout_on_open() {
 
     fs::remove_file(db_path).ok();
 }
-

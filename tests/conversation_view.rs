@@ -1,7 +1,7 @@
 use opencode_multiplexer::app::conversation::ConversationViewState;
 use opencode_multiplexer::data::db::models::{DbConversationMessage, DbConversationPart};
 use opencode_multiplexer::ui::conversation::{
-    self, body_assistant_color, body_user_color, GUTTER, REASONING_PREFIX, TOOL_INDENT,
+    self, GUTTER, REASONING_PREFIX, TOOL_INDENT, body_assistant_color, body_user_color,
 };
 use opencode_multiplexer::ui::diff::highlight_search_matches;
 use ratatui::style::{Color, Modifier};
@@ -61,7 +61,9 @@ fn first_fg(line: &Line<'_>) -> Option<Color> {
 
 #[allow(dead_code)]
 fn line_has_modifier(line: &Line<'_>, modifier: Modifier) -> bool {
-    line.spans.iter().any(|s| s.style.add_modifier.contains(modifier))
+    line.spans
+        .iter()
+        .any(|s| s.style.add_modifier.contains(modifier))
 }
 
 #[test]
@@ -98,8 +100,14 @@ fn multi_line_body_every_line_has_gutter() {
     let lines = conversation::build_document(&[m], 80);
     // Header, Line 1, Blank line (with gutter), Line 2, Separator (no gutter)
     let texts = flats(&lines);
-    assert!(texts.iter().any(|t| t == GUTTER), "Should have a line that is just a gutter: {texts:?}");
-    assert!(texts.iter().any(|t| t.is_empty()), "Should have a truly empty separator: {texts:?}");
+    assert!(
+        texts.iter().any(|t| t == GUTTER),
+        "Should have a line that is just a gutter: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.is_empty()),
+        "Should have a truly empty separator: {texts:?}"
+    );
 }
 
 #[test]
@@ -120,9 +128,10 @@ fn user_header_is_you_uppercase_with_dim_time() {
             && s.content.chars().any(|c| c.is_ascii_digit())
     });
     assert!(has_dim_time, "expected dim timestamp in header: {t:?}");
-    let role_bold = header.spans.iter().any(|s| {
-        s.content.contains("YOU") && s.style.add_modifier.contains(Modifier::BOLD)
-    });
+    let role_bold = header
+        .spans
+        .iter()
+        .any(|s| s.content.contains("YOU") && s.style.add_modifier.contains(Modifier::BOLD));
     assert!(role_bold);
 }
 
@@ -261,9 +270,11 @@ fn empty_reasoning_skipped() {
         ],
     );
     let texts = flats(&conversation::build_document(&[m], 80));
-    assert!(!texts
-        .iter()
-        .any(|t| t.contains(REASONING_PREFIX) && !t.contains("only")));
+    assert!(
+        !texts
+            .iter()
+            .any(|t| t.contains(REASONING_PREFIX) && !t.contains("only"))
+    );
     assert!(texts.iter().any(|t| t.contains("only answer")));
 }
 
@@ -302,7 +313,10 @@ fn user_and_assistant_bodies_use_distinct_role_cues() {
         .iter()
         .find(|l| flat(l).contains("ASST_ONLY_TOKEN"))
         .unwrap();
-    assert_eq!(user_line.spans[0].style.fg, Some(conversation::user_color()));
+    assert_eq!(
+        user_line.spans[0].style.fg,
+        Some(conversation::user_color())
+    );
     assert_eq!(
         asst_line.spans[0].style.fg,
         Some(conversation::assistant_color())
@@ -547,7 +561,10 @@ fn multiple_tools_in_a_row() {
 fn tool_without_tool_name_uses_fallback() {
     let mut p = tool_part("bash", "completed", Some("x"));
     p.tool = None;
-    let t = flats(&conversation::build_document(&[msg("assistant", vec![p])], 80));
+    let t = flats(&conversation::build_document(
+        &[msg("assistant", vec![p])],
+        80,
+    ));
     assert!(t.iter().any(|line| line.contains("tool")));
 }
 

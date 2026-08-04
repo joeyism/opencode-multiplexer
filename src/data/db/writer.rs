@@ -1,6 +1,6 @@
-use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
+use std::path::Path;
 
 pub struct DbWriter {
     conn: Connection,
@@ -23,7 +23,9 @@ impl DbWriter {
     }
 
     pub fn pragma_foreign_keys(&self) -> anyhow::Result<i64> {
-        Ok(self.conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?)
+        Ok(self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?)
     }
 
     /// Returns the busy_timeout in milliseconds. Used for tests and diagnostics.
@@ -90,8 +92,8 @@ impl DbWriter {
 
         {
             let id_list = format!("('{}')", sorted_ids.join("','"));
-            
-            // Whitelist of tables to clean up. 
+
+            // Whitelist of tables to clean up.
             let tables = [
                 "session_share",
                 "session_message",
@@ -110,16 +112,25 @@ impl DbWriter {
                     |r| r.get::<_, i64>(0).map(|n| n > 0),
                 )?;
                 if exists {
-                    tx.execute(&format!("DELETE FROM {} WHERE {} IN {}", 
-                        table, 
-                        if table == "session" { "id" } else { "session_id" },
-                        id_list), [])?;
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE {} IN {}",
+                            table,
+                            if table == "session" {
+                                "id"
+                            } else {
+                                "session_id"
+                            },
+                            id_list
+                        ),
+                        [],
+                    )?;
                 }
             }
         }
 
         tx.commit()?;
-        
+
         Ok(DeleteSessionsResult {
             deleted_session_ids: sorted_ids,
             skipped_live_ids,

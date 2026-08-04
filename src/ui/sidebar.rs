@@ -154,13 +154,7 @@ pub fn render_sidebar(
     let lines = rows
         .iter()
         .enumerate()
-        .map(|(index, row)| {
-            render_row(
-                row,
-                index == selected,
-                sidebar_width.saturating_sub(1),
-            )
-        })
+        .map(|(index, row)| render_row(row, index == selected, sidebar_width.saturating_sub(1)))
         .collect::<Vec<_>>();
 
     Paragraph::new(lines).block(
@@ -249,7 +243,7 @@ fn format_sidebar_parts(
         display_session_label(cwd, title)
     };
     let time_text = time.to_string();
-    
+
     let marker = if is_child {
         ""
     } else if has_children {
@@ -358,11 +352,7 @@ pub fn relative_time_from_updated(time_updated: Option<i64>) -> String {
     relative_time_label(age)
 }
 
-fn render_row(
-    row: &SidebarVisibleRow,
-    is_selected: bool,
-    sidebar_width: u16,
-) -> Line<'static> {
+fn render_row(row: &SidebarVisibleRow, is_selected: bool, sidebar_width: u16) -> Line<'static> {
     let (symbol, color) = match row.status {
         SessionStatus::Working => ("●", Color::Green),
         SessionStatus::SubagentsWorking => ("●", Color::Cyan),
