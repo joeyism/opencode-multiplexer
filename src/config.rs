@@ -38,6 +38,7 @@ pub struct Keybindings {
     pub files: char,
     pub diff: char,
     pub history: char,
+    pub sessions: char,
 }
 
 impl Default for Keybindings {
@@ -54,6 +55,7 @@ impl Default for Keybindings {
             files: 'f',
             diff: 'd',
             history: 'h',
+            sessions: 's',
         }
     }
 }
@@ -79,6 +81,7 @@ struct PartialKeybindings {
     files: Option<String>,
     diff: Option<String>,
     history: Option<String>,
+    sessions: Option<String>,
 }
 
 pub fn load_config() -> anyhow::Result<AppConfig> {
@@ -111,6 +114,7 @@ pub fn load_config_from_path(path: &Path) -> anyhow::Result<AppConfig> {
         apply_keybinding(&mut config.keybindings.files, bindings.files);
         apply_keybinding(&mut config.keybindings.diff, bindings.diff);
         apply_keybinding(&mut config.keybindings.history, bindings.history);
+        apply_keybinding(&mut config.keybindings.sessions, bindings.sessions);
     }
     if let Some(notifications) = partial.notifications {
         config.notifications = notifications;

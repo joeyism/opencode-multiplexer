@@ -231,6 +231,15 @@ impl PtyManager {
         self.sessions.active_id()
     }
 
+    pub fn active_session_id(&self) -> Option<String> {
+        let id = self.sessions.active_id()?;
+        self.sessions
+            .items()
+            .iter()
+            .find(|session| session.id == id)
+            .and_then(|session| session.session_id.clone())
+    }
+
     pub fn selected_id(&self) -> Option<u64> {
         self.sessions.selected_id()
     }
@@ -261,6 +270,10 @@ impl PtyManager {
 
     pub fn select_top_level(&mut self, id: u64) {
         self.sessions.select_id(id);
+    }
+
+    pub fn detach_active(&mut self) {
+        self.sessions.deactivate();
     }
 
     pub fn activate_selected(&mut self) {

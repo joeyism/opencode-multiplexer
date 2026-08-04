@@ -4,5 +4,6 @@ pub mod hints;
 pub mod layout;
 pub mod message_picker;
 pub mod root;
+pub mod session_manager;
 pub mod session_picker;
 pub mod sidebar;

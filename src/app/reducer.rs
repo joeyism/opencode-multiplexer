@@ -25,9 +25,6 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ToggleHelp => {
             state.show_help = !state.show_help;
         }
-        Action::ToggleSidebarCollapse => {
-            state.sidebar_collapsed = !state.sidebar_collapsed;
-        }
         Action::SelectNextRow => {
             state.selected_sidebar_row = state.selected_sidebar_row.saturating_add(1);
         }

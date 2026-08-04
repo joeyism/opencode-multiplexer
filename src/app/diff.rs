@@ -436,6 +436,9 @@ impl DiffViewState {
     /// Scroll so the current match is visible in the viewport.
     fn scroll_to_current_match(&mut self, viewport_height: usize) {
         if let Some(&(line_idx, _, _)) = self.match_positions.get(self.current_match) {
+            // Task 1: Cursor follows search matches.
+            self.cursor = line_idx;
+
             let max_scroll = self.document.len().saturating_sub(viewport_height);
             if line_idx < self.scroll {
                 // Match is above viewport — scroll up to show it.
@@ -505,12 +508,15 @@ mod tests {
 
         assert_eq!(state.match_positions.len(), 2);
         assert_eq!(state.current_match, 0);
+        assert_eq!(state.cursor(), 0);
 
         state.next_match(100);
         assert_eq!(state.current_match, 1);
+        assert_eq!(state.cursor(), 2);
 
         state.next_match(100);
         assert_eq!(state.current_match, 0); // wrapped
+        assert_eq!(state.cursor(), 0);
     }
 
     #[test]
@@ -569,6 +575,228 @@ mod tests {
         // Scroll should have moved to make line 50 visible.
         assert!(state.scroll <= 50);
         assert!(state.scroll + 20 > 50);
+
+        // Task 1: Cursor must also move to the match line.
+        assert_eq!(state.cursor(), 50);
+    }
+
+    #[test]
+    fn search_moves_cursor_to_match_line() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "ccc target", "ddd"]);
+        state.cursor = 0;
+        state.scroll = 0;
+
+        state.start_search();
+        for ch in "target".chars() {
+            state.search_insert(ch, 100);
+        }
+
+        assert_eq!(state.cursor(), 2);
+        assert_eq!(state.match_positions.len(), 1);
+    }
+
+    #[test]
+    fn search_moves_cursor_even_when_match_already_visible() {
+        // Pitfall: old code only scrolled when match was off-screen.
+        // Cursor must still jump to the match line.
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "ccc target", "ddd", "eee"]);
+        state.cursor = 0;
+        state.scroll = 0;
+
+        state.start_search();
+        for ch in "target".chars() {
+            state.search_insert(ch, 10); // vp large enough that line 2 is already visible
+        }
+
+        assert_eq!(state.scroll_offset(), 0); // still no scroll needed
+        assert_eq!(state.cursor(), 2); // but cursor must move
+    }
+
+    #[test]
+    fn search_no_matches_leaves_cursor_unchanged() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "ccc"]);
+        state.cursor = 1;
+        state.scroll = 0;
+
+        state.start_search();
+        for ch in "zzz".chars() {
+            state.search_insert(ch, 100);
+        }
+
+        assert!(state.match_positions.is_empty());
+        assert_eq!(state.cursor(), 1);
+    }
+
+    #[test]
+    fn next_match_moves_cursor_to_match_line() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "aaa", "ccc", "aaa"]);
+        state.cursor = 0;
+
+        state.start_search();
+        for ch in "aaa".chars() {
+            state.search_insert(ch, 100);
+        }
+        state.confirm_search();
+
+        assert_eq!(state.cursor(), 0); // first match
+        state.next_match(100);
+        assert_eq!(state.cursor(), 2);
+        state.next_match(100);
+        assert_eq!(state.cursor(), 4);
+    }
+
+    #[test]
+    fn next_match_wrap_moves_cursor_to_first_match() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "aaa"]);
+        state.start_search();
+        for ch in "aaa".chars() {
+            state.search_insert(ch, 100);
+        }
+        state.confirm_search();
+        state.next_match(100); // -> index 1, line 2
+        assert_eq!(state.cursor(), 2);
+        state.next_match(100); // wrap -> index 0, line 0
+        assert_eq!(state.cursor(), 0);
+        assert_eq!(state.current_match_index(), 0);
+    }
+
+    #[test]
+    fn prev_match_wrap_moves_cursor_to_last_match() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb", "aaa"]);
+        state.start_search();
+        for ch in "aaa".chars() {
+            state.search_insert(ch, 100);
+        }
+        state.confirm_search();
+        assert_eq!(state.cursor(), 0);
+        state.prev_match(100); // wrap to last
+        assert_eq!(state.cursor(), 2);
+        assert_eq!(state.current_match_index(), 1);
+    }
+
+    #[test]
+    fn next_match_with_no_matches_is_noop_for_cursor() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["aaa", "bbb"]);
+        state.cursor = 1;
+        state.next_match(100);
+        assert_eq!(state.cursor(), 1);
+    }
+
+    #[test]
+    fn multiple_matches_on_same_line_keep_cursor_on_that_line() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["xx xx xx", "other"]);
+        state.start_search();
+        for ch in "xx".chars() {
+            state.search_insert(ch, 100);
+        }
+        state.confirm_search();
+        assert_eq!(state.match_positions.len(), 3);
+        assert_eq!(state.cursor(), 0);
+        state.next_match(100);
+        assert_eq!(state.cursor(), 0); // still line 0
+        assert_eq!(state.current_match_index(), 1);
+        state.next_match(100);
+        assert_eq!(state.cursor(), 0);
+        assert_eq!(state.current_match_index(), 2);
+    }
+
+    #[test]
+    fn search_then_visual_anchors_on_match_line() {
+        // End-to-end of the user-visible bug: search, then v, selection starts at match.
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["a", "b", "target here", "d"]);
+        let meta = vec![
+            Some(crate::app::diff::LineMeta {
+                filepath: "f.rs".into(),
+                new_line_no: Some(1),
+                old_line_no: None,
+            }),
+            Some(crate::app::diff::LineMeta {
+                filepath: "f.rs".into(),
+                new_line_no: Some(2),
+                old_line_no: None,
+            }),
+            Some(crate::app::diff::LineMeta {
+                filepath: "f.rs".into(),
+                new_line_no: Some(3),
+                old_line_no: None,
+            }),
+            Some(crate::app::diff::LineMeta {
+                filepath: "f.rs".into(),
+                new_line_no: Some(4),
+                old_line_no: None,
+            }),
+        ];
+        // Use replace_document path for metadata + cursor clamp consistency
+        state.replace_document(make_document(&["a", "b", "target here", "d"]), meta, 100);
+        state.cursor = 0;
+
+        state.start_search();
+        for ch in "target".chars() {
+            state.search_insert(ch, 100);
+        }
+        state.confirm_search();
+        assert_eq!(state.cursor(), 2);
+
+        state.toggle_visual();
+        assert_eq!(state.selection_range(), Some((2, 2)));
+        assert_eq!(state.format_selection(), Some("f.rs:3".to_string()));
+    }
+
+    #[test]
+    fn search_offscreen_match_moves_cursor_and_scroll() {
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        let mut texts: Vec<&str> = vec!["nope"; 50];
+        texts.push("found it");
+        texts.extend(vec!["nope"; 49]);
+        state.document = make_document(&texts);
+        state.cursor = 0;
+        state.scroll = 0;
+
+        state.start_search();
+        for ch in "found".chars() {
+            state.search_insert(ch, 20);
+        }
+
+        assert_eq!(state.cursor(), 50);
+        assert!(state.scroll_offset() <= 50);
+        assert!(state.scroll_offset() + 20 > 50);
+    }
+
+    #[test]
+    fn cancel_search_does_not_reset_cursor() {
+        // After finding a match, Esc clears query but leaves you on that line.
+        let mut state = DiffViewState::default();
+        state.session_id = Some("test".into());
+        state.document = make_document(&["a", "target", "c"]);
+        state.cursor = 0;
+        state.start_search();
+        for ch in "target".chars() {
+            state.search_insert(ch, 100);
+        }
+        assert_eq!(state.cursor(), 1);
+        state.cancel_search();
+        assert_eq!(state.cursor(), 1);
+        assert!(!state.is_searching());
+        assert!(state.search_query().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -770,5 +998,129 @@ mod tests_scroll_view {
         );
         assert_eq!(state.scroll, 0);
         assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn scroll_view_down_does_not_move_cursor_while_still_visible() {
+        // Viewport-led: cursor stays put if it remains on-screen.
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 2, // visible in vp=5 at scroll=0 (lines 0..4)
+            scroll: 0,
+            ..Default::default()
+        };
+        state.scroll_view_down(1, 5);
+        assert_eq!(state.scroll_offset(), 1);
+        assert_eq!(state.cursor(), 2); // still visible (visible 1..5)
+    }
+
+    #[test]
+    fn scroll_view_up_does_not_move_cursor_while_still_visible() {
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 5,
+            scroll: 3, // visible 3..7, cursor 5 on-screen
+            ..Default::default()
+        };
+        state.scroll_view_up(1, 5);
+        assert_eq!(state.scroll_offset(), 2);
+        assert_eq!(state.cursor(), 5); // still visible (visible 2..6)
+    }
+
+    #[test]
+    fn scroll_view_down_clamps_cursor_when_leaving_top() {
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 0,
+            scroll: 0,
+            ..Default::default()
+        };
+        state.scroll_view_down(3, 5);
+        assert_eq!(state.scroll_offset(), 3);
+        assert_eq!(state.cursor(), 3); // dragged down to top of viewport
+    }
+
+    #[test]
+    fn scroll_view_up_clamps_cursor_when_leaving_bottom() {
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 9,
+            scroll: 5, // visible 5..9
+            ..Default::default()
+        };
+        state.scroll_view_up(2, 5);
+        // scroll=3, visible 3..7 → cursor 9 off bottom → clamp to 7
+        assert_eq!(state.scroll_offset(), 3);
+        assert_eq!(state.cursor(), 7);
+    }
+
+    #[test]
+    fn scroll_view_down_at_end_is_stable() {
+        let mut state = DiffViewState {
+            document: make_document(&["1", "2", "3", "4", "5"]),
+            cursor: 4,
+            scroll: 0,
+            ..Default::default()
+        };
+        // max_scroll for len=5, vp=5 is 0
+        state.scroll_view_down(10, 5);
+        assert_eq!(state.scroll_offset(), 0);
+        assert_eq!(state.cursor(), 4);
+    }
+
+    #[test]
+    fn scroll_view_up_at_top_is_stable() {
+        let mut state = DiffViewState {
+            document: make_document(&["1", "2", "3", "4", "5"]),
+            cursor: 0,
+            scroll: 0,
+            ..Default::default()
+        };
+        state.scroll_view_up(10, 5);
+        assert_eq!(state.scroll_offset(), 0);
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn scroll_view_during_visual_updates_selection_when_clamped() {
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 0,
+            scroll: 0,
+            ..Default::default()
+        };
+        state.toggle_visual(); // anchor = 0
+        state.scroll_view_down(3, 5); // cursor clamps to 3
+        assert_eq!(state.cursor(), 3);
+        assert_eq!(state.selection_range(), Some((0, 3)));
+    }
+
+    #[test]
+    fn pure_scroll_up_does_not_clamp_cursor() {
+        // Documents the OLD mouse API pitfall: scroll_up leaves cursor off-screen.
+        // After Fix B mouse must not call this. Keep the method behavior explicit.
+        let mut state = DiffViewState {
+            document: make_document(&[
+                "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            ]),
+            cursor: 0,
+            scroll: 0,
+            ..Default::default()
+        };
+        state.scroll_down(3, 5);
+        assert_eq!(state.scroll_offset(), 3);
+        assert_eq!(state.cursor(), 0); // intentionally stale — do not "fix" this API
+        // cursor is off-screen: visible window is [3, 8)
+        assert!(state.cursor() < state.scroll_offset());
     }
 }

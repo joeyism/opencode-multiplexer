@@ -195,6 +195,7 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
             source,
             Some(cwd.clone()),
             title_fallback,
+            Some(process.start_time),
         )? {
             sessions.push(info);
         }
@@ -225,6 +226,7 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
             None,
             DiscoverySource::TuiExplicit,
             Some(proj.worktree.clone()),
+            None,
             None,
         )
         .ok()
@@ -288,7 +290,7 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
                 continue;
             }
             let status = reader
-                .get_session_status(&serve_session_id)
+                .get_session_status(&serve_session_id, Some(serve_process.start_time))
                 .unwrap_or(crate::app::sessions::SessionStatus::Idle);
             seen.insert(serve_session_id.clone());
             let cwd = if session.directory.as_os_str().is_empty() {
@@ -319,7 +321,13 @@ pub fn poll_full() -> anyhow::Result<PollSnapshot> {
                 has_children: reader
                     .has_child_sessions(&serve_session_id)
                     .unwrap_or(false),
-                children: collect_children(&reader, &serve_session_id, 2).unwrap_or_default(),
+                children: collect_children(
+                    &reader,
+                    &serve_session_id,
+                    2,
+                    Some(serve_process.start_time),
+                )
+                .unwrap_or_default(),
                 serve_port: Some(serve_process.port),
                 source: DiscoverySource::Serve,
             });
@@ -376,6 +384,7 @@ fn collect_children(
     reader: &DbReader,
     parent_id: &str,
     max_depth: usize,
+    process_start_time: Option<i64>,
 ) -> anyhow::Result<Vec<ChildSessionInfo>> {
     if max_depth == 0 {
         return Ok(vec![]);
@@ -384,10 +393,10 @@ fn collect_children(
     children
         .into_iter()
         .map(|child| {
-            let status = reader.get_session_status(&child.id)?;
+            let status = reader.get_session_status(&child.id, process_start_time)?;
             let has_children = reader.has_child_sessions(&child.id)?;
             let nested = if has_children {
-                collect_children(reader, &child.id, max_depth - 1)?
+                collect_children(reader, &child.id, max_depth - 1, process_start_time)?
             } else {
                 vec![]
             };
@@ -462,6 +471,7 @@ fn chrono_like_epoch(value: &str) -> Option<u64> {
 /// Returns `Ok(None)` if the session doesn't exist.
 /// If the session's directory is empty, uses `cwd_fallback` if provided.
 /// If the session's title is empty, uses `title_fallback` if provided.
+#[allow(clippy::too_many_arguments)]
 fn hydrate_session(
     reader: &DbReader,
     session_id: &str,
@@ -470,6 +480,7 @@ fn hydrate_session(
     source: DiscoverySource,
     cwd_fallback: Option<PathBuf>,
     title_fallback: Option<String>,
+    process_start_time: Option<i64>,
 ) -> anyhow::Result<Option<DiscoveredSessionInfo>> {
     let Some(session) = reader.get_session_by_id(session_id)? else {
         return Ok(None);
@@ -487,7 +498,7 @@ fn hydrate_session(
     } else {
         session.title.clone()
     };
-    let status = reader.get_session_status(session_id)?;
+    let status = reader.get_session_status(session_id, process_start_time)?;
     Ok(Some(DiscoveredSessionInfo {
         session_id: session_id.to_string(),
         cwd,
@@ -498,7 +509,7 @@ fn hydrate_session(
         preview: reader.get_last_message_preview(session_id)?.map(|p| p.text),
         time_updated: Some(session.time_updated),
         has_children: reader.has_child_sessions(session_id)?,
-        children: collect_children(reader, session_id, 2)?,
+        children: collect_children(reader, session_id, 2, process_start_time)?,
         serve_port,
         source,
     }))
@@ -590,6 +601,7 @@ mod tests {
             DiscoverySource::Serve,
             None,
             None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -613,6 +625,7 @@ mod tests {
             None,
             None,
             DiscoverySource::Serve,
+            None,
             None,
             None,
         )
@@ -642,6 +655,7 @@ mod tests {
             None,
             None,
             DiscoverySource::Serve,
+            None,
             None,
             None,
         )
@@ -931,3 +945,4 @@ mod tests {
         assert_eq!(cached_session.source, DiscoverySource::Serve);
     }
 }
+// test

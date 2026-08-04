@@ -9,7 +9,8 @@ use ratatui::{
 use crate::{
     app::{
         conversation::ConversationViewState, diff::DiffViewState, focus::AppFocus,
-        message_picker::MessagePickerState, session_picker::SessionPickerState,
+        message_picker::MessagePickerState, session_manager::SessionManagerState,
+        session_picker::SessionPickerState,
     },
     config::Keybindings,
     terminal::{manager::PtyManager, renderer::TerminalWidget, selection::SelectionRange},
@@ -19,6 +20,7 @@ use crate::{
         hints::footer_line,
         layout::{centered_rect, split_root, terminal_inner_rect},
         message_picker::render_message_picker,
+        session_manager::render_session_manager,
         session_picker::render_session_picker,
         sidebar::{SidebarVisibleRow, render_sidebar, repo_root_name},
     },
@@ -36,12 +38,12 @@ pub fn render(
     show_help: bool,
     show_files: &[String],
     sidebar_width: u16,
-    sidebar_collapsed: bool,
     panel_hidden: bool,
     app_focused: bool,
     conversation: &ConversationViewState,
     diff: &DiffViewState,
     session_picker: Option<&mut SessionPickerState>,
+    session_manager: Option<&mut SessionManagerState>,
     message_picker: Option<&mut MessagePickerState>,
     confirm_quit: bool,
     terminal_selection: Option<SelectionRange>,
@@ -53,7 +55,6 @@ pub fn render(
                 rows,
                 selected,
                 focus,
-                sidebar_collapsed,
                 sidebar_width,
                 app_focused,
             ),
@@ -335,7 +336,7 @@ pub fn render(
 
     if show_help {
         let help = Paragraph::new(format!(
-            "{} focus\n{} / {} move\nEnter attach/open\n{} view\n{} files\n{} diff\n{} spawn\n{} worktree\n{} kill\n{} help\n{} quit",
+            "{} focus\n{} / {} move\nEnter attach/open\n{} view\n{} files\n{} diff\n{} spawn\n{} worktree\n/ attach\n{} manage\n{} history\n{} kill\n{} help\n{} quit",
             "Ctrl-\\",
             keys.down,
             keys.up,
@@ -344,6 +345,8 @@ pub fn render(
             keys.diff,
             keys.spawn,
             keys.worktree,
+            keys.sessions,
+            keys.history,
             keys.kill,
             keys.help,
             keys.quit,
@@ -363,7 +366,11 @@ pub fn render(
         frame.render_widget(files_widget, popup);
     }
 
-    if let Some(picker) = session_picker {
+    if let Some(manager) = session_manager {
+        let popup = centered_rect(frame.area(), 85, 80);
+        frame.render_widget(Clear, popup);
+        render_session_manager(frame, manager, popup);
+    } else if let Some(picker) = session_picker {
         let popup = centered_rect(frame.area(), 80, 70);
         frame.render_widget(Clear, popup);
         render_session_picker(frame, picker, popup);

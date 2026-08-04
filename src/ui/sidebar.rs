@@ -131,7 +131,6 @@ pub fn render_sidebar(
     rows: &[SidebarVisibleRow],
     selected: usize,
     focus: AppFocus,
-    collapsed: bool,
     sidebar_width: u16,
     app_focused: bool,
 ) -> Paragraph<'static> {
@@ -159,7 +158,6 @@ pub fn render_sidebar(
             render_row(
                 row,
                 index == selected,
-                collapsed,
                 sidebar_width.saturating_sub(1),
             )
         })
@@ -189,13 +187,8 @@ pub fn sidebar_row_modifier() -> Modifier {
     Modifier::empty()
 }
 
-pub fn display_session_label(cwd: &Path, title: &str, collapsed: bool) -> String {
+pub fn display_session_label(cwd: &Path, title: &str) -> String {
     let repo = repo_root_name(cwd);
-    if collapsed {
-        let repo_tag: String = repo.chars().take(2).collect();
-        let prefix: String = title.chars().take(5).collect();
-        return format!("{repo_tag}·{prefix}…");
-    }
     let repo_prefix: String = repo.chars().take(3).collect();
     format!("{repo_prefix}/{title} ")
 }
@@ -216,7 +209,6 @@ pub fn relative_time_label(age_secs: u64) -> String {
 pub fn format_sidebar_text(
     cwd: &Path,
     title: &str,
-    collapsed: bool,
     time: &str,
     sidebar_width: u16,
     depth: usize,
@@ -228,7 +220,6 @@ pub fn format_sidebar_text(
     let (left, right) = format_sidebar_parts(
         cwd,
         title,
-        collapsed,
         time,
         sidebar_width,
         depth,
@@ -244,7 +235,6 @@ pub fn format_sidebar_text(
 fn format_sidebar_parts(
     cwd: &Path,
     title: &str,
-    collapsed: bool,
     time: &str,
     sidebar_width: u16,
     depth: usize,
@@ -256,19 +246,10 @@ fn format_sidebar_parts(
     let label = if is_child {
         title.to_string()
     } else {
-        display_session_label(cwd, title, collapsed)
+        display_session_label(cwd, title)
     };
     let time_text = time.to_string();
-    if collapsed {
-        let content_width = sidebar_width.saturating_sub(3); // 2 dot span + 1 border
-        let left_width = content_width.saturating_sub(time_text.chars().count() as u16) as usize;
-        let padded = format!(
-            "{:<width$}",
-            truncate_label(&label, left_width),
-            width = left_width
-        );
-        return (padded, time_text);
-    }
+    
     let marker = if is_child {
         ""
     } else if has_children {
@@ -380,7 +361,6 @@ pub fn relative_time_from_updated(time_updated: Option<i64>) -> String {
 fn render_row(
     row: &SidebarVisibleRow,
     is_selected: bool,
-    collapsed: bool,
     sidebar_width: u16,
 ) -> Line<'static> {
     let (symbol, color) = match row.status {
@@ -395,7 +375,6 @@ fn render_row(
     let (left, right) = format_sidebar_parts(
         &row.cwd,
         &row.title,
-        collapsed,
         &time,
         sidebar_width,
         row.depth,

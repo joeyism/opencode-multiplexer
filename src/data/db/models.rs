@@ -61,3 +61,13 @@ pub struct DbUserMessage {
     pub time_created: i64,
     pub text: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbManagedSession {
+    pub id: String,
+    pub title: String,
+    pub directory: PathBuf,
+    pub worktree: PathBuf,
+    pub user_message_count: i64,
+    pub time_updated: i64,
+}

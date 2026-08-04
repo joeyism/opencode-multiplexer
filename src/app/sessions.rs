@@ -180,6 +180,10 @@ impl SessionList {
         self.active_id = self.selected_id();
     }
 
+    pub fn deactivate(&mut self) {
+        self.active_id = None;
+    }
+
     pub fn select_last(&mut self) {
         if !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;

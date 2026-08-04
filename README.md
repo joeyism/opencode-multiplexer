@@ -76,7 +76,7 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 - Press `Enter` to attach to a top-level session
 - Press `Tab` to expand/collapse child sessions
 - Press `v` to open a read-only conversation view (see below)
-- Press `s` to collapse the sidebar for more screen space
+- Press `s` to open the session manager
 - Click a sidebar row to select it
 
 ## Keybindings
@@ -89,7 +89,7 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 | `k` / `Up`   | Move up               |
 | `Enter`  | Attach to session        |
 | `Tab`    | Expand/collapse children |
-| `s`      | Toggle sidebar collapse  |
+| `s`      | Open session manager     |
 | `Ctrl-h` | Hide/show sidebar panel  |
 | `/`      | Open session picker     |
 | `r`      | Refresh active session   |
@@ -109,6 +109,7 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 | `!` | Drop into shell in session directory   |
 | `c` | Commit/push modified files            |
 | `h` | Open message history picker           |
+| `s` | Open session manager (delete junk)    |
 | `x` | Kill session (`y` confirm, `n`/`Esc` cancel) |
 
 ### Session picker
@@ -124,6 +125,25 @@ Press `/` to search and attach to any opencode session. The picker uses **fuzzy 
 | `Esc`    | Cancel picker            |
 
 The footer shows `matched/total` counts. Results are sorted by live status first, then fuzzy match score, then recency.
+
+### Session manager
+
+Press `s` to manage your opencode sessions and delete junk that pollutes your message history. You can fuzzy search, select multiple sessions, and hard-delete them (cascading to all their messages, parts, and subagent children).
+
+| Key      | Action                    |
+|----------|---------------------------|
+| `↑` / `↓` | Move through list       |
+| `Tab`    | Toggle selection         |
+| `Ctrl-a` | Select all matched       |
+| `Ctrl-u` | Clear selection          |
+| `Ctrl-d` | Delete selected (or current) |
+| `y`      | Confirm hard-delete      |
+| `Backspace` | Delete last character |
+| any key  | Filter by fuzzy match     |
+| `Esc`    | Cancel / close           |
+
+> [!WARNING]
+> Deletion is permanent and writes directly to the OpenCode database. It is recommended to back up `~/.local/share/opencode/opencode.db` before bulk cleanup.
 
 ### Message history picker
 
@@ -142,6 +162,8 @@ The footer shows `matched/total` counts. Results are sorted by fuzzy match score
 ### Conversation view
 
 Press `v` from the sidebar to open a read-only view of the session's conversation history. The view polls the opencode database every second and renders messages, markdown, syntax-highlighted code blocks, and tool call status.
+
+Turns are visually separated with a role-colored left gutter (`│`). User turns use cyan (`YOU`); assistant turns use green (agent name). Reasoning is dim italic; tool calls are indented and muted under the gutter.
 
 | Key      | Action                    |
 |----------|---------------------------|
@@ -169,7 +191,7 @@ Mouse scroll is supported.
 
 Press `d` from the sidebar to open a read-only view of the session's git diff. The view shows both tracked and untracked changes, preferring the opencode serve API when available and falling back to `git diff` otherwise.
 
-The diff view uses a **cursor-based** navigation model (distinct from the scroll-based conversation view). The cursor determines the position for visual selection.
+The diff view uses a **cursor-based** navigation model (distinct from the scroll-based conversation view). The cursor determines the position for visual selection. Searching (`/`, `n`, `N`) moves the cursor to the match line, and mouse scrolling keeps the cursor within the visible viewport.
 
 | Key      | Action                    |
 |----------|---------------------------|
@@ -187,9 +209,9 @@ The diff view uses a **cursor-based** navigation model (distinct from the scroll
 | `Esc`    | Cancel selection / close  |
 | `q` / `d`| Close view                |
 
-**Search:** Case-insensitive, incremental. The search bar shows current/total matches. The `/` key is disabled while visual mode is active — cancel visual mode first to search.
+**Search:** Case-insensitive, incremental. The search bar shows current/total matches. Jumping to matches moves the cursor to the match line. The `/` key is disabled while visual mode is active — cancel visual mode first to search.
 
-Mouse scroll is supported.
+Mouse scroll is supported and keeps the cursor within the viewport (same behavior as `Ctrl-y` / `Ctrl-e`).
 
 ### Visual mode
 <p align="center" width="100%">
@@ -224,18 +246,20 @@ This works on **top-level sessions only** — child sessions do not support shel
 <video src="https://github.com/user-attachments/assets/2b2b4c2e-0739-4009-99bb-62e9de0d67f7" width="80%" controls></video>
 </p>
 
-The sidebar has three states:
+The sidebar has two states:
+
+### Sidebar and Panel
+
+The sidebar shows your active and discovered opencode sessions. You can hide the panel entirely for more terminal space.
 
 | State | Key | Behavior |
 |-------|-----|----------|
-| Expanded | (default) | Full-width sidebar showing session tree, title, and status |
-| Collapsed | `s` | Sidebar shrinks to a narrow width (12 columns), showing only session names |
+| Visible | (default) | Full-width sidebar showing session tree, title, and status |
 | Hidden | `Ctrl-h` | Sidebar disappears entirely for maximum terminal space |
 
-- Toggle between expanded and collapsed with `s`
 - Toggle hidden with `Ctrl-h`
 - When the sidebar is hidden, `Ctrl-4` (focus toggle) will first unhide it before switching focus
-- The sidebar width when expanded is configurable via `sidebar_width` in config (default: 30)
+- The sidebar width is configurable via `sidebar_width` in config (default: 30)
 
 ## Advanced workflows
 
@@ -257,7 +281,7 @@ The sidebar has three states:
 
 **Notifications** — When `notifications: true` in config, ocmux sends desktop alerts on specific session transitions: `Working → Idle`, `Working → NeedsInput`, `Working → Error`. Each session has a 5-second cooldown between notifications. On macOS, `notify-rust` is used (which respects Do Not Disturb / Focus modes). On Linux, `notify-send` is used as a fallback. Notifications are suppressed while ocmux is the focused window.
 
-**Terminal features** — ocmux supports bracketed paste (safe paste of multi-line content), full special-key forwarding (arrows, Home, End, PageUp, PageDown, F-keys, etc.), and proper terminal resize on window changes.
+**Terminal features** — ocmux supports bracketed paste (safe paste of multi-line content), full special-key forwarding (arrows, Home, End, PageUp, PageDown, F-keys, etc.), and proper terminal resize on window changes. Mouse wheel scroll and clicks are forwarded to the active terminal session (SGR), while diff and conversation views scroll locally. Left-drag still selects text for clipboard copy; a click without drag is delivered to the app.
 
 ## Configuration
 
@@ -293,12 +317,13 @@ Keybinding values are single characters. Default `sidebar_width` is `30`. Only t
 ## Notes
 
 - `Ctrl-4` is the actual focus toggle binding (hold `Ctrl` and press `4`)
-- `s` collapses the sidebar to a narrow width; `Ctrl-h` hides it entirely for maximum terminal space
+- `s` opens the session manager; `Ctrl-h` hides the sidebar entirely for maximum terminal space
 - `q` prompts for confirmation before quitting (`y` confirm, `n`/`Esc` cancel)
 - Child sessions are expandable and selectable in the sidebar, but `Enter` attach is not yet supported for child rows — use `v` to view their conversation instead
 - `c` and `!` operate on top-level sessions only
 - `r` refreshes the currently active session's PTY, not the selected sidebar row
 - Killing a managed session (`x`) also terminates its associated opencode serve daemon
+- Deleting a session via the session manager (`s`) is permanent and hard-removes all associated messages and parts from the database
 
 ## License
 

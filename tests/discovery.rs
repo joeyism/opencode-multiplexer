@@ -15,6 +15,7 @@ fn parses_bare_opencode_process() {
         ParsedProcess {
             pid: 12345,
             session_id: None,
+            start_time: 0,
         }
     );
 }
@@ -84,6 +85,7 @@ fn parses_opencode_serve_process_with_port() {
         ParsedServeProcess {
             pid: 12345,
             port: 4096,
+            start_time: 0,
         }
     );
 }
@@ -101,14 +103,17 @@ fn find_orphaned_serve_pids_returns_pids_not_in_registry() {
         ParsedServeProcess {
             pid: 100,
             port: 4200,
+            start_time: 0,
         },
         ParsedServeProcess {
             pid: 200,
             port: 4201,
+            start_time: 0,
         },
         ParsedServeProcess {
             pid: 300,
             port: 4202,
+            start_time: 0,
         },
     ];
 
@@ -139,6 +144,7 @@ fn find_orphaned_serve_pids_empty_when_all_registered() {
     let serve_processes = vec![ParsedServeProcess {
         pid: 100,
         port: 4200,
+        start_time: 0,
     }];
     let registry = vec![ServeEntry {
         port: 4200,
@@ -159,10 +165,12 @@ fn find_orphaned_serve_pids_all_orphaned_when_registry_empty() {
         ParsedServeProcess {
             pid: 100,
             port: 4200,
+            start_time: 0,
         },
         ParsedServeProcess {
             pid: 200,
             port: 4201,
+            start_time: 0,
         },
     ];
     let registry: Vec<ServeEntry> = vec![];

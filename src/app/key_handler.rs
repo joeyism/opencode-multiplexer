@@ -482,6 +482,87 @@ mod tests {
         handle_diff_key(ctrl('e'), &mut diff, &default_keys(), 20);
         assert!(diff.scroll_offset() > scroll_before);
     }
+
+    #[test]
+    fn diff_search_typing_moves_cursor_via_key_handler() {
+        let mut diff = diff_with_doc(&["alpha", "beta target", "gamma"]);
+        assert_eq!(diff.cursor(), 0);
+        handle_diff_key(key(KeyCode::Char('/')), &mut diff, &default_keys(), 100);
+        for ch in "target".chars() {
+            handle_diff_key(key(KeyCode::Char(ch)), &mut diff, &default_keys(), 100);
+        }
+        assert_eq!(diff.cursor(), 1);
+        handle_diff_key(key(KeyCode::Enter), &mut diff, &default_keys(), 100);
+        assert!(!diff.is_searching());
+        assert_eq!(diff.cursor(), 1);
+    }
+
+    #[test]
+    fn diff_n_moves_cursor_to_next_match() {
+        let mut diff = diff_with_doc(&["aaa", "bbb", "aaa"]);
+        handle_diff_key(key(KeyCode::Char('/')), &mut diff, &default_keys(), 100);
+        for ch in "aaa".chars() {
+            handle_diff_key(key(KeyCode::Char(ch)), &mut diff, &default_keys(), 100);
+        }
+        handle_diff_key(key(KeyCode::Enter), &mut diff, &default_keys(), 100);
+        assert_eq!(diff.cursor(), 0);
+        handle_diff_key(key(KeyCode::Char('n')), &mut diff, &default_keys(), 100);
+        assert_eq!(diff.cursor(), 2);
+        assert_eq!(diff.current_match_index(), 1);
+    }
+
+    #[test]
+    fn diff_n_uppercase_moves_cursor_to_prev_match() {
+        let mut diff = diff_with_doc(&["aaa", "bbb", "aaa"]);
+        handle_diff_key(key(KeyCode::Char('/')), &mut diff, &default_keys(), 100);
+        for ch in "aaa".chars() {
+            handle_diff_key(key(KeyCode::Char(ch)), &mut diff, &default_keys(), 100);
+        }
+        handle_diff_key(key(KeyCode::Enter), &mut diff, &default_keys(), 100);
+        handle_diff_key(key(KeyCode::Char('N')), &mut diff, &default_keys(), 100);
+        assert_eq!(diff.cursor(), 2);
+    }
+
+    #[test]
+    fn diff_search_then_v_pastes_from_match_line() {
+        let mut diff = DiffViewState::default();
+        diff.open(
+            "test".into(),
+            "Test".into(),
+            "raw".into(),
+            crate::app::focus::AppFocus::Sidebar,
+        );
+        diff.replace_document(
+            make_document(&["skip", "hit me", "skip"]),
+            vec![
+                Some(LineMeta {
+                    filepath: "x.rs".into(),
+                    new_line_no: Some(10),
+                    old_line_no: None,
+                }),
+                Some(LineMeta {
+                    filepath: "x.rs".into(),
+                    new_line_no: Some(11),
+                    old_line_no: None,
+                }),
+                Some(LineMeta {
+                    filepath: "x.rs".into(),
+                    new_line_no: Some(12),
+                    old_line_no: None,
+                }),
+            ],
+            100,
+        );
+
+        handle_diff_key(key(KeyCode::Char('/')), &mut diff, &default_keys(), 100);
+        for ch in "hit".chars() {
+            handle_diff_key(key(KeyCode::Char(ch)), &mut diff, &default_keys(), 100);
+        }
+        handle_diff_key(key(KeyCode::Enter), &mut diff, &default_keys(), 100);
+        handle_diff_key(key(KeyCode::Char('v')), &mut diff, &default_keys(), 100);
+        let action = handle_diff_key(key(KeyCode::Enter), &mut diff, &default_keys(), 100);
+        assert_eq!(action, KeyAction::PasteSelection("x.rs:11".to_string()));
+    }
     #[test]
     fn diff_keybinding_diff_closes() {
         let mut diff = diff_with_doc(&["a"]);

@@ -7,7 +7,7 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -21,12 +21,13 @@ use opencode_multiplexer::{
         key_handler::{KeyAction, handle_conversation_key, handle_diff_key},
         message_picker::MessagePickerState,
         reducer::reduce,
+        session_manager::{ManagerCommand, SessionManagerState, manager_key_to_command},
         session_picker::SessionPickerState,
         sessions::SessionStatus,
         state::AppState,
     },
     config::load_config,
-    data::{db::reader::DbReader, poller::start_poller},
+    data::{db::{reader::DbReader, writer::DbWriter}, poller::start_poller},
     notify::Notifier,
     ops::git::{diff_worktree, fetch_session_diff_from_serve},
     ops::opencode_events::{SessionCreatedEvent, SessionEventSubscriber},
@@ -34,7 +35,7 @@ use opencode_multiplexer::{
     ops::{fzf::pick_directory, opencode::display_title_for_cwd},
     registry::{load_serve_registry, save_managed_sessions},
     terminal::{
-        clipboard, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
+        clipboard, input, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
     },
     ui::{
         conversation, diff as ui_diff,
@@ -47,7 +48,6 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::path::PathBuf;
 
 const FOOTER_HEIGHT: u16 = 2;
-const COLLAPSED_SIDEBAR_WIDTH: u16 = 12;
 
 fn main() -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
@@ -165,8 +165,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             }
             let sidebar_width = if state.panel_hidden {
                 0
-            } else if state.sidebar_collapsed {
-                COLLAPSED_SIDEBAR_WIDTH
             } else {
                 config.sidebar_width
             };
@@ -197,6 +195,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             if let Some(picker) = state.session_picker.as_mut() {
                 picker.tick();
             }
+            if let Some(manager) = state.session_manager.as_mut() {
+                manager.tick();
+            }
             if let Some(picker) = state.message_picker.as_mut() {
                 picker.tick();
             }
@@ -213,12 +214,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     state.show_help,
                     &state.show_files,
                     sidebar_width,
-                    state.sidebar_collapsed,
                     state.panel_hidden,
                     state.app_focused,
                     &conversation,
                     &diff_view,
                     state.session_picker.as_mut(),
+                    state.session_manager.as_mut(),
                     state.message_picker.as_mut(),
                     state.confirm_quit,
                     terminal_selection.range(),
@@ -300,7 +301,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 state.session_picker = None;
                                 if let Some(entry) = entry {
                                     match DbReader::open_default()
-                                        .and_then(|r| r.get_session_status(&entry.session_id))
+                                        .and_then(|r| r.get_session_status(&entry.session_id, None))
                                     {
                                         Ok(status) => {
                                             let (rows, cols) = pane_size(
@@ -359,6 +360,68 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             }
                             _ => {}
                         }
+                    } else if state.session_manager.is_some() {
+                        let manager_state = state.session_manager.as_mut().unwrap();
+                        let command = manager_key_to_command(
+                            key,
+                            manager_state.pending_delete.is_some(),
+                            !manager_state.selected_ids.is_empty(),
+                        );
+
+                        match command {
+                            ManagerCommand::ConfirmDelete => {
+                                if let Some(pending) = manager_state.pending_delete.clone() {
+                                    let live_ids: HashSet<String> = manager
+                                        .sidebar_entries()
+                                        .iter()
+                                        .filter_map(|e| e.session_id.clone())
+                                        .collect();
+                                    match DbWriter::open_default()
+                                        .and_then(|mut w| w.delete_sessions(&pending.session_ids, &live_ids))
+                                    {
+                                        Ok(result) => {
+                                            manager_state.apply_local_removal(&result.deleted_session_ids);
+                                            manager_state.pending_delete = None;
+                                            
+                                            if let Some(active_sid) = manager.active_session_id() {
+                                                if result.deleted_session_ids.contains(&active_sid) {
+                                                    manager.detach_active();
+                                                    state.focus = AppFocus::Sidebar;
+                                                }
+                                            }
+
+                                            save_managed_sessions(manager.managed_session_ids())?;
+
+                                            footer_message = Some(format!(
+                                                "deleted {} session(s), skipped {} live",
+                                                result.deleted_session_ids.len(),
+                                                result.skipped_live_ids.len()
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            footer_message = Some(format!("delete failed: {error}"));
+                                            manager_state.pending_delete = None;
+                                        }
+                                    }
+                                }
+                            }
+                            ManagerCommand::CancelPending => {
+                                manager_state.pending_delete = None;
+                            }
+                            ManagerCommand::Close => {
+                                state.session_manager = None;
+                                footer_message = Some("manager closed".into());
+                            }
+                            ManagerCommand::Up => manager_state.move_up(),
+                            ManagerCommand::Down => manager_state.move_down(),
+                            ManagerCommand::Toggle => manager_state.toggle_select(),
+                            ManagerCommand::SelectAll => manager_state.select_all_matched(),
+                            ManagerCommand::Clear => manager_state.clear_selection(),
+                            ManagerCommand::RequestDelete => manager_state.request_delete(),
+                            ManagerCommand::Backspace => manager_state.backspace(),
+                            ManagerCommand::Insert(c) => manager_state.insert_char(c),
+                            ManagerCommand::Nop => {}
+                        }
                     } else if key.code == KeyCode::Char(config.keybindings.help)
                         && !matches!(state.focus, AppFocus::Terminal)
                     {
@@ -390,8 +453,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         reduce(&mut state, Action::TogglePanelHidden);
                         let new_sidebar_width = if state.panel_hidden {
                             0
-                        } else if state.sidebar_collapsed {
-                            COLLAPSED_SIDEBAR_WIDTH
                         } else {
                             config.sidebar_width
                         };
@@ -419,8 +480,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     } else if is_focus_toggle(key) {
                         if state.panel_hidden {
                             reduce(&mut state, Action::TogglePanelHidden);
-                            let new_sidebar_width = if state.sidebar_collapsed {
-                                COLLAPSED_SIDEBAR_WIDTH
+                            let new_sidebar_width = if state.panel_hidden {
+                                0
                             } else {
                                 config.sidebar_width
                             };
@@ -626,6 +687,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     }
                                 }
                             }
+                            KeyCode::Char(c) if c == config.keybindings.sessions => {
+                                let live_ids: HashSet<String> = manager
+                                    .sidebar_entries()
+                                    .iter()
+                                    .filter_map(|e| e.session_id.clone())
+                                    .collect();
+                                match SessionManagerState::load(live_ids) {
+                                    Ok(m) if m.total_count() > 0 => {
+                                        state.session_manager = Some(m);
+                                        state.session_picker = None;
+                                        state.message_picker = None;
+                                        footer_message = None;
+                                    }
+                                    Ok(_) => {
+                                        footer_message = Some("no sessions found".into());
+                                    }
+                                    Err(error) => {
+                                        footer_message = Some(format!("manager failed: {error}"));
+                                    }
+                                }
+                            }
                             KeyCode::Char(c) if c == config.keybindings.kill => {
                                 if let Some(row) = rows.get(state.selected_sidebar_row) {
                                     match row.kind {
@@ -770,30 +852,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 Some("bash only on top-level sessions".into());
                                         }
                                     }
-                                }
-                            }
-                            KeyCode::Char('s') => {
-                                reduce(&mut state, Action::ToggleSidebarCollapse);
-
-                                let new_sidebar_width = if state.panel_hidden {
-                                    0
-                                } else if state.sidebar_collapsed {
-                                    COLLAPSED_SIDEBAR_WIDTH
-                                } else {
-                                    config.sidebar_width
-                                };
-
-                                if diff_view.is_active() {
-                                    let new_content_width =
-                                        terminal.size()?.width.saturating_sub(new_sidebar_width);
-                                    let new_vp =
-                                        terminal.size()?.height.saturating_sub(FOOTER_HEIGHT + 1)
-                                            as usize;
-                                    let (doc, meta) = ui_diff::build_diff_document(
-                                        diff_view.raw_diff(),
-                                        new_content_width,
-                                    );
-                                    diff_view.replace_document(doc, meta, new_vp);
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.worktree => {
@@ -1009,12 +1067,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 if let Some(text) =
                                     terminal_selection.extract_text_from(&snapshot, &wrapped)
                                 {
-                                    if let Err(e) = clipboard::copy_to_clipboard(&text) {
-                                        footer_message = Some(format!("copy failed: {e}"));
+                                    if !text.is_empty() {
+                                        if let Err(e) = clipboard::copy_to_clipboard(&text) {
+                                            footer_message = Some(format!("copy failed: {e}"));
+                                        }
                                     }
                                 }
                                 state.focus = AppFocus::Terminal;
                                 handled = true;
+                            }
+                            MouseResult::Click { col, row } => {
+                                state.focus = AppFocus::Terminal;
+                                handled = true;
+                                let col1 = (col as u16).saturating_add(1);
+                                let row1 = (row as u16).saturating_add(1);
+                                if let Some(pty) = manager.active_session_mut() {
+                                    let bytes = input::mouse_click_press_release_sgr(
+                                        col1,
+                                        row1,
+                                        mouse.modifiers,
+                                    );
+                                    if let Err(e) = pty.send_bytes(&bytes) {
+                                        footer_message = Some(format!("mouse click failed: {e}"));
+                                    }
+                                }
                             }
                             MouseResult::Ignored => {}
                         }
@@ -1024,6 +1100,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         if matches!(mouse.kind, MouseEventKind::Down(_)) {
                             terminal_selection.clear();
                         }
+
+                        // Forward right/middle clicks if over terminal pane
+                        let over_terminal = input::screen_to_pty_cell(
+                            mouse.column,
+                            mouse.row,
+                            inner.x,
+                            inner.y,
+                            inner.width,
+                            inner.height,
+                        );
+
                         if matches!(mouse.kind, MouseEventKind::Down(_))
                             && mouse.column < sidebar_width
                         {
@@ -1031,6 +1118,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             let clicked_row = mouse.row.saturating_sub(1) as usize;
                             if clicked_row < rows.len() {
                                 state.selected_sidebar_row = clicked_row;
+                            }
+                        } else if let Some((col, row)) = over_terminal
+                            && matches!(
+                                mouse.kind,
+                                MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
+                                    | MouseEventKind::Up(MouseButton::Right | MouseButton::Middle)
+                            )
+                        {
+                            if let Some(bytes) =
+                                input::mouse_event_to_sgr_bytes(mouse.kind, col, row, mouse.modifiers)
+                            {
+                                if let Some(pty) = manager.active_session_mut() {
+                                    let _ = pty.send_bytes(&bytes);
+                                }
                             }
                         } else if matches!(
                             mouse.kind,
@@ -1047,18 +1148,43 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     }
                                     _ => {}
                                 },
-                                AppFocus::Diff => match mouse.kind {
-                                    MouseEventKind::ScrollUp => {
-                                        diff_view.scroll_up(scroll_amount);
+                                        AppFocus::Diff => match mouse.kind {
+                                            MouseEventKind::ScrollUp => {
+                                                diff_view.scroll_view_up(scroll_amount, viewport_height);
+                                            }
+                                            MouseEventKind::ScrollDown => {
+                                                diff_view.scroll_view_down(scroll_amount, viewport_height);
+                                            }
+                                            _ => {}
+                                        },
+                                        AppFocus::Terminal => {
+                                            if let Some((col, row)) = input::screen_to_pty_cell(
+                                                mouse.column,
+                                                mouse.row,
+                                                inner.x,
+                                                inner.y,
+                                                inner.width,
+                                                inner.height,
+                                            ) {
+                                                if let Some(bytes) = input::mouse_scroll_to_sgr_bytes(
+                                                    mouse.kind,
+                                                    col,
+                                                    row,
+                                                    mouse.modifiers,
+                                                ) {
+                                                    terminal_selection.clear();
+                                                    if let Some(pty) = manager.active_session_mut() {
+                                                        if let Err(error) = pty.send_bytes(&bytes) {
+                                                            footer_message =
+                                                                Some(format!("mouse scroll failed: {error}"));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    MouseEventKind::ScrollDown => {
-                                        diff_view.scroll_down(scroll_amount, viewport_height);
-                                    }
-                                    _ => {}
-                                },
-                                _ => {}
-                            }
-                        }
+                                }
                     }
                 }
                 Event::FocusGained => {

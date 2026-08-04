@@ -7,8 +7,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::{
     app::sessions::SessionStatus,
     data::db::models::{
-        DbConversationMessage, DbConversationPart, DbProject, DbSession, DbSessionSummary,
-        DbUserMessage, SessionPreview,
+        DbConversationMessage, DbConversationPart, DbManagedSession, DbProject, DbSession,
+        DbSessionSummary, DbUserMessage, SessionPreview,
     },
 };
 
@@ -35,7 +35,7 @@ impl DbReader {
     }
 
     pub fn open_default() -> anyhow::Result<Self> {
-        Self::open(&default_db_path()?)
+        Self::open(&super::default_db_path()?)
     }
 
     pub fn get_all_sessions(&self) -> anyhow::Result<Vec<DbSessionSummary>> {
@@ -64,6 +64,45 @@ impl DbReader {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+    pub fn list_sessions_for_manager(&self) -> anyhow::Result<Vec<DbManagedSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.title, s.directory, p.worktree,
+              COALESCE((
+                SELECT COUNT(*) FROM message m
+                WHERE m.session_id IN (
+                  WITH RECURSIVE tree(id) AS (
+                    SELECT s.id
+                    UNION ALL
+                    SELECT c.id FROM session c JOIN tree t ON c.parent_id = t.id
+                  )
+                  SELECT id FROM tree
+                )
+                AND json_extract(m.data, '$.role') = 'user'
+              ), 0) AS user_msg_count,
+              COALESCE((
+                SELECT time_created FROM message
+                WHERE session_id = s.id AND json_extract(data, '$.role') = 'user'
+                ORDER BY time_created DESC LIMIT 1
+              ), s.time_created) AS last_interaction
+            FROM session s
+            JOIN project p ON p.id = s.project_id
+            WHERE s.parent_id IS NULL
+            ORDER BY last_interaction DESC
+            LIMIT 500"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DbManagedSession {
+                id: row.get(0)?,
+                title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                directory: PathBuf::from(row.get::<_, Option<String>>(2)?.unwrap_or_default()),
+                worktree: PathBuf::from(row.get::<_, String>(3)?),
+                user_message_count: row.get(4)?,
+                time_updated: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn get_projects(&self) -> anyhow::Result<Vec<DbProject>> {
         let mut stmt = self
             .conn
@@ -192,28 +231,75 @@ impl DbReader {
         Ok(count > 0)
     }
 
-    pub fn get_session_status(&self, session_id: &str) -> anyhow::Result<SessionStatus> {
-        self.get_session_status_recursive(session_id, &mut std::collections::HashSet::new())
+    pub fn get_session_status(
+        &self,
+        session_id: &str,
+        process_start_time: Option<i64>,
+    ) -> anyhow::Result<SessionStatus> {
+        self.get_session_status_recursive(
+            session_id,
+            process_start_time,
+            None,
+            &mut std::collections::HashSet::new(),
+        )
     }
 
     fn get_session_status_recursive(
         &self,
         session_id: &str,
+        process_start_time: Option<i64>,
+        parent_user_msg_time: Option<i64>,
         visited: &mut std::collections::HashSet<String>,
     ) -> anyhow::Result<SessionStatus> {
         if !visited.insert(session_id.to_string()) {
             return Ok(SessionStatus::Idle);
         }
 
-        let local = self.get_local_session_status(session_id)?;
+        let local = self.get_local_session_status(session_id, process_start_time)?;
+
+        // If parent has a newer user message than this subagent's last update,
+        // treat subagent as abandoned/idle.
+        if let Some(cutoff) = parent_user_msg_time {
+            let last_update: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT time_updated FROM session WHERE id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(t) = last_update {
+                // OpenCode uses milliseconds for time_updated
+                if t < cutoff {
+                    return Ok(SessionStatus::Idle);
+                }
+            }
+        }
+
         if local == SessionStatus::NeedsInput {
             return Ok(SessionStatus::NeedsInput);
         }
 
+        // Get this session's latest user message time to pass to children
+        let latest_user_msg_time: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT time_created FROM message WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user' ORDER BY time_created DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
         let mut best_child = SessionStatus::Idle;
         let children = self.get_child_sessions(session_id, 100, 0)?;
         for child in children {
-            let child_status = self.get_session_status_recursive(&child.id, visited)?;
+            let child_status = self.get_session_status_recursive(
+                &child.id,
+                process_start_time,
+                latest_user_msg_time,
+                visited,
+            )?;
             best_child = self.rollup_status(best_child, child_status, true);
             if best_child == SessionStatus::NeedsInput {
                 return Ok(SessionStatus::NeedsInput);
@@ -254,7 +340,11 @@ impl DbReader {
         }
     }
 
-    fn get_local_session_status(&self, session_id: &str) -> anyhow::Result<SessionStatus> {
+    fn get_local_session_status(
+        &self,
+        session_id: &str,
+        process_start_time: Option<i64>,
+    ) -> anyhow::Result<SessionStatus> {
         let latest_message_id: Option<String> = self
             .conn
             .query_row(
@@ -272,17 +362,46 @@ impl DbReader {
                 |row| row.get(0),
             )?;
             if latest_running > 0 {
-                return Ok(SessionStatus::NeedsInput);
+                // Check if this tool part is stale relative to process lifetime
+                if let Some(cutoff) = process_start_time {
+                    let part_time: Option<i64> = self
+                        .conn
+                        .query_row(
+                            "SELECT COALESCE(json_extract(data, '$.state.time.start'), time_created) FROM part WHERE session_id = ?1 AND message_id = ?2 AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.tool') IN ('question', 'plan_exit') AND json_extract(data, '$.state.status') = 'running' LIMIT 1",
+                            params![session_id, message_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if part_time.is_none_or(|t| t >= cutoff) {
+                        return Ok(SessionStatus::NeedsInput);
+                    }
+                } else {
+                    return Ok(SessionStatus::NeedsInput);
+                }
             }
 
-            // Detect 'pending' status on ANY tool call part (fixing permission detection)
+            // Detect 'pending' status on ANY tool call part (permission required)
             let latest_pending: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM part p WHERE p.session_id = ?1 AND p.message_id = ?2 AND json_extract(p.data, '$.type') = 'tool' AND json_extract(p.data, '$.state.status') = 'pending'",
                 params![session_id, message_id],
                 |row| row.get(0),
             )?;
             if latest_pending > 0 {
-                return Ok(SessionStatus::NeedsInput);
+                if let Some(cutoff) = process_start_time {
+                    let part_time: Option<i64> = self
+                        .conn
+                        .query_row(
+                            "SELECT time_created FROM part WHERE session_id = ?1 AND message_id = ?2 AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.state.status') = 'pending' LIMIT 1",
+                            params![session_id, message_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if part_time.is_none_or(|t| t >= cutoff) {
+                        return Ok(SessionStatus::NeedsInput);
+                    }
+                } else {
+                    return Ok(SessionStatus::NeedsInput);
+                }
             }
 
             // Check for Error
@@ -312,16 +431,34 @@ impl DbReader {
             }
         }
 
-        let latest_message: Option<(Option<String>, Option<i64>)> = self.conn.query_row(
-            "SELECT json_extract(data, '$.role') as role, json_extract(data, '$.time.completed') as completed FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1",
+        let latest_message: Option<(Option<String>, Option<i64>, i64)> = self.conn.query_row(
+            "SELECT json_extract(data, '$.role') as role, json_extract(data, '$.time.completed') as completed, time_created FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1",
             [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
 
         match latest_message {
-            Some((Some(role), _completed)) if role == "user" => Ok(SessionStatus::Working),
-            Some((Some(role), completed)) if role == "assistant" && completed.is_none() => {
-                Ok(SessionStatus::Working)
+            Some((Some(role), _completed, time)) if role == "user" => {
+                if let Some(cutoff) = process_start_time {
+                    if time < cutoff {
+                        Ok(SessionStatus::Idle)
+                    } else {
+                        Ok(SessionStatus::Working)
+                    }
+                } else {
+                    Ok(SessionStatus::Working)
+                }
+            }
+            Some((Some(role), completed, time)) if role == "assistant" && completed.is_none() => {
+                if let Some(cutoff) = process_start_time {
+                    if time < cutoff {
+                        Ok(SessionStatus::Idle)
+                    } else {
+                        Ok(SessionStatus::Working)
+                    }
+                } else {
+                    Ok(SessionStatus::Working)
+                }
             }
             _ => Ok(SessionStatus::Idle),
         }
@@ -536,11 +673,6 @@ impl DbReader {
     }
 }
 
-fn default_db_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/opencode/opencode.db"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,7 +751,7 @@ mod tests {
 
         let reader = DbReader::open(&db_path).unwrap();
         assert_eq!(
-            reader.get_session_status("sess1").unwrap(),
+            reader.get_session_status("sess1", None).unwrap(),
             SessionStatus::Error
         );
     }
@@ -646,7 +778,7 @@ mod tests {
 
         let reader = DbReader::open(&db_path).unwrap();
         assert_eq!(
-            reader.get_session_status("sess1").unwrap(),
+            reader.get_session_status("sess1", None).unwrap(),
             SessionStatus::Idle
         );
     }
@@ -718,7 +850,7 @@ mod tests {
 
         let reader = DbReader::open(&db_path).unwrap();
         assert_eq!(
-            reader.get_session_status("sess1").unwrap(),
+            reader.get_session_status("sess1", None).unwrap(),
             SessionStatus::NeedsInput
         );
     }
@@ -761,13 +893,13 @@ mod tests {
         
         // Child should be Working
         assert_eq!(
-            reader.get_session_status("child").unwrap(),
+            reader.get_session_status("child", None).unwrap(),
             SessionStatus::Working
         );
         
         // Parent should be SubagentsWorking
         assert_eq!(
-            reader.get_session_status("parent").unwrap(),
+            reader.get_session_status("parent", None).unwrap(),
             SessionStatus::SubagentsWorking
         );
         
@@ -779,7 +911,7 @@ mod tests {
         .unwrap();
         
         assert_eq!(
-            reader.get_session_status("parent").unwrap(),
+            reader.get_session_status("parent", None).unwrap(),
             SessionStatus::NeedsInput
         );
     }
@@ -817,7 +949,7 @@ mod tests {
         
         // Parent should be Idle because child is archived
         assert_eq!(
-            reader.get_session_status("parent").unwrap(),
+            reader.get_session_status("parent", None).unwrap(),
             SessionStatus::Idle
         );
     }

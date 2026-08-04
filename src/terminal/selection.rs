@@ -19,6 +19,7 @@ pub enum MouseResult {
     Ignored,
     Claimed,
     Finished,
+    Click { col: usize, row: usize },
 }
 
 impl SelectionRange {
@@ -113,7 +114,11 @@ impl TerminalSelection {
                     let row = (mouse.row as usize)
                         .saturating_sub(pane.y as usize)
                         .min(surface_rows.saturating_sub(1));
-                    self.begin(SelectionPoint { row, col });
+                    // Initial Down just sets anchor and clears dragging.
+                    // We don't call begin() yet because that sets dragging = true.
+                    self.anchor = Some(SelectionPoint { row, col });
+                    self.head = Some(SelectionPoint { row, col });
+                    self.dragging = false;
                     MouseResult::Claimed
                 } else {
                     self.clear();
@@ -121,32 +126,52 @@ impl TerminalSelection {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(anchor) = self.anchor else {
+                    return MouseResult::Ignored;
+                };
+                let col = (mouse.column as usize)
+                    .saturating_sub(pane.x as usize)
+                    .min(surface_cols.saturating_sub(1));
+                let row = (mouse.row as usize)
+                    .saturating_sub(pane.y as usize)
+                    .min(surface_rows.saturating_sub(1));
+                let point = SelectionPoint { row, col };
+
+                if !self.dragging && max_delta(anchor, point) >= 1 {
+                    self.dragging = true;
+                }
+
                 if self.dragging {
-                    let col = (mouse.column as usize)
-                        .saturating_sub(pane.x as usize)
-                        .min(surface_cols.saturating_sub(1));
-                    let row = (mouse.row as usize)
-                        .saturating_sub(pane.y as usize)
-                        .min(surface_rows.saturating_sub(1));
-                    self.update(SelectionPoint { row, col });
+                    self.head = Some(point);
                     MouseResult::Claimed
                 } else {
-                    MouseResult::Ignored
+                    // Still within click threshold
+                    MouseResult::Claimed
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let Some(anchor) = self.anchor else {
+                    return MouseResult::Ignored;
+                };
+                let col = (mouse.column as usize)
+                    .saturating_sub(pane.x as usize)
+                    .min(surface_cols.saturating_sub(1));
+                let row = (mouse.row as usize)
+                    .saturating_sub(pane.y as usize)
+                    .min(surface_rows.saturating_sub(1));
+                let point = SelectionPoint { row, col };
+
                 if self.dragging {
-                    let col = (mouse.column as usize)
-                        .saturating_sub(pane.x as usize)
-                        .min(surface_cols.saturating_sub(1));
-                    let row = (mouse.row as usize)
-                        .saturating_sub(pane.y as usize)
-                        .min(surface_rows.saturating_sub(1));
-                    self.update(SelectionPoint { row, col });
-                    self.finish();
+                    self.head = Some(point);
+                    self.dragging = false;
                     MouseResult::Finished
                 } else {
-                    MouseResult::Ignored
+                    // Click confirmed
+                    self.clear();
+                    MouseResult::Click {
+                        col: anchor.col,
+                        row: anchor.row,
+                    }
                 }
             }
             _ => MouseResult::Ignored,
@@ -212,6 +237,12 @@ pub fn extract_selection_text(
     }
 
     lines.join("\n")
+}
+
+fn max_delta(a: SelectionPoint, b: SelectionPoint) -> usize {
+    let dr = a.row.abs_diff(b.row);
+    let dc = a.col.abs_diff(b.col);
+    dr.max(dc)
 }
 
 #[cfg(test)]
@@ -485,10 +516,10 @@ mod tests {
             20,
         );
         assert_eq!(res, MouseResult::Claimed);
-        assert!(sel.dragging);
+        assert!(!sel.dragging); // Not dragging yet (pending click)
         assert_eq!(sel.anchor, Some(SelectionPoint { row: 5, col: 5 }));
 
-        // Drag inside
+        // Drag inside (past threshold)
         let res = sel.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Drag(MouseButton::Left),
@@ -501,6 +532,7 @@ mod tests {
             20,
         );
         assert_eq!(res, MouseResult::Claimed);
+        assert!(sel.dragging);
         assert_eq!(sel.head, Some(SelectionPoint { row: 6, col: 7 }));
 
         // Up inside
@@ -518,5 +550,118 @@ mod tests {
         assert_eq!(res, MouseResult::Finished);
         assert!(!sel.dragging);
         assert!(sel.is_active());
+    }
+
+    #[test]
+    fn left_click_without_drag_emits_click() {
+        let mut sel = TerminalSelection::default();
+        let pane = Rect::new(10, 10, 20, 20);
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 15,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(sel.handle_mouse(down, pane, 20, 20), MouseResult::Claimed);
+        assert!(!sel.is_dragging());
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 15,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(
+            sel.handle_mouse(up, pane, 20, 20),
+            MouseResult::Click { col: 5, row: 5 }
+        );
+        assert!(!sel.is_active());
+    }
+
+    #[test]
+    fn left_drag_past_threshold_finishes_selection() {
+        let mut sel = TerminalSelection::default();
+        let pane = Rect::new(10, 10, 20, 20);
+        sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 15,
+                row: 15,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
+        );
+
+        let res = sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 17,
+                row: 15,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
+        );
+        assert_eq!(res, MouseResult::Claimed);
+        assert!(sel.is_dragging());
+
+        let res = sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 17,
+                row: 15,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            20,
+        );
+        assert_eq!(res, MouseResult::Finished);
+        assert!(sel.is_active());
+        assert!(!sel.is_dragging());
+    }
+
+    #[test]
+    fn drag_below_threshold_still_counts_as_click() {
+        let mut sel = TerminalSelection::default();
+        let pane = Rect::new(0, 0, 40, 20);
+        sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            40,
+        );
+        sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            40,
+        );
+        assert!(!sel.is_dragging());
+        let res = sel.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane,
+            20,
+            40,
+        );
+        assert_eq!(res, MouseResult::Click { col: 3, row: 3 });
     }
 }

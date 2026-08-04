@@ -90,9 +90,17 @@ impl PtySession {
 
     pub fn send_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         if let Some(bytes) = key_event_to_bytes(key) {
-            self.writer.write_all(&bytes)?;
-            self.writer.flush()?;
+            self.send_bytes(&bytes)?;
         }
+        Ok(())
+    }
+
+    pub fn send_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
         Ok(())
     }
 

@@ -66,7 +66,7 @@ fn session_status_prefers_needs_input_over_other_states() {
     let reader = DbReader::open(&db_path).unwrap();
 
     assert_eq!(
-        reader.get_session_status("sess_1").unwrap(),
+        reader.get_session_status("sess_1", None).unwrap(),
         SessionStatus::NeedsInput
     );
 
@@ -248,11 +248,11 @@ fn session_status_pending_tools_needs_input() {
         [],
     ).unwrap();
 
-    let tools = vec!["write", "bash", "edit", "task"];
+    let tools = ["write", "bash", "edit", "task"];
     for (i, tool) in tools.iter().enumerate() {
-        let sess_id = format!("sess_pending_{}", i);
-        let msg_id = format!("msg_pending_{}", i);
-        let part_id = format!("part_pending_{}", i);
+        let sess_id = format!("sess_pending_{i}");
+        let msg_id = format!("msg_pending_{i}");
+        let part_id = format!("part_pending_{i}");
 
         conn.execute(
             "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES (?1, 'proj_1', NULL, 'title', '/tmp/repo', '{}', 1, 10, NULL)",
@@ -264,14 +264,14 @@ fn session_status_pending_tools_needs_input() {
         ).unwrap();
         conn.execute(
             "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES (?1, ?2, ?3, ?4, 1)",
-            params![part_id, sess_id, msg_id, format!("{{\"type\":\"tool\",\"tool\":\"{}\",\"state\":{{\"status\":\"pending\"}}}}", tool)],
+            params![part_id, sess_id, msg_id, format!("{{\"type\":\"tool\",\"tool\":\"{tool}\",\"state\":{{\"status\":\"pending\"}}}}")],
         ).unwrap();
 
         let reader = DbReader::open(&db_path).unwrap();
         assert_eq!(
-            reader.get_session_status(&sess_id).unwrap(),
+            reader.get_session_status(&sess_id, None).unwrap(),
             SessionStatus::NeedsInput,
-            "Tool {} should trigger NeedsInput when pending", tool
+            "Tool {tool} should trigger NeedsInput when pending"
         );
     }
 
@@ -310,7 +310,7 @@ fn session_status_main_idle_active_subagent() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("main").unwrap(),
+        reader.get_session_status("main", None).unwrap(),
         SessionStatus::SubagentsWorking
     );
 
@@ -353,7 +353,7 @@ fn session_status_subagent_needs_input() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("main").unwrap(),
+        reader.get_session_status("main", None).unwrap(),
         SessionStatus::NeedsInput
     );
 
@@ -392,7 +392,7 @@ fn session_status_ignores_archived_subagents() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("main").unwrap(),
+        reader.get_session_status("main", None).unwrap(),
         SessionStatus::Idle
     );
 
@@ -441,15 +441,15 @@ fn session_status_multi_level_rollup() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("C").unwrap(),
+        reader.get_session_status("C", None).unwrap(),
         SessionStatus::Working
     );
     assert_eq!(
-        reader.get_session_status("B").unwrap(),
+        reader.get_session_status("B", None).unwrap(),
         SessionStatus::SubagentsWorking
     );
     assert_eq!(
-        reader.get_session_status("A").unwrap(),
+        reader.get_session_status("A", None).unwrap(),
         SessionStatus::SubagentsWorking
     );
 
@@ -460,7 +460,7 @@ fn session_status_multi_level_rollup() {
     ).unwrap();
 
     assert_eq!(
-        reader.get_session_status("A").unwrap(),
+        reader.get_session_status("A", None).unwrap(),
         SessionStatus::NeedsInput
     );
 
@@ -493,7 +493,7 @@ fn session_status_error_precedence() {
     
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("sess_err_work").unwrap(),
+        reader.get_session_status("sess_err_work", None).unwrap(),
         SessionStatus::Error
     );
 
@@ -504,7 +504,7 @@ fn session_status_error_precedence() {
     ).unwrap();
     
     assert_eq!(
-        reader.get_session_status("sess_err_work").unwrap(),
+        reader.get_session_status("sess_err_work", None).unwrap(),
         SessionStatus::NeedsInput
     );
 
@@ -528,7 +528,7 @@ fn session_status_full_precedence_chain() {
     ).unwrap();
     
     let reader = DbReader::open(&db_path).unwrap();
-    assert_eq!(reader.get_session_status("main").unwrap(), SessionStatus::Idle);
+    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Idle);
 
     // Add Subagent (Working) -> SubagentsWorking
     conn.execute(
@@ -539,28 +539,28 @@ fn session_status_full_precedence_chain() {
         "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_sub', 'sub', '{\"role\":\"user\"}', 20)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main").unwrap(), SessionStatus::SubagentsWorking);
+    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::SubagentsWorking);
 
     // Make Main (Working) -> Working wins over SubagentsWorking
     conn.execute(
         "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_main', 'main', '{\"role\":\"user\"}', 30)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main").unwrap(), SessionStatus::Working);
+    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Working);
 
     // Make Main (Error) -> Error wins over Working
     conn.execute(
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_err', 'main', 'msg_main', '{\"type\":\"tool\",\"tool\":\"edit\",\"state\":{\"status\":\"error\"}}', 31)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main").unwrap(), SessionStatus::Error);
+    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::Error);
 
     // Make Main (NeedsInput) -> NeedsInput wins over Error
     conn.execute(
         "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_needs', 'main', 'msg_main', '{\"type\":\"tool\",\"tool\":\"question\",\"state\":{\"status\":\"running\"}}', 32)",
         [],
     ).unwrap();
-    assert_eq!(reader.get_session_status("main").unwrap(), SessionStatus::NeedsInput);
+    assert_eq!(reader.get_session_status("main", None).unwrap(), SessionStatus::NeedsInput);
 
     fs::remove_file(db_path).ok();
 }
@@ -587,7 +587,7 @@ fn session_status_cycle_detection() {
 
     let reader = DbReader::open(&db_path).unwrap();
     // Should not hang
-    let status = reader.get_session_status("A").unwrap();
+    let status = reader.get_session_status("A", None).unwrap();
     assert_eq!(status, SessionStatus::Idle);
 
     fs::remove_file(db_path).ok();
@@ -613,7 +613,7 @@ fn session_status_working_user_message() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("sess_1").unwrap(),
+        reader.get_session_status("sess_1", None).unwrap(),
         SessionStatus::Working
     );
 
@@ -640,7 +640,7 @@ fn session_status_working_incomplete_assistant_message() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("sess_1").unwrap(),
+        reader.get_session_status("sess_1", None).unwrap(),
         SessionStatus::Working
     );
 
@@ -663,7 +663,187 @@ fn session_status_idle_no_messages() {
 
     let reader = DbReader::open(&db_path).unwrap();
     assert_eq!(
-        reader.get_session_status("sess_1").unwrap(),
+        reader.get_session_status("sess_1", None).unwrap(),
+        SessionStatus::Idle
+    );
+
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn uncompleted_assistant_message_older_than_process_start_is_idle() {
+    let db_path = temp_db_path("stale_assistant");
+    let conn = init_db(&db_path);
+
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('sess_1', 'proj_1', NULL, 'Title', '/tmp/repo', '{}', 1000, 1000, NULL)",
+        [],
+    )
+    .unwrap();
+    // Uncompleted assistant message from a previous process lifetime
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_1', 'sess_1', '{\"role\":\"assistant\"}', 1000)",
+        [],
+    )
+    .unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+
+    // Without cutoff: Working
+    assert_eq!(
+        reader.get_session_status("sess_1", None).unwrap(),
+        SessionStatus::Working
+    );
+
+    // With process start after message: Idle (stale)
+    assert_eq!(
+        reader.get_session_status("sess_1", Some(5000)).unwrap(),
+        SessionStatus::Idle
+    );
+
+    // With process start before message: still Working
+    assert_eq!(
+        reader.get_session_status("sess_1", Some(500)).unwrap(),
+        SessionStatus::Working
+    );
+
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn running_tool_part_older_than_process_start_is_stale() {
+    let db_path = temp_db_path("stale_tool");
+    let conn = init_db(&db_path);
+
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('sess_1', 'proj_1', NULL, 'Title', '/tmp/repo', '{}', 1000, 1000, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_1', 'sess_1', '{\"role\":\"assistant\"}', 1000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_1', 'sess_1', 'msg_1', '{\"type\":\"tool\",\"tool\":\"question\",\"state\":{\"status\":\"running\",\"time\":{\"start\":1000}}}', 1000)",
+        [],
+    )
+    .unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+
+    // Without cutoff: NeedsInput
+    assert_eq!(
+        reader.get_session_status("sess_1", None).unwrap(),
+        SessionStatus::NeedsInput
+    );
+
+    // With process start after tool start: stale → falls through to Idle
+    // (assistant message also older than cutoff)
+    assert_eq!(
+        reader.get_session_status("sess_1", Some(5000)).unwrap(),
+        SessionStatus::Idle
+    );
+
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn subagent_uncompleted_message_with_newer_parent_user_message_is_idle() {
+    let db_path = temp_db_path("abandoned_subagent");
+    let conn = init_db(&db_path);
+
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+
+    // Parent: idle after a newer user message at t=5000
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('main', 'proj_1', NULL, 'Main', '/tmp/repo', '{}', 1, 5000, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_user', 'main', '{\"role\":\"user\"}', 5000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_main', 'main', '{\"role\":\"assistant\",\"time\":{\"completed\":5001}}', 5001)",
+        [],
+    )
+    .unwrap();
+
+    // Subagent: still "working" but last updated at t=2000 (before parent user msg)
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('sub', 'proj_1', 'main', 'Sub', '/tmp/repo/sub', '{}', 1000, 2000, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_sub', 'sub', '{\"role\":\"assistant\"}', 2000)",
+        [],
+    )
+    .unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+
+    // Parent should be Idle — abandoned subagent must not roll up as SubagentsWorking
+    assert_eq!(
+        reader.get_session_status("main", None).unwrap(),
+        SessionStatus::Idle
+    );
+
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn pending_permission_older_than_process_start_is_stale() {
+    let db_path = temp_db_path("stale_pending");
+    let conn = init_db(&db_path);
+
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('sess_1', 'proj_1', NULL, 'Title', '/tmp/repo', '{}', 1000, 1000, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_1', 'sess_1', '{\"role\":\"assistant\",\"time\":{\"completed\":1000}}', 1000)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO part (id, session_id, message_id, data, time_created) VALUES ('part_1', 'sess_1', 'msg_1', '{\"type\":\"tool\",\"tool\":\"write\",\"state\":{\"status\":\"pending\"}}', 1000)",
+        [],
+    )
+    .unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+
+    assert_eq!(
+        reader.get_session_status("sess_1", None).unwrap(),
+        SessionStatus::NeedsInput
+    );
+    assert_eq!(
+        reader.get_session_status("sess_1", Some(5000)).unwrap(),
         SessionStatus::Idle
     );
 
@@ -738,6 +918,53 @@ fn reader_sets_busy_timeout_on_open() {
         busy_timeout > 0,
         "DbReader must set a non-zero busy_timeout, got: {busy_timeout}"
     );
+
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn list_sessions_for_manager_returns_top_level_with_subtree_message_counts() {
+    let db_path = temp_db_path("manager_list");
+    let conn = init_db(&db_path);
+    conn.execute(
+        "INSERT INTO project VALUES ('proj1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    
+    // parent1 -> child1 (2 msgs total: 1 parent, 1 child)
+    conn.execute(
+        "INSERT INTO session VALUES ('p1', 'proj1', NULL, 'P1', '/tmp/repo', NULL, 100, 100, NULL)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO session VALUES ('c1', 'proj1', 'p1', 'C1', '/tmp/repo/c1', NULL, 110, 110, NULL)",
+        [],
+    ).unwrap();
+    conn.execute(
+        r#"INSERT INTO message VALUES ('m1', 'p1', '{"role":"user"}', 105)"#,
+        [],
+    ).unwrap();
+    conn.execute(
+        r#"INSERT INTO message VALUES ('m2', 'c1', '{"role":"user"}', 115)"#,
+        [],
+    ).unwrap();
+
+    // parent2 (0 msgs)
+    conn.execute(
+        "INSERT INTO session VALUES ('p2', 'proj1', NULL, 'P2', '/tmp/repo', NULL, 50, 50, NULL)",
+        [],
+    ).unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+    let sessions = reader.list_sessions_for_manager().unwrap();
+    
+    assert_eq!(sessions.len(), 2);
+    // ordered by last_interaction DESC: p1 (115) then p2 (50)
+    assert_eq!(sessions[0].id, "p1");
+    assert_eq!(sessions[0].user_message_count, 2);
+    assert_eq!(sessions[1].id, "p2");
+    assert_eq!(sessions[1].user_message_count, 0);
 
     fs::remove_file(db_path).ok();
 }

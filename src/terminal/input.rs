@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
 pub fn key_event_to_bytes(event: KeyEvent) -> Option<Vec<u8>> {
     // Don't forward the focus toggle (Ctrl-\, reported as Ctrl-4)
@@ -131,5 +131,191 @@ fn modified_ss3(letter: u8, mods: KeyModifiers) -> Option<Vec<u8>> {
     match modifier_param(mods) {
         Some(m) => Some(format!("\x1b[1;{}{}", m, letter as char).into_bytes()),
         None => Some(vec![0x1b, b'O', letter]),
+    }
+}
+
+pub fn mouse_scroll_to_sgr_bytes(
+    kind: MouseEventKind,
+    col: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+) -> Option<Vec<u8>> {
+    mouse_event_to_sgr_bytes(kind, col, row, modifiers)
+}
+
+pub fn mouse_event_to_sgr_bytes(
+    kind: MouseEventKind,
+    col: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+) -> Option<Vec<u8>> {
+    let (base, trailer) = match kind {
+        MouseEventKind::Down(MouseButton::Left) => (0u16, b'M'),
+        MouseEventKind::Up(MouseButton::Left) => (0u16, b'm'),
+        MouseEventKind::Down(MouseButton::Middle) => (1u16, b'M'),
+        MouseEventKind::Up(MouseButton::Middle) => (1u16, b'm'),
+        MouseEventKind::Down(MouseButton::Right) => (2u16, b'M'),
+        MouseEventKind::Up(MouseButton::Right) => (2u16, b'm'),
+        MouseEventKind::ScrollUp => (64u16, b'M'),
+        MouseEventKind::ScrollDown => (65u16, b'M'),
+        _ => return None,
+    };
+
+    let mut btn = base;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        btn += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        btn += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        btn += 16;
+    }
+
+    let col = col.max(1);
+    let row = row.max(1);
+    Some(format!("\x1b[<{btn};{col};{row}{}", trailer as char).into_bytes())
+}
+
+pub fn screen_to_pty_cell(
+    screen_col: u16,
+    screen_row: u16,
+    pane_x: u16,
+    pane_y: u16,
+    pane_width: u16,
+    pane_height: u16,
+) -> Option<(u16, u16)> {
+    if pane_width == 0 || pane_height == 0 {
+        return None;
+    }
+    if screen_col < pane_x
+        || screen_row < pane_y
+        || screen_col >= pane_x.saturating_add(pane_width)
+        || screen_row >= pane_y.saturating_add(pane_height)
+    {
+        return None;
+    }
+    let col = (screen_col - pane_x + 1).min(pane_width);
+    let row = (screen_row - pane_y + 1).min(pane_height);
+    Some((col, row))
+}
+
+pub fn mouse_click_press_release_sgr(
+    col_1based: u16,
+    row_1based: u16,
+    modifiers: KeyModifiers,
+) -> Vec<u8> {
+    let mut out = mouse_event_to_sgr_bytes(
+        MouseEventKind::Down(MouseButton::Left),
+        col_1based,
+        row_1based,
+        modifiers,
+    )
+    .unwrap_or_default();
+    out.extend(
+        mouse_event_to_sgr_bytes(
+            MouseEventKind::Up(MouseButton::Left),
+            col_1based,
+            row_1based,
+            modifiers,
+        )
+        .unwrap_or_default(),
+    );
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+
+    #[test]
+    fn scroll_up_encodes_sgr_button_64() {
+        let bytes = mouse_scroll_to_sgr_bytes(
+            MouseEventKind::ScrollUp,
+            3, // col 1-based
+            5, // row 1-based
+            KeyModifiers::NONE,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<64;3;5M");
+    }
+
+    #[test]
+    fn scroll_down_encodes_sgr_button_65() {
+        let bytes = mouse_scroll_to_sgr_bytes(
+            MouseEventKind::ScrollDown,
+            1,
+            1,
+            KeyModifiers::NONE,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn scroll_with_ctrl_adds_16_to_button() {
+        let bytes = mouse_scroll_to_sgr_bytes(
+            MouseEventKind::ScrollUp,
+            2,
+            4,
+            KeyModifiers::CONTROL,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[<80;2;4M"); // 64 + 16
+    }
+
+    #[test]
+    fn non_scroll_kinds_return_none() {
+        assert!(mouse_scroll_to_sgr_bytes(
+            MouseEventKind::Moved,
+            1,
+            1,
+            KeyModifiers::NONE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn screen_to_pty_cell_translates_and_clamps() {
+        // pane at (10, 2), size 40x20
+        assert_eq!(screen_to_pty_cell(10, 2, 10, 2, 40, 20), Some((1, 1)));
+        assert_eq!(screen_to_pty_cell(19, 6, 10, 2, 40, 20), Some((10, 5)));
+        // outside pane
+        assert_eq!(screen_to_pty_cell(5, 6, 10, 2, 40, 20), None);
+        assert_eq!(screen_to_pty_cell(10, 1, 10, 2, 40, 20), None);
+        // clamp right/bottom edge inside pane to pane size
+        assert_eq!(screen_to_pty_cell(49, 21, 10, 2, 40, 20), Some((40, 20)));
+    }
+
+    #[test]
+    fn left_press_encodes_button_0_m_uppercase() {
+        assert_eq!(
+            mouse_event_to_sgr_bytes(MouseEventKind::Down(MouseButton::Left), 4, 7, KeyModifiers::NONE).unwrap(),
+            b"\x1b[<0;4;7M"
+        );
+    }
+
+    #[test]
+    fn left_release_encodes_button_0_m_lowercase() {
+        assert_eq!(
+            mouse_event_to_sgr_bytes(MouseEventKind::Up(MouseButton::Left), 4, 7, KeyModifiers::NONE).unwrap(),
+            b"\x1b[<0;4;7m"
+        );
+    }
+
+    #[test]
+    fn right_press_encodes_button_2() {
+        assert_eq!(
+            mouse_event_to_sgr_bytes(MouseEventKind::Down(MouseButton::Right), 1, 1, KeyModifiers::NONE).unwrap(),
+            b"\x1b[<2;1;1M"
+        );
+    }
+
+    #[test]
+    fn drag_returns_none() {
+        assert!(mouse_event_to_sgr_bytes(
+            MouseEventKind::Drag(MouseButton::Left), 1, 1, KeyModifiers::NONE
+        ).is_none());
     }
 }

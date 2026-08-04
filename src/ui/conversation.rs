@@ -14,6 +14,31 @@ use syntect::{
 
 use crate::data::db::models::{DbConversationMessage, DbConversationPart};
 
+pub const GUTTER: &str = "│ ";
+pub const TOOL_INDENT: &str = "  ";
+pub const REASONING_PREFIX: &str = "· ";
+
+pub fn user_color() -> Color {
+    Color::Cyan
+}
+pub fn assistant_color() -> Color {
+    Color::Green
+}
+pub fn meta_color() -> Color {
+    Color::DarkGray
+}
+pub fn body_user_color() -> Color {
+    Color::Cyan
+}
+pub fn body_assistant_color() -> Color {
+    Color::Reset
+}
+pub fn reasoning_style() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
+}
+
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
@@ -21,6 +46,7 @@ const THEME_NAME: &str = "base16-ocean.dark";
 
 pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let content_width = width.saturating_sub(2);
 
     if messages.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -32,73 +58,148 @@ pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Lin
 
     for msg in messages {
         let role_color = match msg.role.as_str() {
-            "user" => Color::Cyan,
-            "assistant" => Color::Green,
+            "user" => user_color(),
+            "assistant" => assistant_color(),
             _ => Color::Gray,
         };
+        let body_color = match msg.role.as_str() {
+            "user" => body_user_color(),
+            "assistant" => body_assistant_color(),
+            _ => Color::Reset,
+        };
+
         let role_label = match msg.role.as_str() {
-            "user" => "you",
+            "user" => "YOU".to_string(),
             "assistant" => {
                 if let Some(agent) = &msg.agent {
-                    if agent.is_empty() { "assistant" } else { agent }
+                    if agent.is_empty() {
+                        "assistant".to_string()
+                    } else {
+                        agent.clone()
+                    }
                 } else {
-                    "assistant"
+                    "assistant".to_string()
                 }
             }
-            _ => &msg.role,
+            _ => msg.role.clone(),
         };
         let time_str = format_timestamp(msg.time_created);
-        let header = if let Some(model) = &msg.model_id {
-            format!(" {role_label}  {time_str}  {model}")
-        } else {
-            format!(" {role_label}  {time_str}")
-        };
-        lines.push(Line::from(Span::styled(
-            header,
+
+        let gutter_span = Span::styled(
+            GUTTER,
             Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-        )));
+        );
+
+        let mut header_spans = vec![
+            gutter_span.clone(),
+            Span::styled(
+                role_label,
+                Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {time_str}"), Style::default().fg(meta_color())),
+        ];
+
+        if let Some(model) = &msg.model_id {
+            header_spans.push(Span::styled(
+                format!("  {model}"),
+                Style::default().fg(meta_color()),
+            ));
+        }
+
+        lines.push(Line::from(header_spans));
 
         let mut text_buffer = String::new();
+
+        let flush_text = |buf: &mut String, lines: &mut Vec<Line<'static>>| {
+            if buf.is_empty() {
+                return;
+            }
+            let md_lines = render_markdown(buf, content_width);
+            for mut line in md_lines {
+                apply_body_color(&mut line, body_color);
+                lines.push(prefix_gutter(line, gutter_span.clone()));
+            }
+            buf.clear();
+        };
+
         for part in &msg.parts {
             match part.part_type.as_str() {
-                "text" | "reasoning" => {
+                "text" => {
                     if let Some(text) = &part.text
                         && !text.is_empty()
                     {
                         text_buffer.push_str(text);
                     }
                 }
-                "tool" => {
-                    if !text_buffer.is_empty() {
-                        let md_lines = render_markdown(&text_buffer, width);
-                        lines.extend(md_lines);
-                        text_buffer.clear();
+                "reasoning" => {
+                    flush_text(&mut text_buffer, &mut lines);
+
+                    if let Some(text) = &part.text
+                        && !text.is_empty()
+                    {
+                        let reasoning_width =
+                            content_width.saturating_sub(REASONING_PREFIX.chars().count() as u16);
+                        for line_text in text.lines() {
+                            if line_text.trim().is_empty() {
+                                continue;
+                            }
+                            let mut r_lines = vec![Line::from(line_text.to_string())];
+                            wrap_lines(&mut r_lines, reasoning_width as usize);
+                            for r_line in r_lines {
+                                let mut spans = vec![
+                                    gutter_span.clone(),
+                                    Span::styled(REASONING_PREFIX, reasoning_style()),
+                                ];
+                                for s in r_line.spans {
+                                    spans.push(Span::styled(s.content, reasoning_style()));
+                                }
+                                lines.push(Line::from(spans));
+                            }
+                        }
                     }
-                    lines.push(render_tool_line(part));
+                }
+                "tool" => {
+                    flush_text(&mut text_buffer, &mut lines);
+                    let tool_line = render_tool_line(part, content_width);
+                    lines.push(prefix_gutter(tool_line, gutter_span.clone()));
                 }
                 _ => {
-                    if !text_buffer.is_empty() {
-                        let md_lines = render_markdown(&text_buffer, width);
-                        lines.extend(md_lines);
-                        text_buffer.clear();
-                    }
-                    lines.push(Line::from(Span::styled(
-                        format!(" [{}]", part.part_type),
-                        Style::default().fg(Color::DarkGray),
-                    )));
+                    flush_text(&mut text_buffer, &mut lines);
+                    let other_line = Line::from(vec![
+                        Span::raw(TOOL_INDENT),
+                        Span::styled(
+                            format!("[{}]", part.part_type),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]);
+                    lines.push(prefix_gutter(other_line, gutter_span.clone()));
                 }
             }
         }
 
-        if !text_buffer.is_empty() {
-            let md_lines = render_markdown(&text_buffer, width);
-            lines.extend(md_lines);
-        }
+        flush_text(&mut text_buffer, &mut lines);
 
         lines.push(Line::from(""));
     }
 
     lines
+}
+
+fn prefix_gutter(line: Line<'static>, gutter_span: Span<'static>) -> Line<'static> {
+    let mut spans = vec![gutter_span];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+fn apply_body_color(line: &mut Line<'static>, color: Color) {
+    if color == Color::Reset {
+        return;
+    }
+    for span in &mut line.spans {
+        if span.style.fg.is_none() || span.style.fg == Some(Color::Reset) {
+            span.style.fg = Some(color);
+        }
+    }
 }
 
 fn format_timestamp(ts: i64) -> String {
@@ -112,7 +213,7 @@ fn format_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| secs.to_string())
 }
 
-fn render_tool_line(part: &DbConversationPart) -> Line<'static> {
+fn render_tool_line(part: &DbConversationPart, width: u16) -> Line<'static> {
     let (icon, color) = match part.tool_status.as_deref() {
         Some("completed") => ("✓", Color::Green),
         Some("running") => ("⟳", Color::Yellow),
@@ -122,19 +223,24 @@ fn render_tool_line(part: &DbConversationPart) -> Line<'static> {
 
     let tool_name = part.tool.as_deref().unwrap_or("tool");
 
+    let prefix_len = TOOL_INDENT.len() + icon.len() + 1 + tool_name.len() + 2;
+    let max_detail_len = width.saturating_sub(prefix_len as u16) as usize;
+
     let detail = part
         .tool_title
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| part.tool_input.as_deref().map(|s| truncate(s, 60)));
+        .map(|s| truncate(s, max_detail_len))
+        .or_else(|| {
+            part.tool_input
+                .as_deref()
+                .map(|s| truncate(s, max_detail_len))
+        });
 
     let mut spans = vec![
+        Span::raw(TOOL_INDENT),
         Span::styled(format!("{icon} "), Style::default().fg(color)),
-        Span::styled(
-            tool_name.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(tool_name.to_string(), Style::default().fg(Color::Gray)),
     ];
 
     if let Some(detail) = detail {

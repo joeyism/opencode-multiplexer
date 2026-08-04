@@ -43,7 +43,7 @@ fn collapsed_sidebar_render_keeps_time_visible_inside_border() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, true, 14, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 14, true),
                 Rect::new(0, 0, 16, 4),
             );
         })
@@ -89,7 +89,7 @@ fn expanded_sidebar_render_right_aligns_time_within_content_width() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 20, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 20, true),
                 Rect::new(0, 0, 22, 4),
             );
         })
@@ -146,7 +146,7 @@ fn selected_row_does_not_restyle_status_dot() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 20, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 20, true),
                 Rect::new(0, 0, 22, 4),
             );
         })
@@ -177,17 +177,6 @@ fn ctrl_backslash_toggles_focus_between_sidebar_and_terminal() {
 
     reduce(&mut state, Action::ToggleFocus);
     assert_eq!(state.focus, AppFocus::Sidebar);
-}
-
-#[test]
-fn toggle_sidebar_collapse_action_flips_sidebar_state() {
-    let mut state = AppState::default();
-
-    reduce(&mut state, Action::ToggleSidebarCollapse);
-    assert!(state.sidebar_collapsed);
-
-    reduce(&mut state, Action::ToggleSidebarCollapse);
-    assert!(!state.sidebar_collapsed);
 }
 
 #[test]
@@ -307,7 +296,7 @@ fn subagents_working_status_uses_cyan_dot() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 25, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 25, true),
                 Rect::new(0, 0, 30, 4),
             );
         })
@@ -344,7 +333,7 @@ fn subagents_working_status_uses_cyan_dot_when_collapsed() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, true, 15, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 15, true),
                 Rect::new(0, 0, 20, 4),
             );
         })
@@ -380,7 +369,7 @@ fn subagents_working_status_stays_cyan_when_selected() {
     terminal
         .draw(|frame| {
             frame.render_widget(
-                render_sidebar(&rows, 0, AppFocus::Sidebar, false, 25, true),
+                render_sidebar(&rows, 0, AppFocus::Sidebar, 25, true),
                 Rect::new(0, 0, 30, 4),
             );
         })
