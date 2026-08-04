@@ -1,17 +1,21 @@
 [package]
 name = "opencode-multiplexer"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "A terminal multiplexer for managing OpenCode sessions"
 license = "Apache-2.0"
-repository = "https://github.com/joeyism/ocmux-rs"
-homepage = "https://github.com/joeyism/ocmux-rs"
+repository = "https://github.com/joeyism/opencode-multiplexer"
+homepage = "https://github.com/joeyism/opencode-multiplexer"
 readme = "README.md"
 keywords = ["terminal", "multiplexer", "tui", "opencode"]
 categories = ["command-line-utilities"]
 
 [[bin]]
 name = "ocmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "opencode-multiplexer"
 path = "src/main.rs"
 
 [dependencies]

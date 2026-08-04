@@ -26,9 +26,11 @@ fn identity_log(msg: impl Display) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    let _ = OpenOptions::new().create(true).append(true).open(path).and_then(|mut file| {
-        writeln!(file, "{ts} {msg}")
-    });
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{ts} {msg}"));
 }
 
 #[derive(Default)]
@@ -126,7 +128,9 @@ impl PtyManager {
             vec![],
         );
         self.ptys.insert(id, Some(pty));
-        identity_log(format!("spawn_managed entry={id} port={port} cwd={cwd_for_log:?} initial session_id=None"));
+        identity_log(format!(
+            "spawn_managed entry={id} port={port} cwd={cwd_for_log:?} initial session_id=None"
+        ));
         self.sessions.select_last();
         self.sessions.activate_selected();
         Ok(id)
@@ -463,14 +467,17 @@ impl PtyManager {
                     matched_ids.insert(id);
                     let old = summary.session_id.clone();
                     summary.session_id = Some(discovered.session_id.clone());
-                    identity_log(format!("poll_session_id_match entry={}: {:?} -> {:?} (title={:?})", id, old, summary.session_id, summary.title));
+                    identity_log(format!(
+                        "poll_session_id_match entry={}: {:?} -> {:?} (title={:?})",
+                        id, old, summary.session_id, summary.title
+                    ));
                     summary.cwd = discovered.cwd.clone();
                     summary.title = discovered.title.clone();
                     summary.status = discovered.status;
-                    if let Some(pid) = discovered.process_pid {
-                        if Some(pid) != summary.serve_pid {
-                            summary.process_pid = Some(pid);
-                        }
+                    if let Some(pid) = discovered.process_pid
+                        && Some(pid) != summary.serve_pid
+                    {
+                        summary.process_pid = Some(pid);
                     }
                     summary.model = discovered.model.clone();
                     summary.preview = discovered.preview.clone();
@@ -645,20 +652,20 @@ impl PtyManager {
         //
         // Safe fallback: if the DB is unavailable, the check is skipped and
         // the existing behavior is preserved.
-        if let Some(old_id) = old.as_deref() {
-            if old_id != new_id.as_str() {
-                let old_active = DbReader::open_default()
-                    .ok()
-                    .and_then(|r| r.session_is_active(old_id).ok())
-                    .unwrap_or(false);
-                if old_active {
-                    identity_log(format!(
-                        "apply_session_event DEFENSIVE SKIP port={port} entry={}: \
+        if let Some(old_id) = old.as_deref()
+            && old_id != new_id.as_str()
+        {
+            let old_active = DbReader::open_default()
+                .ok()
+                .and_then(|r| r.session_is_active(old_id).ok())
+                .unwrap_or(false);
+            if old_active {
+                identity_log(format!(
+                    "apply_session_event DEFENSIVE SKIP port={port} entry={}: \
                          old session {old_id:?} still active, ignoring new session {new_id:?}",
-                        summary.id
-                    ));
-                    return false;
-                }
+                    summary.id
+                ));
+                return false;
             }
         }
 
@@ -813,7 +820,10 @@ mod tests {
         };
         let dirty = manager.apply_session_event(4200, &event);
 
-        assert!(dirty, "None -> Some transition must continue to signal dirty");
+        assert!(
+            dirty,
+            "None -> Some transition must continue to signal dirty"
+        );
         assert_eq!(
             manager.sessions().items()[0].session_id.as_deref(),
             Some("ses_first")

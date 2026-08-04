@@ -749,15 +749,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     .items()
                                                     .iter()
                                                     .find(|s| s.id == id)
+                                                    && let Some(port) = summary.serve_port
                                                 {
-                                                    if let Some(port) = summary.serve_port {
-                                                        subscribers.push(
-                                                            SessionEventSubscriber::start(
-                                                                port,
-                                                                event_tx.clone(),
-                                                            ),
-                                                        );
-                                                    }
+                                                    subscribers.push(
+                                                        SessionEventSubscriber::start(
+                                                            port,
+                                                            event_tx.clone(),
+                                                        ),
+                                                    );
                                                 }
                                                 state.focus = AppFocus::Terminal;
                                                 state.selected_sidebar_row = 0;
@@ -886,14 +885,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                                     .items()
                                                                     .iter()
                                                                     .find(|s| s.id == id)
-                                                                {
-                                                                    if let Some(port) =
+                                                                    && let Some(port) =
                                                                         summary.serve_port
-                                                                    {
-                                                                        subscribers.push(
-                                                                            SessionEventSubscriber::start(port, event_tx.clone()),
-                                                                        );
-                                                                    }
+                                                                {
+                                                                    subscribers.push(
+                                                                        SessionEventSubscriber::start(port, event_tx.clone()),
+                                                                    );
                                                                 }
                                                                 footer_message = Some(format!(
                                                                     "spawned worktree {title}"
@@ -934,15 +931,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                             .items()
                                                             .iter()
                                                             .find(|s| s.id == id)
+                                                            && let Some(port) = summary.serve_port
                                                         {
-                                                            if let Some(port) = summary.serve_port {
-                                                                subscribers.push(
-                                                                    SessionEventSubscriber::start(
-                                                                        port,
-                                                                        event_tx.clone(),
-                                                                    ),
-                                                                );
-                                                            }
+                                                            subscribers.push(
+                                                                SessionEventSubscriber::start(
+                                                                    port,
+                                                                    event_tx.clone(),
+                                                                ),
+                                                            );
                                                         }
                                                         footer_message =
                                                             Some(format!("spawned {title}"));
@@ -1066,12 +1062,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 let wrapped = session.surface.wrapped_rows();
                                 if let Some(text) =
                                     terminal_selection.extract_text_from(&snapshot, &wrapped)
+                                    && !text.is_empty()
+                                    && let Err(e) = clipboard::copy_to_clipboard(&text)
                                 {
-                                    if !text.is_empty() {
-                                        if let Err(e) = clipboard::copy_to_clipboard(&text) {
-                                            footer_message = Some(format!("copy failed: {e}"));
-                                        }
-                                    }
+                                    footer_message = Some(format!("copy failed: {e}"));
                                 }
                                 state.focus = AppFocus::Terminal;
                                 handled = true;
