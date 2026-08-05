@@ -263,7 +263,7 @@ The sidebar shows your active and discovered opencode sessions. You can hide the
 
 ## Advanced workflows
 
-- **Inspect conversation output** — press `v` on any session (including child sessions) to watch the agent's progress in real-time without attaching to the PTY
+- **Inspect conversation output** — press `v` on any session (including child sessions) to watch the agent's progress in real-time without attaching to the PTY. Mermaid diagrams (` ```mermaid `) are automatically rendered as images in supported terminals (Kitty, etc.) or as high-fidelity half-block diagrams otherwise. Requires `mmdc` (Mermaid CLI) on your `PATH`.
 - **Inspect changed files** — press `d` to open a diff view of all changes made by a session (tracked and untracked)
 - **Inspect changed files (list)** — press `f` to see which files a session has created or modified. Press any key or `Esc` to close.
 - **Drop into a shell** — press `!` to open a shell in the selected session's working directory. The shell inherits the session's environment; exiting the shell returns to ocmux.

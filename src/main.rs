@@ -41,7 +41,9 @@ use opencode_multiplexer::{
         clipboard, input, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
     },
     ui::{
-        conversation, diff as ui_diff,
+        conversation::build_conversation_document,
+        conversation::diagram::mmdc::MermaidRenderConfig,
+        diff as ui_diff,
         layout::terminal_inner_rect,
         root,
         sidebar::{SidebarRowKind, flatten_sidebar_entries},
@@ -87,6 +89,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     let mut manager = PtyManager::default();
     let mut footer_message: Option<String> = None;
     let mut conversation = ConversationViewState::default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let mermaid_config = MermaidRenderConfig {
+        mmdc_path: PathBuf::from("mmdc"),
+        cache_dir: PathBuf::from(home).join(".cache/ocmux/mermaid"),
+        timeout: Duration::from_secs(10),
+        max_rows: 36,
+        prefetch_viewports: 1,
+        // true => force on; set_mermaid_config also ORs kitty auto-detect.
+        // OCMUX_NO_KITTY_GRAPHICS disables. OCMUX_PROTOCOL forces on.
+        protocol_enabled: std::env::var_os("OCMUX_PROTOCOL").is_some(),
+        invocation_log: None,
+    };
+    conversation.set_mermaid_config(mermaid_config);
     let mut diff_view = DiffViewState::default();
     let mut terminal_selection = TerminalSelection::default();
     let (poll_tx, poll_rx) = std::sync::mpsc::channel();
@@ -185,13 +200,24 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 conversation.mark_polled(Instant::now());
                 match DbReader::open_default().and_then(|r| r.get_conversation(&session_id)) {
                     Ok(messages) => {
-                        let doc = conversation::build_document(&messages, content_width);
+                        let doc = build_conversation_document(
+                            &messages,
+                            content_width,
+                            conversation.diagram_index(),
+                        );
                         conversation.replace_document(doc, viewport_height);
                         conversation.clear_error();
                     }
                     Err(e) => {
                         conversation.set_error(e.to_string());
                     }
+                }
+            }
+
+            if state.focus == AppFocus::Conversation {
+                conversation.scheduler_tick(viewport_height, content_width);
+                for finished in conversation.poll_diagram_completions() {
+                    conversation.apply_diagram_update(finished, viewport_height);
                 }
             }
 
@@ -228,6 +254,37 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     terminal_selection.range(),
                 )
             })?;
+
+            // Overlay Kitty pixel graphics for mermaid diagrams (scroll-coupled).
+            // Must run AFTER ratatui draw so cells don't paint over the images.
+            // Clear whenever conversation is not the exclusive full-screen view
+            // (other focus, pickers, help, quit confirm) so images don't ghost.
+            let overlays_block_graphics = state.session_picker.is_some()
+                || state.session_manager.is_some()
+                || state.message_picker.is_some()
+                || state.show_help
+                || state.confirm_quit;
+            let show_kitty = matches!(state.focus, AppFocus::Conversation)
+                && conversation.is_active()
+                && !overlays_block_graphics;
+            if show_kitty {
+                let area = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                // Shrink for search bar if active (mirror root.rs).
+                let area = if conversation.is_searching() || !conversation.search_query().is_empty()
+                {
+                    ratatui::layout::Rect::new(
+                        area.x,
+                        area.y,
+                        area.width,
+                        area.height.saturating_sub(1),
+                    )
+                } else {
+                    area
+                };
+                let _ = conversation.paint_kitty_graphics(terminal.backend_mut(), area);
+            } else if conversation.has_kitty_graphics() {
+                let _ = conversation.clear_kitty_graphics(terminal.backend_mut());
+            }
 
             if !event::poll(Duration::from_millis(16))? {
                 continue;
@@ -976,12 +1033,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         ) {
                             KeyAction::Consumed => {}
                             KeyAction::Close => {
+                                let _ = conversation.clear_kitty_graphics(terminal.backend_mut());
                                 let return_focus = conversation.close();
                                 state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));
                                 footer_message = None;
                             }
                             KeyAction::PasteSelection(text) => {
+                                let _ = conversation.clear_kitty_graphics(terminal.backend_mut());
                                 let return_focus = conversation.close();
                                 state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));

@@ -1,18 +1,35 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::text::Line;
 
 use crate::app::focus::AppFocus;
+use crate::ui::conversation::diagram::mmdc::MermaidRenderConfig;
+use crate::ui::conversation::diagram::protocol::{
+    DiagramPaint, KittyImagePlacer, kitty_graphics_supported, slot_visibility, source_crop,
+};
+use crate::ui::conversation::diagram::scheduler::{DiagramScheduler, RenderFinished};
+use crate::ui::conversation::diagram::slot::{DiagramIndex, DiagramPhase, DiagramSlot};
+use crate::ui::conversation::document::{ConversationDocument, DocBlock};
+use ratatui::layout::Rect;
+use std::io::Write;
+
+/// Owned Kitty paint record: hash, png bytes, dest rect, source crop x/y/w/h.
+type KittyPaintOwned = (String, Vec<u8>, Rect, u32, u32, u32, u32);
 
 pub struct ConversationViewState {
     session_id: Option<String>,
     session_title: String,
     return_focus: AppFocus,
-    document: Vec<Line<'static>>,
+    document: ConversationDocument,
+    diagrams: DiagramIndex,
+    scheduler: Option<DiagramScheduler>,
     scroll: usize,
     follow_tail: bool,
     last_poll: Option<Instant>,
     load_error: Option<String>,
+    protocol_enabled: bool,
+    kitty: KittyImagePlacer,
     // Search state
     search_query: String,
     search_active: bool,
@@ -26,11 +43,15 @@ impl Default for ConversationViewState {
             session_id: None,
             session_title: String::new(),
             return_focus: AppFocus::Sidebar,
-            document: Vec::new(),
+            document: ConversationDocument::new(),
+            diagrams: DiagramIndex::default(),
+            scheduler: None,
             scroll: 0,
             follow_tail: true,
             last_poll: None,
             load_error: None,
+            protocol_enabled: false,
+            kitty: KittyImagePlacer::new(),
             search_query: String::new(),
             search_active: false,
             match_positions: Vec::new(),
@@ -44,7 +65,7 @@ impl ConversationViewState {
         self.session_id = Some(session_id);
         self.session_title = session_title;
         self.return_focus = return_focus;
-        self.document.clear();
+        self.document = ConversationDocument::new();
         self.scroll = 0;
         self.follow_tail = true;
         self.last_poll = None;
@@ -57,13 +78,15 @@ impl ConversationViewState {
 
     pub fn close(&mut self) -> AppFocus {
         self.session_id = None;
-        self.document.clear();
+        self.document = ConversationDocument::new();
         self.scroll = 0;
         self.load_error = None;
         self.search_query.clear();
         self.search_active = false;
         self.match_positions.clear();
         self.current_match = 0;
+        // Kitty placements are cleared by the main loop via clear_kitty_graphics
+        // when focus leaves conversation; keep placer state for next open.
         self.return_focus
     }
 
@@ -94,13 +117,13 @@ impl ConversationViewState {
         self.last_poll = Some(now);
     }
 
-    pub fn replace_document(&mut self, lines: Vec<Line<'static>>, viewport_height: usize) {
+    pub fn replace_document(&mut self, doc: ConversationDocument, viewport_height: usize) {
         let was_at_tail = self.follow_tail;
-        self.document = lines;
+        self.document = doc;
         if was_at_tail {
             self.scroll_to_end(viewport_height);
-        } else if self.scroll >= self.document.len() {
-            self.scroll = self.document.len().saturating_sub(1);
+        } else if self.scroll >= self.document.total_rows() {
+            self.scroll = self.document.total_rows().saturating_sub(1);
         }
         if !self.search_query.is_empty() {
             self.refresh_matches(viewport_height);
@@ -116,8 +139,8 @@ impl ConversationViewState {
     }
 
     pub fn visible_lines(&self, viewport_height: usize) -> Vec<Line<'static>> {
-        let end = (self.scroll + viewport_height).min(self.document.len());
-        self.document[self.scroll..end].to_vec()
+        self.document
+            .visible_lines(self.scroll, viewport_height, self.protocol_enabled)
     }
 
     pub fn scroll_offset(&self) -> usize {
@@ -125,7 +148,7 @@ impl ConversationViewState {
     }
 
     pub fn document_len(&self) -> usize {
-        self.document.len()
+        self.document.total_rows()
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
@@ -134,7 +157,8 @@ impl ConversationViewState {
     }
 
     pub fn scroll_down(&mut self, amount: usize, viewport_height: usize) {
-        let max_scroll = self.document.len().saturating_sub(viewport_height);
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
         self.scroll = (self.scroll + amount).min(max_scroll);
         if self.scroll >= max_scroll {
             self.follow_tail = true;
@@ -147,7 +171,8 @@ impl ConversationViewState {
     }
 
     pub fn scroll_to_end(&mut self, viewport_height: usize) {
-        let max_scroll = self.document.len().saturating_sub(viewport_height);
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
         self.scroll = max_scroll;
         self.follow_tail = true;
     }
@@ -160,7 +185,8 @@ impl ConversationViewState {
     }
 
     pub fn clamp_scroll(&mut self, viewport_height: usize) {
-        let max_scroll = self.document.len().saturating_sub(viewport_height);
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
@@ -267,17 +293,33 @@ impl ConversationViewState {
         }
 
         let query_lower = self.search_query.to_lowercase();
+        let mut current_row = 0;
 
-        for (line_idx, line) in self.document.iter().enumerate() {
-            let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let flat_lower = flat.to_lowercase();
+        for block in &self.document.blocks {
+            match block {
+                DocBlock::Text(lines) => {
+                    for (i, line) in lines.iter().enumerate() {
+                        let line_idx = current_row + i;
+                        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                        let flat_lower = flat.to_lowercase();
 
-            let mut start = 0;
-            while let Some(pos) = flat_lower[start..].find(&query_lower) {
-                let byte_start = start + pos;
-                self.match_positions
-                    .push((line_idx, byte_start, query_lower.len()));
-                start = byte_start + query_lower.len();
+                        let mut start = 0;
+                        while let Some(pos) = flat_lower[start..].find(&query_lower) {
+                            let byte_start = start + pos;
+                            self.match_positions
+                                .push((line_idx, byte_start, query_lower.len()));
+                            start = byte_start + query_lower.len();
+                        }
+                    }
+                    current_row += lines.len();
+                }
+                DocBlock::Diagram(slot) => {
+                    let source_lower = slot.source.to_lowercase();
+                    if source_lower.contains(&query_lower) {
+                        self.match_positions.push((current_row, 0, 0));
+                    }
+                    current_row += slot.row_height;
+                }
             }
         }
 
@@ -295,13 +337,175 @@ impl ConversationViewState {
     /// Scroll so the current match is visible in the viewport.
     fn scroll_to_current_match(&mut self, viewport_height: usize) {
         if let Some(&(line_idx, _, _)) = self.match_positions.get(self.current_match) {
-            let max_scroll = self.document.len().saturating_sub(viewport_height);
+            let total = self.document.total_rows();
+            let max_scroll = total.saturating_sub(viewport_height);
             if line_idx < self.scroll {
+                // Match is above viewport — scroll up to show it.
                 self.scroll = line_idx;
+                self.follow_tail = false;
             } else if line_idx >= self.scroll + viewport_height {
+                // Match is below viewport — scroll down.
                 self.scroll = line_idx.saturating_sub(viewport_height / 2).min(max_scroll);
+                self.follow_tail = self.scroll >= max_scroll;
             }
-            self.follow_tail = false;
         }
+    }
+
+    pub fn apply_diagram_update(&mut self, finished: RenderFinished, viewport_height: usize) {
+        let hash = finished.hash;
+        let phase = finished.result;
+
+        // Update index
+        let mut row_height = 8;
+        if let DiagramPhase::Ready { row_height: h, .. } = &phase {
+            row_height = *h;
+        }
+
+        let source = self
+            .diagrams
+            .get(&hash)
+            .map(|s| s.source.clone())
+            .or_else(|| {
+                self.document.blocks.iter().find_map(|b| match b {
+                    DocBlock::Diagram(s) if s.hash == hash => Some(s.source.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+
+        let updated_slot = Arc::new(DiagramSlot {
+            hash: hash.clone(),
+            source,
+            phase,
+            row_height,
+        });
+
+        self.diagrams
+            .slots
+            .insert(hash.clone(), updated_slot.clone());
+
+        // Update current document slots
+        for block in &mut self.document.blocks {
+            if let DocBlock::Diagram(slot) = block {
+                if slot.hash == hash {
+                    *slot = (*updated_slot).clone();
+                }
+            }
+        }
+
+        if self.follow_tail {
+            self.scroll_to_end(viewport_height);
+        } else {
+            self.clamp_scroll(viewport_height);
+        }
+    }
+
+    pub fn diagram_index(&self) -> &DiagramIndex {
+        &self.diagrams
+    }
+
+    pub fn set_mermaid_config(&mut self, cfg: MermaidRenderConfig) {
+        // Auto-enable Kitty pixels when supported unless caller forced a value
+        // via OCMUX_NO_KITTY_GRAPHICS (handled inside kitty_graphics_supported).
+        self.protocol_enabled = cfg.protocol_enabled || kitty_graphics_supported();
+        self.scheduler = Some(DiagramScheduler::new(cfg));
+    }
+
+    pub fn protocol_enabled(&self) -> bool {
+        self.protocol_enabled
+    }
+
+    pub fn scheduler_tick(&mut self, viewport_height: usize, width: u16) {
+        if let Some(ref mut sched) = self.scheduler {
+            sched.tick(&self.document, self.scroll, viewport_height, width);
+        }
+    }
+
+    pub fn poll_diagram_completions(&mut self) -> Vec<RenderFinished> {
+        if let Some(ref mut sched) = self.scheduler {
+            sched.poll_completions()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Owned paint records for Kitty (hash, png, dest rect, source crop).
+    pub fn collect_kitty_paints(&self, area: Rect) -> Vec<KittyPaintOwned> {
+        if !self.protocol_enabled {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut row = 0usize;
+        for block in &self.document.blocks {
+            match block {
+                DocBlock::Text(lines) => row += lines.len(),
+                DocBlock::Diagram(slot) => {
+                    let start = row;
+                    let height = slot.row_height;
+                    if let DiagramPhase::Ready {
+                        png,
+                        png_w,
+                        png_h,
+                        col_width,
+                        ..
+                    } = &slot.phase
+                    {
+                        if let Some(vis) =
+                            slot_visibility(start, height, self.scroll, area, *col_width)
+                        {
+                            let (sx, sy, sw, sh) = source_crop(
+                                *png_w,
+                                *png_h,
+                                vis.full_rows,
+                                vis.clip_top_rows,
+                                vis.visible_rows,
+                            );
+                            out.push((
+                                slot.hash.clone(),
+                                png.as_ref().clone(),
+                                vis.screen_rect,
+                                sx,
+                                sy,
+                                sw,
+                                sh,
+                            ));
+                        }
+                    }
+                    row += height;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn paint_kitty_graphics(&mut self, out: &mut dyn Write, area: Rect) -> std::io::Result<()> {
+        if !self.protocol_enabled {
+            return Ok(());
+        }
+        let paints_owned = self.collect_kitty_paints(area);
+        let paints: Vec<DiagramPaint<'_>> = paints_owned
+            .iter()
+            .map(|(hash, png, rect, sx, sy, sw, sh)| DiagramPaint {
+                hash: hash.as_str(),
+                png: png.as_slice(),
+                rect: *rect,
+                src_x: *sx,
+                src_y: *sy,
+                src_w: *sw,
+                src_h: *sh,
+            })
+            .collect();
+        self.kitty.paint_frame(out, &paints)
+    }
+
+    pub fn has_kitty_graphics(&self) -> bool {
+        self.protocol_enabled && self.kitty.has_graphics()
+    }
+
+    pub fn clear_kitty_graphics(&mut self, out: &mut dyn Write) -> std::io::Result<()> {
+        if !self.protocol_enabled {
+            return Ok(());
+        }
+        self.kitty.clear_all(out)
     }
 }

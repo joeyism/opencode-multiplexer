@@ -21,8 +21,10 @@ path = "src/main.rs"
 [dependencies]
 alacritty_terminal = "0.26"
 anyhow = "1"
+base64 = "0.22"
 arboard = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 crossterm = "0.28"
 portable-pty = "0.9"
 ratatui = "0.30.0-beta.0"
@@ -34,8 +36,11 @@ libc = "0.2"
 pulldown-cmark = "0.12"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 nucleo = "0.5"
+sha2 = "0.10"
+wait-timeout = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4.16", default-features = false, features = ["z"] }
@@ -45,6 +50,7 @@ notify-rust = { version = "4.16", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1"
+uuid = { version = "1", features = ["v4"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

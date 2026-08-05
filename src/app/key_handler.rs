@@ -250,7 +250,9 @@ mod tests {
             "Test".into(),
             crate::app::focus::AppFocus::Sidebar,
         );
-        c.replace_document(make_document(texts), 100);
+        let mut doc = crate::ui::conversation::document::ConversationDocument::new();
+        doc.push_lines(make_document(texts));
+        c.replace_document(doc, 100);
         c
     }
 

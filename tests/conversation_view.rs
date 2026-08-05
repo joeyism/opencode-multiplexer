@@ -1,7 +1,9 @@
 use opencode_multiplexer::app::conversation::ConversationViewState;
 use opencode_multiplexer::data::db::models::{DbConversationMessage, DbConversationPart};
+use opencode_multiplexer::ui::conversation::diagram::slot::DiagramIndex;
 use opencode_multiplexer::ui::conversation::{
     self, GUTTER, REASONING_PREFIX, TOOL_INDENT, body_assistant_color, body_user_color,
+    build_conversation_document,
 };
 use opencode_multiplexer::ui::diff::highlight_search_matches;
 use ratatui::style::{Color, Modifier};
@@ -571,14 +573,14 @@ fn tool_without_tool_name_uses_fallback() {
 #[test]
 fn search_finds_body_text_despite_gutter_prefix() {
     let m = msg("user", vec![part("text", Some("unique_needle_abc"))]);
-    let doc = conversation::build_document(&[m], 80);
+    let doc_blocks = build_conversation_document(&[m.clone()], 80, &DiagramIndex::default());
     let mut state = ConversationViewState::default();
     state.open(
         "s1".into(),
         "t".into(),
         opencode_multiplexer::app::focus::AppFocus::Sidebar,
     );
-    state.replace_document(doc.clone(), 50);
+    state.replace_document(doc_blocks, 50);
     state.start_search();
     state.search_insert_str("unique_needle", 50);
     let (cur, total) = state.match_status().expect("match");
@@ -586,7 +588,8 @@ fn search_finds_body_text_despite_gutter_prefix() {
     assert!(total >= 1);
 
     let (line_idx, byte_start, len) = state.matches()[0];
-    let line_flat: String = doc[line_idx]
+    let doc_lines = conversation::build_document(&[m], 80);
+    let line_flat: String = doc_lines[line_idx]
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -598,25 +601,22 @@ fn search_finds_body_text_despite_gutter_prefix() {
 #[test]
 fn search_highlight_preserves_gutter_and_marks_match() {
     let m = msg("user", vec![part("text", Some("highlight_me_now"))]);
-    let doc = conversation::build_document(&[m], 80);
+    let doc_blocks = build_conversation_document(&[m.clone()], 80, &DiagramIndex::default());
     let mut state = ConversationViewState::default();
     state.open(
         "s1".into(),
         "t".into(),
         opencode_multiplexer::app::focus::AppFocus::Sidebar,
     );
-    state.replace_document(doc, 50);
+    state.replace_document(doc_blocks, 50);
     state.start_search();
     state.search_insert_str("highlight_me", 50);
     let (line_idx, _, _) = state.matches()[0];
 
     // Re-build doc to get the line to highlight
-    let doc = conversation::build_document(
-        &[msg("user", vec![part("text", Some("highlight_me_now"))])],
-        80,
-    );
+    let doc_lines = conversation::build_document(&[m], 80);
     let highlighted = highlight_search_matches(
-        std::slice::from_ref(&doc[line_idx]),
+        std::slice::from_ref(&doc_lines[line_idx]),
         line_idx, // scroll_offset so abs idx matches
         state.matches(),
         0,

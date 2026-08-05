@@ -1864,8 +1864,10 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "arboard",
+ "base64",
  "chrono",
  "crossterm 0.28.1",
+ "image",
  "libc",
  "notify-rust",
  "nucleo",
@@ -1877,9 +1879,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "syntect",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -3443,6 +3448,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

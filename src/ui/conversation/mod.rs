@@ -1,5 +1,12 @@
 use std::sync::LazyLock;
 
+pub mod diagram;
+pub mod document;
+
+use diagram::hash::hash_source;
+use diagram::slot::{DiagramIndex, DiagramSlot};
+use document::{ConversationDocument, DocBlock};
+
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -44,16 +51,20 @@ static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 const THEME_NAME: &str = "base16-ocean.dark";
 
-pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+pub fn build_conversation_document(
+    messages: &[DbConversationMessage],
+    width: u16,
+    diagrams: &DiagramIndex,
+) -> ConversationDocument {
+    let mut doc = ConversationDocument::new();
     let content_width = width.saturating_sub(2);
 
     if messages.is_empty() {
-        lines.push(Line::from(Span::styled(
+        doc.push_lines(vec![Line::from(Span::styled(
             "No messages yet.",
             Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
+        ))]);
+        return doc;
     }
 
     for msg in messages {
@@ -106,18 +117,35 @@ pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Lin
             ));
         }
 
-        lines.push(Line::from(header_spans));
+        doc.push_lines(vec![Line::from(header_spans)]);
 
         let mut text_buffer = String::new();
 
-        let flush_text = |buf: &mut String, lines: &mut Vec<Line<'static>>| {
+        let flush_text = |buf: &mut String, doc: &mut ConversationDocument| {
             if buf.is_empty() {
                 return;
             }
-            let md_lines = render_markdown(buf, content_width);
-            for mut line in md_lines {
-                apply_body_color(&mut line, body_color);
-                lines.push(prefix_gutter(line, gutter_span.clone()));
+            let blocks = render_markdown_blocks(buf, content_width, diagrams);
+            for block in blocks {
+                match block {
+                    DocBlock::Text(mut lines) => {
+                        for line in &mut lines {
+                            apply_body_color(line, body_color);
+                        }
+                        let lines_with_gutter = lines
+                            .into_iter()
+                            .map(|l| prefix_gutter(l, gutter_span.clone()))
+                            .collect();
+                        doc.push_lines(lines_with_gutter);
+                    }
+                    DocBlock::Diagram(slot) => {
+                        // For now, diagrams don't get the gutter in the block itself
+                        // but maybe they should? The design says "gutters/headers still correct".
+                        // I'll add gutter to diagram lines later in visible_lines or here.
+                        // For simplicity, I'll just push the diagram block.
+                        doc.push_diagram(slot);
+                    }
+                }
             }
             buf.clear();
         };
@@ -132,13 +160,14 @@ pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Lin
                     }
                 }
                 "reasoning" => {
-                    flush_text(&mut text_buffer, &mut lines);
+                    flush_text(&mut text_buffer, &mut doc);
 
                     if let Some(text) = &part.text
                         && !text.is_empty()
                     {
                         let reasoning_width =
                             content_width.saturating_sub(REASONING_PREFIX.chars().count() as u16);
+                        let mut r_lines_all = Vec::new();
                         for line_text in text.lines() {
                             if line_text.trim().is_empty() {
                                 continue;
@@ -153,18 +182,19 @@ pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Lin
                                 for s in r_line.spans {
                                     spans.push(Span::styled(s.content, reasoning_style()));
                                 }
-                                lines.push(Line::from(spans));
+                                r_lines_all.push(Line::from(spans));
                             }
                         }
+                        doc.push_lines(r_lines_all);
                     }
                 }
                 "tool" => {
-                    flush_text(&mut text_buffer, &mut lines);
+                    flush_text(&mut text_buffer, &mut doc);
                     let tool_line = render_tool_line(part, content_width);
-                    lines.push(prefix_gutter(tool_line, gutter_span.clone()));
+                    doc.push_lines(vec![prefix_gutter(tool_line, gutter_span.clone())]);
                 }
                 _ => {
-                    flush_text(&mut text_buffer, &mut lines);
+                    flush_text(&mut text_buffer, &mut doc);
                     let other_line = Line::from(vec![
                         Span::raw(TOOL_INDENT),
                         Span::styled(
@@ -172,17 +202,22 @@ pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Lin
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]);
-                    lines.push(prefix_gutter(other_line, gutter_span.clone()));
+                    doc.push_lines(vec![prefix_gutter(other_line, gutter_span.clone())]);
                 }
             }
         }
 
-        flush_text(&mut text_buffer, &mut lines);
+        flush_text(&mut text_buffer, &mut doc);
 
-        lines.push(Line::from(""));
+        doc.push_lines(vec![Line::from("")]);
     }
 
-    lines
+    doc
+}
+
+pub fn build_document(messages: &[DbConversationMessage], width: u16) -> Vec<Line<'static>> {
+    let doc = build_conversation_document(messages, width, &DiagramIndex::default());
+    doc.visible_lines(0, usize::MAX, false)
 }
 
 fn prefix_gutter(line: Line<'static>, gutter_span: Span<'static>) -> Line<'static> {
@@ -259,7 +294,8 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+fn render_markdown_blocks(text: &str, width: u16, diagrams: &DiagramIndex) -> Vec<DocBlock> {
+    let mut blocks: Vec<DocBlock> = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let parser = Parser::new_ext(text, Options::ENABLE_TABLES);
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -268,6 +304,12 @@ fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut code_block_lang: Option<String> = None;
     let mut code_block_text = String::new();
     let mut list_counter: usize = 0;
+
+    let flush_lines = |lines: &mut Vec<Line<'static>>, blocks: &mut Vec<DocBlock>| {
+        if !lines.is_empty() {
+            blocks.push(DocBlock::Text(std::mem::take(lines)));
+        }
+    };
 
     for event in parser {
         match event {
@@ -308,10 +350,22 @@ fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
-                let highlighted =
-                    highlight_code_block(&code_block_text, code_block_lang.as_deref());
-                lines.extend(highlighted);
-                lines.push(Line::from(""));
+                if let Some(lang) = &code_block_lang
+                    && lang.eq_ignore_ascii_case("mermaid")
+                {
+                    flush_lines(&mut lines, &mut blocks);
+                    let h = hash_source(&code_block_text);
+                    let slot = diagrams
+                        .get(&h)
+                        .map(|s| (*s).clone())
+                        .unwrap_or_else(|| DiagramSlot::placeholder(&h, &code_block_text, 8));
+                    blocks.push(DocBlock::Diagram(slot));
+                } else {
+                    let highlighted =
+                        highlight_code_block(&code_block_text, code_block_lang.as_deref());
+                    lines.extend(highlighted);
+                    lines.push(Line::from(""));
+                }
                 code_block_lang = None;
             }
             Event::Start(Tag::List(start_num)) => {
@@ -403,10 +457,16 @@ fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     }
 
     flush_spans(&mut current_spans, &mut lines);
+    flush_lines(&mut lines, &mut blocks);
 
-    wrap_lines(&mut lines, width as usize);
+    // Apply wrapping to text blocks
+    for block in &mut blocks {
+        if let DocBlock::Text(lines) = block {
+            wrap_lines(lines, width as usize);
+        }
+    }
 
-    lines
+    blocks
 }
 
 fn flush_spans(spans: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>) {
