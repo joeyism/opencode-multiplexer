@@ -476,8 +476,8 @@ fn long_reasoning_line_wraps() {
 #[test]
 fn narrow_width_does_not_panic() {
     let m = msg("user", vec![part("text", Some("hi"))]);
-    let _ = conversation::build_document(&[m.clone()], 1);
-    let _ = conversation::build_document(&[m.clone()], 2);
+    let _ = conversation::build_document(std::slice::from_ref(&m), 1);
+    let _ = conversation::build_document(std::slice::from_ref(&m), 2);
     let _ = conversation::build_document(&[m], 5);
 }
 
@@ -573,7 +573,8 @@ fn tool_without_tool_name_uses_fallback() {
 #[test]
 fn search_finds_body_text_despite_gutter_prefix() {
     let m = msg("user", vec![part("text", Some("unique_needle_abc"))]);
-    let doc_blocks = build_conversation_document(&[m.clone()], 80, &DiagramIndex::default());
+    let doc_blocks =
+        build_conversation_document(std::slice::from_ref(&m), 80, &DiagramIndex::default());
     let mut state = ConversationViewState::default();
     state.open(
         "s1".into(),
@@ -601,7 +602,8 @@ fn search_finds_body_text_despite_gutter_prefix() {
 #[test]
 fn search_highlight_preserves_gutter_and_marks_match() {
     let m = msg("user", vec![part("text", Some("highlight_me_now"))]);
-    let doc_blocks = build_conversation_document(&[m.clone()], 80, &DiagramIndex::default());
+    let doc_blocks =
+        build_conversation_document(std::slice::from_ref(&m), 80, &DiagramIndex::default());
     let mut state = ConversationViewState::default();
     state.open(
         "s1".into(),

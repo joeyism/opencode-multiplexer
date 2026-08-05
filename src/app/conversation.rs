@@ -386,10 +386,10 @@ impl ConversationViewState {
 
         // Update current document slots
         for block in &mut self.document.blocks {
-            if let DocBlock::Diagram(slot) = block {
-                if slot.hash == hash {
-                    *slot = (*updated_slot).clone();
-                }
+            if let DocBlock::Diagram(slot) = block
+                && slot.hash == hash
+            {
+                *slot = (*updated_slot).clone();
             }
         }
 
@@ -449,27 +449,25 @@ impl ConversationViewState {
                         col_width,
                         ..
                     } = &slot.phase
-                    {
-                        if let Some(vis) =
+                        && let Some(vis) =
                             slot_visibility(start, height, self.scroll, area, *col_width)
-                        {
-                            let (sx, sy, sw, sh) = source_crop(
-                                *png_w,
-                                *png_h,
-                                vis.full_rows,
-                                vis.clip_top_rows,
-                                vis.visible_rows,
-                            );
-                            out.push((
-                                slot.hash.clone(),
-                                png.as_ref().clone(),
-                                vis.screen_rect,
-                                sx,
-                                sy,
-                                sw,
-                                sh,
-                            ));
-                        }
+                    {
+                        let (sx, sy, sw, sh) = source_crop(
+                            *png_w,
+                            *png_h,
+                            vis.full_rows,
+                            vis.clip_top_rows,
+                            vis.visible_rows,
+                        );
+                        out.push((
+                            slot.hash.clone(),
+                            png.as_ref().clone(),
+                            vis.screen_rect,
+                            sx,
+                            sy,
+                            sw,
+                            sh,
+                        ));
                     }
                     row += height;
                 }

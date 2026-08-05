@@ -107,15 +107,15 @@ pub fn kitty_graphics_supported() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some() {
         return true;
     }
-    if let Ok(term) = std::env::var("TERM") {
-        if term.contains("kitty") {
-            return true;
-        }
+    if let Ok(term) = std::env::var("TERM")
+        && term.contains("kitty")
+    {
+        return true;
     }
-    if let Ok(prog) = std::env::var("TERM_PROGRAM") {
-        if prog.eq_ignore_ascii_case("ghostty") || prog.eq_ignore_ascii_case("WezTerm") {
-            return true;
-        }
+    if let Ok(prog) = std::env::var("TERM_PROGRAM")
+        && (prog.eq_ignore_ascii_case("ghostty") || prog.eq_ignore_ascii_case("WezTerm"))
+    {
+        return true;
     }
     false
 }
@@ -218,11 +218,11 @@ impl KittyImagePlacer {
         let visible_hashes: Vec<String> = paints.iter().map(|p| p.hash.to_string()).collect();
 
         for old in &self.last_visible {
-            if !visible_hashes.iter().any(|h| h == old) {
-                if let Some(&id) = self.uploaded.get(old) {
-                    write_apc(out, &format!("a=d,d=i,i={id},q=2"))?;
-                    self.uploaded.remove(old);
-                }
+            if !visible_hashes.iter().any(|h| h == old)
+                && let Some(&id) = self.uploaded.get(old)
+            {
+                write_apc(out, &format!("a=d,d=i,i={id},q=2"))?;
+                self.uploaded.remove(old);
             }
         }
 

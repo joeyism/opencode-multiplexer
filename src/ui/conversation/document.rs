@@ -125,7 +125,7 @@ impl ConversationDocument {
         None
     }
 
-    pub fn diagram_covering_row(&self, row: usize) -> Option<SlotInfo> {
+    pub fn diagram_covering_row(&self, row: usize) -> Option<SlotInfo<'_>> {
         let mut current_row = 0;
         for block in &self.blocks {
             let height = match block {

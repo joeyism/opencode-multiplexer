@@ -1225,20 +1225,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         inner.y,
                                         inner.width,
                                         inner.height,
+                                    ) && let Some(bytes) = input::mouse_scroll_to_sgr_bytes(
+                                        mouse.kind,
+                                        col,
+                                        row,
+                                        mouse.modifiers,
                                     ) {
-                                        if let Some(bytes) = input::mouse_scroll_to_sgr_bytes(
-                                            mouse.kind,
-                                            col,
-                                            row,
-                                            mouse.modifiers,
-                                        ) {
-                                            terminal_selection.clear();
-                                            if let Some(pty) = manager.active_session_mut()
-                                                && let Err(error) = pty.send_bytes(&bytes)
-                                            {
-                                                footer_message =
-                                                    Some(format!("mouse scroll failed: {error}"));
-                                            }
+                                        terminal_selection.clear();
+                                        if let Some(pty) = manager.active_session_mut()
+                                            && let Err(error) = pty.send_bytes(&bytes)
+                                        {
+                                            footer_message =
+                                                Some(format!("mouse scroll failed: {error}"));
                                         }
                                     }
                                 }
