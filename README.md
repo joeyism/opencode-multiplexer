@@ -29,6 +29,13 @@ A terminal multiplexer for managing [OpenCode](https://opencode.ai) sessions.
 </p>
 </details>
 
+<details>
+<summary><b>Mermaid Diagrams</b></summary>
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/927fb400-567d-4e36-a17f-64fddd23f286" width="80%" controls></video>
+</p>
+</details>
+
 ## Table of Contents
 - [Install](#install)
 - [Usage](#usage)
@@ -68,6 +75,16 @@ brew install ocmux
 ```
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/joeyism/ocmux-rs/releases/latest/download/ocmux-rs-installer.sh | sh
 ```
+
+### Optional: Mermaid diagrams in conversation view
+
+Conversation view can render fenced ` ```mermaid ` blocks as images. This requires the [Mermaid CLI](https://github.com/mermaid-js/mermaid-cli) (`mmdc`) on your `PATH`:
+
+```
+npm install -g @mermaid-js/mermaid-cli
+```
+
+Pixel graphics work best in Kitty (and other terminals that speak the Kitty graphics protocol). Without `mmdc`, mermaid fences fall back to normal syntax-highlighted code blocks.
 
 ## Usage
 
@@ -161,9 +178,15 @@ The footer shows `matched/total` counts. Results are sorted by fuzzy match score
 
 ### Conversation view
 
+<p align="center" width="100%">
+<video src="https://github.com/user-attachments/assets/927fb400-567d-4e36-a17f-64fddd23f286" width="80%" controls></video>
+</p>
+
 Press `v` from the sidebar to open a read-only view of the session's conversation history. The view polls the opencode database every second and renders messages, markdown, syntax-highlighted code blocks, and tool call status.
 
 Turns are visually separated with a role-colored left gutter (`│`). User turns use cyan (`YOU`); assistant turns use green (agent name). Reasoning is dim italic; tool calls are indented and muted under the gutter.
+
+**Mermaid diagrams:** Fenced ` ```mermaid ` blocks are rendered as images when `mmdc` is installed (see [Optional: Mermaid diagrams](#optional-mermaid-diagrams-in-conversation-view)). In Kitty and compatible terminals, diagrams use pixel graphics and scroll with the conversation; otherwise they fall back to half-block rendering. Without `mmdc`, the fence is shown as a normal code block.
 
 | Key      | Action                    |
 |----------|---------------------------|
@@ -263,7 +286,7 @@ The sidebar shows your active and discovered opencode sessions. You can hide the
 
 ## Advanced workflows
 
-- **Inspect conversation output** — press `v` on any session (including child sessions) to watch the agent's progress in real-time without attaching to the PTY. Mermaid diagrams (` ```mermaid `) are automatically rendered as images in supported terminals (Kitty, etc.) or as high-fidelity half-block diagrams otherwise. Requires `mmdc` (Mermaid CLI) on your `PATH`.
+- **Inspect conversation output** — press `v` on any session (including child sessions) to watch the agent's progress in real-time without attaching to the PTY. Mermaid diagrams render as images when `mmdc` is available (see [Optional: Mermaid diagrams](#optional-mermaid-diagrams-in-conversation-view)).
 - **Inspect changed files** — press `d` to open a diff view of all changes made by a session (tracked and untracked)
 - **Inspect changed files (list)** — press `f` to see which files a session has created or modified. Press any key or `Esc` to close.
 - **Drop into a shell** — press `!` to open a shell in the selected session's working directory. The shell inherits the session's environment; exiting the shell returns to ocmux.
