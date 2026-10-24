@@ -181,17 +181,46 @@ impl PtyManager {
         rows: u16,
         cols: u16,
     ) -> anyhow::Result<()> {
-        let pty = PtySession::spawn_replica(&cwd, &session_id, None, rows, cols)?;
+        let (serve_port, serve_pid) = crate::ops::opencode::ensure_serve_for_cwd(&cwd)?;
+        self.attach_arbitrary_session_to_serve(
+            session_id,
+            cwd,
+            title,
+            status,
+            time_updated,
+            serve_port,
+            serve_pid,
+            rows,
+            cols,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_arbitrary_session_to_serve(
+        &mut self,
+        session_id: String,
+        cwd: PathBuf,
+        title: String,
+        status: SessionStatus,
+        time_updated: Option<i64>,
+        serve_port: u16,
+        serve_pid: u32,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<()> {
+        let pty = PtySession::spawn_replica(&cwd, &session_id, Some(serve_port), rows, cols)?;
         let process_pid = pty.process_id();
 
         if let Some(existing_id) = self.sessions.find_by_session_id(&session_id) {
             if let Some(summary) = self.sessions.get_mut(existing_id) {
                 summary.origin = SessionOrigin::Managed;
+                summary.cwd = cwd.clone();
                 summary.title = title;
                 summary.status = status;
                 summary.process_pid = process_pid;
                 summary.time_updated = time_updated;
-                // DO NOT overwrite serve_pid / serve_port here, they might be valid.
+                summary.serve_pid = Some(serve_pid);
+                summary.serve_port = Some(serve_port);
             }
             self.ptys.insert(existing_id, Some(pty));
             self.sessions.select_id(existing_id);
@@ -206,8 +235,8 @@ impl PtyManager {
             Some(session_id),
             SessionOrigin::Managed,
             process_pid,
-            None,
-            None,
+            Some(serve_pid),
+            Some(serve_port),
             None,
             None,
             time_updated,
@@ -219,6 +248,56 @@ impl PtyManager {
         self.sessions.activate_selected();
         Ok(())
     }
+
+    pub fn reconnect_moved_session_tree(
+        &mut self,
+        session_ids: &[String],
+        focused_session_id: &str,
+        destination: PathBuf,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<()> {
+        let focused = crate::data::db::reader::DbReader::open_default()?
+            .get_session_by_id(focused_session_id)?
+            .ok_or_else(|| anyhow::anyhow!("moved session disappeared from the database"))?;
+        for summary in self.sessions.items_mut() {
+            let Some(session_id) = summary.session_id.as_deref() else {
+                continue;
+            };
+            if !session_ids.iter().any(|id| id == session_id) {
+                continue;
+            }
+            if let Some(Some(pty)) = self.ptys.get_mut(&summary.id) {
+                let _ = pty.kill();
+            }
+            self.ptys.insert(summary.id, None);
+            summary.cwd = destination.clone();
+        }
+
+        self.attach_arbitrary_session(
+            focused_session_id.to_owned(),
+            destination.clone(),
+            focused.title,
+            SessionStatus::Idle,
+            Some(focused.time_updated),
+            rows,
+            cols,
+        )
+    }
+
+    pub fn session_tree_has_busy_status(&self, session_id: &str) -> bool {
+        self.sessions.items().iter().any(|summary| {
+            if summary.session_id.as_deref() == Some(session_id) {
+                return is_busy_status(summary.status)
+                    || summary.children.iter().any(child_tree_is_busy);
+            }
+            summary
+                .children
+                .iter()
+                .any(|child| child_subtree_busy(child, session_id))
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
@@ -299,27 +378,26 @@ impl PtyManager {
         };
 
         let session = self.sessions.items().iter().find(|s| s.id == id).cloned();
-        let keep_placeholder = session
-            .as_ref()
-            .is_some_and(|s| s.origin == SessionOrigin::Discovered);
-
         if let Some(Some(pty)) = self.ptys.get_mut(&id) {
             let _ = pty.kill();
         }
 
-        if let Some(session) = session
-            && session.origin == SessionOrigin::Managed
-            && let Some(serve_pid) = session.serve_pid
-        {
-            crate::registry::kill_pid(serve_pid);
-        }
+        if let Some(session) = session {
+            let serve_pid = session.serve_pid.or_else(|| {
+                session
+                    .serve_port
+                    .and_then(|port| crate::registry::serve_pid_for_port(port).ok().flatten())
+            });
+            let serve_session = SessionSummary {
+                serve_pid,
+                ..session.clone()
+            };
 
-        if keep_placeholder {
-            self.sessions.cancel_kill();
-            if let Some(pty) = self.ptys.get_mut(&id) {
-                *pty = None;
+            if !has_other_serve_reference(self.sessions.items(), &serve_session)
+                && let Some(pid) = serve_pid
+            {
+                crate::registry::kill_and_unregister_serve(pid)?;
             }
-            return Ok(Some(id));
         }
 
         let killed = self.sessions.confirm_kill();
@@ -745,10 +823,28 @@ impl PtyManager {
     }
 
     pub fn shutdown_local_ptys(&mut self) {
-        // Only kill PTY clients (TUI viewers), NOT serve daemons.
-        // Serve daemons persist in the background for session continuity.
+        // Only kill PTY clients (TUI viewers).
         for pty in self.ptys.values_mut().filter_map(Option::as_mut) {
             let _ = pty.kill();
+        }
+    }
+
+    pub fn shutdown_managed_serves(&self) -> anyhow::Result<()> {
+        crate::registry::kill_all_registered_serves()
+    }
+
+    pub fn set_session_serve(&mut self, id: u64, port: u16, pid: u32) {
+        if let Some(summary) = self.sessions.get_mut(id) {
+            summary.serve_port = Some(port);
+            summary.serve_pid = Some(pid);
+            summary.origin = SessionOrigin::Managed;
+        }
+    }
+
+    pub fn set_session_id(&mut self, id: u64, session_id: String) {
+        if let Some(summary) = self.sessions.get_mut(id) {
+            summary.session_id = Some(session_id);
+            summary.origin = SessionOrigin::Managed;
         }
     }
 
@@ -767,6 +863,28 @@ impl PtyManager {
     }
 }
 
+fn child_subtree_busy(child: &ChildSessionInfo, session_id: &str) -> bool {
+    if child.session_id == session_id {
+        is_busy_status(child.status) || child.children.iter().any(child_tree_is_busy)
+    } else {
+        child
+            .children
+            .iter()
+            .any(|nested| child_subtree_busy(nested, session_id))
+    }
+}
+
+fn child_tree_is_busy(child: &ChildSessionInfo) -> bool {
+    is_busy_status(child.status) || child.children.iter().any(child_tree_is_busy)
+}
+
+fn is_busy_status(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Working | SessionStatus::SubagentsWorking | SessionStatus::NeedsInput
+    )
+}
+
 fn convert_child(child: &ChildSessionInfo) -> ChildSidebarEntry {
     ChildSidebarEntry {
         session_id: child.session_id.clone(),
@@ -779,9 +897,133 @@ fn convert_child(child: &ChildSessionInfo) -> ChildSidebarEntry {
     }
 }
 
+fn has_other_serve_reference(sessions: &[SessionSummary], target: &SessionSummary) -> bool {
+    sessions.iter().any(|session| {
+        session.id != target.id
+            && ((target.serve_pid.is_some() && session.serve_pid == target.serve_pid)
+                || (target.serve_port.is_some() && session.serve_port == target.serve_port))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_tree_busy_status_includes_selected_child_descendants() {
+        let mut manager = PtyManager::default();
+        let child = ChildSessionInfo {
+            session_id: "child".into(),
+            cwd: PathBuf::from("/tmp/repo"),
+            title: "child".into(),
+            status: SessionStatus::Idle,
+            time_updated: None,
+            has_children: true,
+            children: vec![ChildSessionInfo {
+                session_id: "grandchild".into(),
+                cwd: PathBuf::from("/tmp/repo"),
+                title: "grandchild".into(),
+                status: SessionStatus::NeedsInput,
+                time_updated: None,
+                has_children: false,
+                children: vec![],
+            }],
+        };
+        manager.register_placeholder(
+            PathBuf::from("/tmp/repo"),
+            "parent".into(),
+            SessionStatus::Idle,
+            Some("parent".into()),
+            SessionOrigin::Managed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            vec![child],
+        );
+
+        assert!(manager.session_tree_has_busy_status("child"));
+        assert!(manager.session_tree_has_busy_status("parent"));
+    }
+
+    #[test]
+    fn set_session_serve_persists_port_and_pid() {
+        let mut manager = PtyManager::default();
+        let id = manager.register_placeholder(
+            PathBuf::from("/tmp/playbook"),
+            "Playbook".into(),
+            SessionStatus::Idle,
+            Some("session".into()),
+            SessionOrigin::Managed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        );
+
+        manager.set_session_serve(id, 4200, 99);
+
+        let summary = manager.sessions().items().first().unwrap();
+        assert_eq!(summary.serve_port, Some(4200));
+        assert_eq!(summary.serve_pid, Some(99));
+    }
+
+    #[test]
+    fn shared_serve_reference_ignores_target_and_matches_pid_or_port() {
+        let target = SessionSummary {
+            id: 1,
+            cwd: PathBuf::new(),
+            title: String::new(),
+            status: SessionStatus::Idle,
+            session_id: None,
+            origin: SessionOrigin::Managed,
+            process_pid: None,
+            serve_pid: Some(10),
+            serve_port: Some(4200),
+            model: None,
+            preview: None,
+            time_updated: None,
+            has_children: false,
+            children: vec![],
+        };
+        let same_pid = SessionSummary {
+            id: 2,
+            serve_pid: Some(10),
+            ..target.clone()
+        };
+        let same_port = SessionSummary {
+            id: 3,
+            serve_pid: None,
+            serve_port: Some(4200),
+            ..target.clone()
+        };
+        let unrelated = SessionSummary {
+            id: 4,
+            serve_pid: Some(11),
+            serve_port: Some(4201),
+            ..target.clone()
+        };
+
+        assert!(has_other_serve_reference(
+            &[target.clone(), same_pid.clone()],
+            &target
+        ));
+        assert!(has_other_serve_reference(
+            &[target.clone(), same_port],
+            &target
+        ));
+        assert!(!has_other_serve_reference(
+            &[target.clone(), unrelated],
+            &target
+        ));
+    }
 
     fn register_managed(
         manager: &mut PtyManager,

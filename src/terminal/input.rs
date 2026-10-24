@@ -9,6 +9,13 @@ pub fn key_event_to_bytes(event: KeyEvent) -> Option<Vec<u8>> {
     if event.code == KeyCode::Char('h') && event.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
+    // Don't forward session-cycle chords (Ctrl-Alt-j/k)
+    if event.modifiers.contains(KeyModifiers::CONTROL)
+        && event.modifiers.contains(KeyModifiers::ALT)
+        && matches!(event.code, KeyCode::Char('j' | 'J' | 'k' | 'K'))
+    {
+        return None;
+    }
 
     let mods = event.modifiers;
     let has_alt = mods.contains(KeyModifiers::ALT);

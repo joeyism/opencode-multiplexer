@@ -264,6 +264,28 @@ fn key_events_translate_into_pty_bytes() {
 }
 
 #[test]
+fn session_cycle_chords_are_not_forwarded_to_pty() {
+    let next = KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let prev = KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    assert_eq!(key_event_to_bytes(next), None);
+    assert_eq!(key_event_to_bytes(prev), None);
+}
+
+#[test]
+fn plain_j_is_still_forwarded_to_pty() {
+    assert_eq!(
+        key_event_to_bytes(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).as_deref(),
+        Some(&b"j"[..])
+    );
+}
+
+#[test]
 fn surface_clamps_zero_dimensions() {
     let surface = TerminalSurface::new(0, 0);
 

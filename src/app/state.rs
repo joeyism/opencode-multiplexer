@@ -1,9 +1,10 @@
 use crate::app::agents::AgentsViewState;
 use crate::app::focus::AppFocus;
 use crate::app::message_picker::MessagePickerState;
+use crate::app::playbook::{ParamFormState, PlaybookPickerState, PlaybookRun};
 use crate::app::session_manager::SessionManagerState;
 use crate::app::session_picker::SessionPickerState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct AppState {
     pub focus: AppFocus,
@@ -19,6 +20,10 @@ pub struct AppState {
     pub message_picker: Option<MessagePickerState>,
     pub confirm_quit: bool,
     pub agents: AgentsViewState,
+    pub playbook_picker: Option<PlaybookPickerState>,
+    pub playbook_form: Option<ParamFormState>,
+    pub playbook_abort_for: Option<String>,
+    pub playbook_runs: HashMap<String, PlaybookRun>,
 }
 
 impl Default for AppState {
@@ -37,6 +42,10 @@ impl Default for AppState {
             message_picker: None,
             confirm_quit: false,
             agents: AgentsViewState::default(),
+            playbook_picker: None,
+            playbook_form: None,
+            playbook_abort_for: None,
+            playbook_runs: HashMap::new(),
         }
     }
 }

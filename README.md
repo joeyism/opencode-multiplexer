@@ -45,12 +45,13 @@ A terminal multiplexer for managing [OpenCode](https://opencode.ai) sessions.
   - [Session picker](#session-picker)
   - [Message history picker](#message-history-picker)
   - [Conversation view](#conversation-view)
-   - [Diff view](#diff-view)
-   - [Agents view](#agents-view)
+  - [Diff view](#diff-view)
+  - [Agents view](#agents-view)
   - [Visual mode](#visual-mode)
   - [Shell mode](#shell-mode)
   - [Sidebar layout](#sidebar-layout)
 - [Advanced workflows](#advanced-workflows)
+- [Playbooks](#playbooks)
 - [System behaviors](#system-behaviors)
 - [Configuration](#configuration)
 - [Notes](#notes)
@@ -105,6 +106,8 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 |----------|---------------------------|
 | `j` / `Down` | Move down             |
 | `k` / `Up`   | Move up               |
+| `Ctrl-Alt-j` | Cycle next session (keep focus) |
+| `Ctrl-Alt-k` | Cycle prev session (keep focus) |
 | `Enter`  | Attach to session        |
 | `Tab`    | Expand/collapse children |
 | `s`      | Open session manager     |
@@ -121,6 +124,7 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 |-----|---------------------------------------|
 | `n` | Spawn new session                     |
 | `t` | Create git worktree + spawn           |
+| `m` | Move selected session to another repo |
 | `a` | Open Agents relationship view         |
 | `v` | Open read-only conversation view       |
 | `d` | Open diff view for session             |
@@ -128,8 +132,9 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 | `!` | Drop into shell in session directory   |
 | `c` | Commit/push modified files            |
 | `h` | Open message history picker           |
+| `p` | Open playbook picker (or abort a running playbook) |
 | `s` | Open session manager (delete junk)    |
-| `x` | Kill session (`y` confirm, `n`/`Esc` cancel) |
+| `x` | Kill session and stop its serve when it is the last user (`y` confirm, `n`/`Esc` cancel) |
 
 ### Status icons
 
@@ -141,9 +146,13 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 | `✖` (red) | Session encountered an error |
 | `○` (gray) | Session is idle |
 
+Quitting with `q` and confirming stops all `opencode serve` daemons managed by ocmux. Pressing `x` stops the selected session's serve when no other sidebar session shares that backend; shared serves remain alive until their last user is removed.
+
 ### Session picker
 
 Press `/` to search and attach to any opencode session. The picker uses **fuzzy search** across repo, title, and directory fields. Live sessions (currently running) are marked with a green dot (`●`).
+
+Attaching starts or reuses an `opencode serve` for the session's exact working directory, then connects the TUI with `attach --session`. This gives attached sessions the same HTTP backend used by new sessions and playbooks.
 
 | Key      | Action                    |
 |----------|---------------------------|
@@ -211,11 +220,16 @@ Turns are visually separated with a role-colored left gutter (`│`). User turns
 | `/`      | Search conversation       |
 | `n`      | Next search match         |
 | `N`      | Previous search match     |
+| `J`      | Jump to next user message |
+| `K`      | Jump to previous user message |
+| `z`      | Enlarge mermaid diagram (lightbox) |
 | `q` / `v` / `Esc` | Close view       |
 
 **Auto-follow:** By default, the view stays at the bottom and scrolls automatically as new messages arrive. Scrolling up manually disengages follow mode. Jump to end (`G`) or page down at the bottom (`Ctrl-d`) to resume following.
 
 **Search:** Search is case-insensitive and incremental — type to filter, `Enter` to confirm. The search bar shows current match position (`1/5`). Pressing `/` again or `Esc` cancels.
+
+**Selecting text:** Drag with the mouse to select; releasing copies the selection to the clipboard. Selection copies readable text — soft-wrapped lines are joined back together, real line breaks and code indentation are kept, and gutters, timestamps, separator rules, Markdown syntax, and Mermaid images are left out. Dragging into the top or bottom edge keeps scrolling while the pointer is held there, so long passages can be selected without flicking. `Esc` clears the selection. This is handled by ocmux rather than the terminal's own selection, so it behaves the same in Kitty, Ghostty, WezTerm, and other modern terminals.
 
 Mouse scroll is supported.
 
@@ -312,7 +326,161 @@ The sidebar shows your active and discovered opencode sessions. You can hide the
 - **Search and attach** — press `/` to open the session picker, search across all opencode sessions, and attach to one.
 - **Reuse an earlier prompt** — press `h` to open the message history picker, search past user messages, and paste one into the active terminal session.
 - **Create a worktree** — press `t` to pick a repo directory, then enter a branch name (leave empty to spawn in the repo root without a worktree). A new worktree is created and a session is spawned in it.
+- **Move a session** — press `m` on a session to move it and its child sessions to another repo. The session must be idle; uncommitted files stay in the source directory.
 - **Spawn a session** — press `n` to pick a repo from discovered git repositories (see Configuration for search paths and depth), then spawn a new managed session in that directory.
+- **Run a playbook** — press `p` to automate prompts, shell checks, and workflow control against the selected session.
+
+## Playbooks
+
+Press `p` to open the playbook picker. Playbooks are YAML files in `~/.config/ocmux/playbooks/` that automate multi-agent workflows: send prompts to specific agents, run shell commands, and loop or branch based on results.
+
+The selected session does not need to have a serve already. `p` starts or reuses one for the exact working directory and reconnects the active TUI when necessary. Playbook sends use the OpenCode serve HTTP API, not PTY keystrokes.
+
+Playbooks are tracked per session, so different sessions can run one playbook each. Stopping an agent turn with OpenCode's `Esc` action aborts that session's playbook after the interrupted turn is detected. If an agent turn fails (for example a remote provider error), the playbook stops and reports the failure instead of running later steps.
+
+The picker shows the current step in the footer. Press `p` again while a playbook is running to request an abort; confirm with `y` or `Enter`, or cancel with `n` or `Esc`.
+
+The parameter form supports:
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Move between fields |
+| `Enter` | Start the playbook |
+| `Esc` | Cancel |
+| Paste | Insert text into the focused field |
+
+### Included playbooks
+
+Copy these files into `~/.config/ocmux/playbooks/`.
+
+#### `pr-comments.yaml`
+
+Counts inline review and issue comments. If comments exist, it sends the work through chat, planning, and implementation agents once.
+
+```yaml
+name: pr-comments
+description: Review, plan, fix, and resolve GitHub PR comments
+params:
+  GITHUB_PR_URL:
+    prompt: GitHub PR URL
+    required: true
+steps:
+  - run: |
+      set -euo pipefail
+      url="$GITHUB_PR_URL"
+      path="${url#https://github.com/}"
+      owner="${path%%/*}"
+      rest="${path#*/}"
+      repo="${rest%%/*}"
+      num="${rest##*/pull/}"
+      num="${num%%/*}"
+      num="${num%%\?*}"
+      review=$(gh api "repos/${owner}/${repo}/pulls/${num}/comments" --jq 'length')
+      issue=$(gh api "repos/${owner}/${repo}/issues/${num}/comments" --jq 'length')
+      echo $((review + issue))
+    register: COMMENTS
+  - if: test "$COMMENTS" != "0"
+    then:
+      - send:
+          agent: chat
+          message: |
+            review comments from ${GITHUB_PR_URL}
+            don't fix anything, just summarize it and tell me what they mean, and are they worth fixing
+      - send:
+          agent: plan
+          message: make a plan to fix this
+      - send:
+          agent: build
+          message: Proceed with implementation
+```
+
+#### `pr-comments-auto.yaml`
+
+Repeats the review, plan, implementation, and resolution workflow until no comments remain or five iterations have run.
+
+```yaml
+name: auto pr-comments
+description: Review, plan, fix, and resolve GitHub PR comments
+params:
+  GITHUB_PR_URL:
+    prompt: GitHub PR URL
+    required: true
+steps:
+  - run: |
+      set -euo pipefail
+      url="$GITHUB_PR_URL"
+      path="${url#https://github.com/}"
+      owner="${path%%/*}"
+      rest="${path#*/}"
+      repo="${rest%%/*}"
+      num="${rest##*/pull/}"
+      num="${num%%/*}"
+      num="${num%%\?*}"
+      review=$(gh api "repos/${owner}/${repo}/pulls/${num}/comments" --jq 'length')
+      issue=$(gh api "repos/${owner}/${repo}/issues/${num}/comments" --jq 'length')
+      echo $((review + issue))
+    register: COMMENTS
+  - until: test "$COMMENTS" = "0"
+    max: 5
+    steps:
+      - send:
+          agent: chat
+          message: |
+            review comments from ${GITHUB_PR_URL}
+            don't fix anything, just summarize it and tell me what they mean, and are they worth fixing
+      - send:
+          agent: plan
+          message: make a plan to fix this
+      - send:
+          agent: build
+          message: Proceed with implementation
+      - send:
+          agent: orchestrator
+          message: reply in thread and resolve comments
+      - run: |
+          set -euo pipefail
+          url="$GITHUB_PR_URL"
+          path="${url#https://github.com/}"
+          owner="${path%%/*}"
+          rest="${path#*/}"
+          repo="${rest%%/*}"
+          num="${rest##*/pull/}"
+          num="${num%%/*}"
+          num="${num%%\?*}"
+          review=$(gh api "repos/${owner}/${repo}/pulls/${num}/comments" --jq 'length')
+          issue=$(gh api "repos/${owner}/${repo}/issues/${num}/comments" --jq 'length')
+          echo $((review + issue))
+        register: COMMENTS
+```
+
+#### `pr-senior-review.yaml`
+
+Asks the chat agent for a senior engineering review and requests only high-severity findings.
+
+```yaml
+name: pr-senior-review
+description: Senior eng review of a PR, high severity and above
+params:
+  GITHUB_URL:
+    prompt: GitHub PR URL
+    required: true
+steps:
+  - send:
+      agent: chat
+      message: |
+        do a senior eng review of the PR ${GITHUB_URL}
+
+        You are in the same branch, but you are behind, so pull upstream to get the latest code. Show me all review comments you have, then filter to only show high severity or above
+```
+
+`${VAR}` is interpolated in `message:` strings. Shell steps use environment variables (`"$VAR"`). `until` is bash-like (check first); `if`/`then`/`else` branches on exit code. See `skills/ocmux-playbook/SKILL.md` for the full schema and an agent skill that can generate playbooks for you.
+
+Copy the skill so agents can author playbooks:
+
+```bash
+mkdir -p ~/.config/opencode/skills/ocmux-playbook
+cp skills/ocmux-playbook/SKILL.md ~/.config/opencode/skills/ocmux-playbook/
+```
 
 ## System behaviors
 
@@ -332,6 +500,7 @@ Keybindings, sidebar width, desktop notifications, and repo search depth are con
 {
   "sidebar_width": 30,
   "notifications": true,
+  "follow_selection": false,
   "spawn_maxdepth": 5,
   "keybindings": {
     "up": "k",
@@ -340,18 +509,26 @@ Keybindings, sidebar width, desktop notifications, and repo search depth are con
     "kill": "x",
     "help": "?",
     "worktree": "t",
+    "move_session": "m",
     "quit": "q",
     "view": "v",
     "files": "f",
     "diff": "d",
-    "history": "h"
+    "history": "h",
+    "sessions": "s",
+    "agents": "a",
+    "playbook": "p",
+    "session_next": "ctrl-alt-j",
+    "session_prev": "ctrl-alt-k"
   }
 }
 ```
 
-Keybinding values are single characters. Default `sidebar_width` is `30`. Only the keys listed above are configurable; other bindings (`Enter`, `Tab`, `/`, `s`, `Ctrl-h`, `r`, `!`, `c`, `Ctrl-4`, arrows) are fixed.
+Keybinding values are single characters. `session_next` and `session_prev` are chord strings (`ctrl-alt-j`), not single characters. Default `sidebar_width` is `30`. Only the keys listed above are configurable; other bindings (`Enter`, `Tab`, `/`, `s`, `Ctrl-h`, `r`, `!`, `c`, `Ctrl-4`, arrows) are fixed.
 
 `notifications` controls desktop alerts. Defaults to `true`.
+
+`follow_selection` makes sidebar `j`/`k`/arrows/click auto-attach the landed-on top-level session without stealing focus. Defaults to `false`.
 
 `spawn_maxdepth` controls how deep `find` searches for git repos when spawning or creating worktrees. It searches `~/Programming`, `~/repos`, `~/projects`, and `~/code` (falling back to `~` if none exist). Defaults to `5`.
 
@@ -360,9 +537,11 @@ Keybinding values are single characters. Default `sidebar_width` is `30`. Only t
 - `Ctrl-4` is the actual focus toggle binding (hold `Ctrl` and press `4`)
 - `s` opens the session manager; `Ctrl-h` hides the sidebar entirely for maximum terminal space
 - `q` prompts for confirmation before quitting (`y` confirm, `n`/`Esc` cancel)
+- `Ctrl-Alt-j` / `Ctrl-Alt-k` cycle top-level sessions without changing focus; cycle order is current sidebar recency order; child rows are skipped
 - Child sessions are expandable and selectable in the sidebar, but `Enter` attach is not yet supported for child rows — use `v` to view their conversation instead
 - `c` and `!` operate on top-level sessions only
 - `r` refreshes the currently active session's PTY, not the selected sidebar row
+- `/` and `p` start or reuse a serve for an attached session when one is missing; the first `p` may reconnect the active TUI once
 - Killing a managed session (`x`) also terminates its associated opencode serve daemon
 - Deleting a session via the session manager (`s`) is permanent and hard-removes all associated messages and parts from the database
 

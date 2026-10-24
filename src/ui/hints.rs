@@ -5,11 +5,54 @@ use ratatui::{
 
 use crate::{app::focus::AppFocus, config::Keybindings};
 
+/// Combine a left-aligned hints line with a right-aligned status readout,
+/// truncating hints (with an ellipsis) when the combined width exceeds `width`.
+/// If status alone is wider than `width`, the status is truncated instead.
+pub fn compose_footer(
+    hints: Line<'static>,
+    status: Option<Line<'static>>,
+    width: u16,
+) -> Line<'static> {
+    let width = width as usize;
+    let hints_w = hints.width();
+    match status {
+        None => hints,
+        Some(status) => {
+            let status_w = status.width();
+            if hints_w + status_w <= width {
+                let mut spans = hints.spans;
+                spans.push(Span::raw(" ".repeat(width - hints_w - status_w)));
+                spans.extend(status.spans);
+                Line::from(spans)
+            } else {
+                // Hints don't fit with status; truncate hints with an ellipsis.
+                let room = width.saturating_sub(status_w);
+                let t: String = hints.spans.iter().map(|s| s.content.as_ref()).collect();
+                if room == 0 {
+                    // No room for hints at all — status truncated to fit.
+                    let mut st: String = status.spans.iter().map(|s| s.content.as_ref()).collect();
+                    st = st.chars().take(width.saturating_sub(1)).collect();
+                    Line::from(vec![Span::raw(format!("{st}…"))])
+                } else {
+                    let ellipsis = 1usize;
+                    let keep = room.saturating_sub(ellipsis);
+                    let truncated: String = t.chars().take(keep).collect();
+                    let mut spans = vec![Span::raw(format!("{truncated}…"))];
+                    spans.push(Span::raw(" ".repeat(room - keep - ellipsis)));
+                    spans.extend(status.spans);
+                    Line::from(spans)
+                }
+            }
+        }
+    }
+}
+
 pub fn footer_line(
     focus: AppFocus,
     message: Option<&str>,
     keys: &Keybindings,
     diff_visual_mode: bool,
+    conversation_lightbox: bool,
 ) -> Line<'static> {
     if let Some(message) = message {
         return Line::from(vec![Span::styled(
@@ -19,6 +62,7 @@ pub fn footer_line(
     }
 
     match focus {
+        AppFocus::Conversation if conversation_lightbox => conversation_lightbox_hints(),
         AppFocus::Conversation => conversation_hints(keys),
         AppFocus::Diff => diff_hints(keys, diff_visual_mode),
         AppFocus::Agents => agents_hints(),
@@ -54,16 +98,28 @@ fn conversation_hints(keys: &Keybindings) -> Line<'static> {
         Span::raw(" search  "),
         Span::styled("n/N", Style::default().fg(Color::Cyan)),
         Span::raw(" next/prev  "),
+        Span::styled("drag", Style::default().fg(Color::Cyan)),
+        Span::raw(" copy  "),
+        Span::styled("J/K", Style::default().fg(Color::Cyan)),
+        Span::raw(" jump  "),
+        Span::styled("z", Style::default().fg(Color::Cyan)),
+        Span::raw(" zoom  "),
         Span::styled(keys.view.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" back  "),
-        Span::styled("\u{21e7}+click", Style::default().fg(Color::Cyan)),
-        Span::raw(" select  "),
         Span::styled(keys.help.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" help  "),
         Span::styled(
             "[conversation]".to_string(),
             Style::default().fg(Color::Yellow),
         ),
+    ])
+}
+
+fn conversation_lightbox_hints() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("z/Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" close  "),
+        Span::styled("[mermaid]".to_string(), Style::default().fg(Color::Yellow)),
     ])
 }
 
@@ -138,6 +194,8 @@ fn main_hints(focus: AppFocus, keys: &Keybindings) -> Line<'static> {
         Span::raw(" attach  "),
         Span::styled(keys.sessions.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" manage  "),
+        Span::styled(keys.playbook.to_string(), Style::default().fg(Color::Cyan)),
+        Span::raw(" playbook  "),
         Span::styled(keys.history.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" history  "),
         Span::styled(keys.kill.to_string(), Style::default().fg(Color::Cyan)),
@@ -156,4 +214,36 @@ fn main_hints(focus: AppFocus, keys: &Keybindings) -> Line<'static> {
             Style::default().fg(Color::Yellow),
         ),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_lightbox_hints_show_close() {
+        let line = footer_line(
+            AppFocus::Conversation,
+            None,
+            &Keybindings::default(),
+            false,
+            true,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("Esc"));
+        assert!(text.contains("[mermaid]"));
+    }
+
+    #[test]
+    fn conversation_hints_show_zoom_without_lightbox() {
+        let line = footer_line(
+            AppFocus::Conversation,
+            None,
+            &Keybindings::default(),
+            false,
+            false,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("zoom"));
+    }
 }

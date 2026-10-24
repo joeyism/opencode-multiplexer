@@ -116,6 +116,48 @@ impl DbReader {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn get_project_for_directory(&self, directory: &Path) -> anyhow::Result<Option<DbProject>> {
+        let has_directory_table: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_directory')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_directory_table {
+            let registered = self
+                .conn
+                .query_row(
+                    "SELECT project_id FROM project_directory WHERE directory = ?1 LIMIT 1",
+                    [directory.to_string_lossy().as_ref()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(id) = registered {
+                return Ok(Some(DbProject {
+                    id,
+                    worktree: directory.to_path_buf(),
+                }));
+            }
+        }
+
+        let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.into());
+        Ok(self
+            .get_projects()?
+            .into_iter()
+            .filter_map(|project| {
+                let worktree = std::fs::canonicalize(&project.worktree)
+                    .unwrap_or_else(|_| project.worktree.clone());
+                directory.starts_with(&worktree).then_some((
+                    worktree.components().count(),
+                    DbProject {
+                        id: project.id,
+                        worktree,
+                    },
+                ))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, project)| project))
+    }
+
     pub fn get_most_recent_session(
         &self,
         project_id: &str,
@@ -171,6 +213,21 @@ impl DbReader {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_session_tree_ids(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id, depth) AS (
+                SELECT id, 0 FROM session WHERE id = ?1 AND time_archived IS NULL
+                UNION ALL
+                SELECT child.id, tree.depth + 1
+                FROM session child JOIN tree ON child.parent_id = tree.id
+                WHERE child.time_archived IS NULL
+            )
+            SELECT id FROM tree ORDER BY depth, id",
+        )?;
+        let rows = stmt.query_map([session_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_child_sessions(
@@ -274,6 +331,24 @@ impl DbReader {
             )
             .optional()?;
         Ok(matches!(result, Some((None, None))))
+    }
+
+    pub fn latest_assistant_error_name(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let error: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.error.name') FROM message \
+                 WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant' \
+                 ORDER BY time_created DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(error.flatten())
+    }
+
+    pub fn latest_assistant_was_aborted(&self, session_id: &str) -> anyhow::Result<bool> {
+        Ok(self.latest_assistant_error_name(session_id)?.as_deref() == Some("MessageAbortedError"))
     }
 
     /// Returns true if the session exists in the DB and is not archived.
@@ -788,6 +863,34 @@ mod tests {
             reader.get_session_status("sess1", None).unwrap(),
             SessionStatus::Error
         );
+        assert_eq!(
+            reader.latest_assistant_error_name("sess1").unwrap(),
+            Some("ContextOverflowError".to_string())
+        );
+    }
+
+    #[test]
+    fn latest_assistant_error_name_is_none_without_errors() {
+        let db_path = temp_db_path("message-no-error");
+        let conn = init_db(&db_path);
+        conn.execute(
+            "INSERT INTO project VALUES ('proj1', '/tmp/proj', 'proj', 100, 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('sess1', 'proj1', NULL, 'Title', '/tmp/proj', NULL, 100, 200, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg1', 'sess1', '{"role":"assistant","time":{"completed":200}}', 200)"#,
+            [],
+        )
+        .unwrap();
+
+        let reader = DbReader::open(&db_path).unwrap();
+        assert_eq!(reader.latest_assistant_error_name("sess1").unwrap(), None);
     }
 
     #[test]
@@ -815,6 +918,11 @@ mod tests {
             reader.get_session_status("sess1", None).unwrap(),
             SessionStatus::Idle
         );
+        assert_eq!(
+            reader.latest_assistant_error_name("sess1").unwrap(),
+            Some("MessageAbortedError".to_string())
+        );
+        assert!(reader.latest_assistant_was_aborted("sess1").unwrap());
     }
 
     #[test]

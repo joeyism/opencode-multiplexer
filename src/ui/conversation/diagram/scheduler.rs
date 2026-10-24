@@ -127,4 +127,14 @@ impl DiagramScheduler {
         }
         results
     }
+
+    /// Drop pending completions and in-flight tracking so a new conversation
+    /// session starts clean. In-flight worker threads may still finish; their
+    /// results go to a disconnected channel and are discarded.
+    pub fn reset(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.tx = tx;
+        self.rx = rx;
+        self.in_flight = Arc::new(Mutex::new(HashSet::new()));
+    }
 }

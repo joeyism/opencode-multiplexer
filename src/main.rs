@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     error::Error,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,7 +22,14 @@ use opencode_multiplexer::{
         focus::AppFocus,
         key_handler::{KeyAction, handle_conversation_key, handle_diff_key},
         message_picker::MessagePickerState,
+        playbook::{
+            PlaybookUiAction, SessionTarget, abort_playbook,
+            handle_form_key as handle_playbook_form_key,
+            handle_picker_key as handle_playbook_picker_key, poll_playbook,
+            should_refresh_pty_after_playbook, start_playbook,
+        },
         reducer::reduce,
+        session_cycle::{chrome_session_cycle, follow_attach_id},
         session_manager::{ManagerCommand, SessionManagerState, manager_key_to_command},
         session_picker::SessionPickerState,
         sessions::SessionStatus,
@@ -38,6 +46,7 @@ use opencode_multiplexer::{
     ops::opencode_events::{ServeEvent, SessionEventSubscriber},
     ops::worktree::create_worktree,
     ops::{fzf::pick_directory, opencode::display_title_for_cwd},
+    playbook::{http::ServePromptClient, shell::PosixShell},
     registry::{load_serve_registry, save_managed_sessions},
     terminal::{
         clipboard, input, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
@@ -46,7 +55,7 @@ use opencode_multiplexer::{
         conversation::build_conversation_document,
         conversation::diagram::mmdc::MermaidRenderConfig,
         diff as ui_diff,
-        layout::terminal_inner_rect,
+        layout::{centered_rect, terminal_inner_rect},
         root,
         sidebar::{SidebarRowKind, flatten_sidebar_entries},
     },
@@ -113,9 +122,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     // SSE event channel — receives session.created events from serve subscribers
     let (event_tx, event_rx) = std::sync::mpsc::channel::<(u16, ServeEvent)>();
     let mut subscribers: Vec<SessionEventSubscriber> = Vec::new();
+    let mut subscribed_serve_ports = HashSet::new();
 
     // Start SSE subscribers for existing serves from the registry
     for entry in load_serve_registry().unwrap_or_default() {
+        subscribed_serve_ports.insert(entry.port);
         subscribers.push(SessionEventSubscriber::start(entry.port, event_tx.clone()));
     }
 
@@ -232,6 +243,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 for finished in conversation.poll_diagram_completions() {
                     conversation.apply_diagram_update(finished, viewport_height);
                 }
+                // Edge auto-scroll runs on elapsed time, not mouse events, so
+                // a drag held still at a viewport edge keeps extending.
+                if conversation.is_dragging() {
+                    let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    let content = conversation.content_rect(inner);
+                    conversation.tick_selection(Instant::now(), content, viewport_height);
+                }
             }
 
             if state.focus == AppFocus::Agents
@@ -256,6 +274,29 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             }
             if let Some(picker) = state.message_picker.as_mut() {
                 picker.tick();
+            }
+
+            let playbook_ids: Vec<String> = state.playbook_runs.keys().cloned().collect();
+            for session_id in playbook_ids {
+                let Some(run) = state.playbook_runs.get_mut(&session_id) else {
+                    continue;
+                };
+                match poll_playbook(run) {
+                    opencode_multiplexer::app::playbook::PlaybookPoll::Quiet => {}
+                    opencode_multiplexer::app::playbook::PlaybookPoll::Banner(message)
+                    | opencode_multiplexer::app::playbook::PlaybookPoll::Finished(message) => {
+                        let finished = message.starts_with("playbook done:")
+                            || message.starts_with("playbook failed:")
+                            || message.starts_with("playbook aborted:");
+                        footer_message = Some(message);
+                        if finished {
+                            state.playbook_runs.remove(&session_id);
+                            if state.playbook_abort_for.as_deref() == Some(session_id.as_str()) {
+                                state.playbook_abort_for = None;
+                            }
+                        }
+                    }
+                }
             }
 
             if last_reconcile.elapsed() >= Duration::from_secs(30) {
@@ -301,6 +342,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     state.session_picker.as_mut(),
                     state.session_manager.as_mut(),
                     state.message_picker.as_mut(),
+                    state.playbook_picker.as_ref(),
+                    state.playbook_form.as_ref(),
+                    state.playbook_abort_for.is_some(),
                     state.confirm_quit,
                     terminal_selection.range(),
                 )
@@ -313,12 +357,37 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             let overlays_block_graphics = state.session_picker.is_some()
                 || state.session_manager.is_some()
                 || state.message_picker.is_some()
+                || state.playbook_picker.is_some()
+                || state.playbook_form.is_some()
+                || state.playbook_abort_for.is_some()
                 || state.show_help
                 || state.confirm_quit;
             let show_kitty = matches!(state.focus, AppFocus::Conversation)
                 && conversation.is_active()
+                && !conversation.is_lightbox()
                 && !overlays_block_graphics;
-            if show_kitty {
+            let show_lightbox_kitty = matches!(state.focus, AppFocus::Conversation)
+                && conversation.is_active()
+                && conversation.is_lightbox()
+                && !overlays_block_graphics
+                && conversation.protocol_enabled();
+            if show_lightbox_kitty {
+                let area: ratatui::layout::Rect = terminal.size()?.into();
+                let body = ratatui::layout::Rect::new(
+                    area.x,
+                    area.y,
+                    area.width,
+                    area.height.saturating_sub(1),
+                );
+                let popup = centered_rect(body, 96, 96);
+                let block_inner = ratatui::layout::Rect {
+                    x: popup.x.saturating_add(1),
+                    y: popup.y.saturating_add(1),
+                    width: popup.width.saturating_sub(2),
+                    height: popup.height.saturating_sub(2),
+                };
+                let _ = conversation.paint_lightbox_graphics(terminal.backend_mut(), block_inner);
+            } else if show_kitty {
                 let area = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
                 // Shrink for search bar if active (mirror root.rs).
                 let area = if conversation.is_searching() || !conversation.search_query().is_empty()
@@ -344,7 +413,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             match event::read()? {
                 Event::Key(key) => {
                     terminal_selection.clear();
-                    if state.message_picker.is_some() {
+                    if state.playbook_abort_for.is_some() {
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Char('y') => {
+                                if let Some(session_id) = state.playbook_abort_for.take()
+                                    && let Some(run) = state.playbook_runs.get(&session_id)
+                                {
+                                    abort_playbook(run);
+                                }
+                                footer_message = Some("playbook abort requested".into());
+                            }
+                            KeyCode::Esc | KeyCode::Char('n') => {
+                                state.playbook_abort_for = None;
+                            }
+                            _ => {}
+                        }
+                    } else if state.message_picker.is_some() {
                         match key.code {
                             KeyCode::Esc => {
                                 state.message_picker = None;
@@ -432,6 +516,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                     save_managed_sessions(
                                                         manager.managed_session_ids(),
                                                     )?;
+                                                    if let Some(port) = manager
+                                                        .selected_summary()
+                                                        .and_then(|summary| summary.serve_port)
+                                                        && subscribed_serve_ports.insert(port)
+                                                    {
+                                                        subscribers.push(
+                                                            SessionEventSubscriber::start(
+                                                                port,
+                                                                event_tx.clone(),
+                                                            ),
+                                                        );
+                                                    }
                                                     state.focus = AppFocus::Terminal;
                                                     state.selected_sidebar_row = 0;
                                                     footer_message = None;
@@ -470,6 +566,140 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 }
                             }
                             _ => {}
+                        }
+                    } else if state.playbook_form.is_some() {
+                        let form = state.playbook_form.as_mut().unwrap();
+                        let action = handle_playbook_form_key(key, form);
+                        match action {
+                            PlaybookUiAction::Consumed => {}
+                            PlaybookUiAction::Close => {
+                                state.playbook_form = None;
+                                footer_message = Some("playbook canceled".into());
+                            }
+                            PlaybookUiAction::OpenForm(_) => {}
+                            PlaybookUiAction::Start {
+                                playbook_name,
+                                steps,
+                                vars,
+                            } => {
+                                state.playbook_form = None;
+                                match rows
+                                    .get(state.selected_sidebar_row)
+                                    .and_then(|row| selected_root_summary(&manager, row))
+                                {
+                                    Some(summary) => {
+                                        match prepare_playbook_target(&mut manager, &summary)
+                                            .and_then(|target| {
+                                                if should_refresh_pty_after_playbook(
+                                                    summary.serve_port,
+                                                    summary.session_id.as_deref(),
+                                                    summary.id,
+                                                    manager.active_id(),
+                                                ) {
+                                                    let (pty_rows, pty_cols) = pane_size(
+                                                        terminal
+                                                            .size()
+                                                            .map_err(|error| error.to_string())?
+                                                            .into(),
+                                                        sidebar_width,
+                                                    );
+                                                    manager
+                                                        .refresh_active(pty_rows, pty_cols)
+                                                        .map_err(|error| error.to_string())?;
+                                                }
+                                                start_playbook(
+                                                    playbook_name,
+                                                    steps,
+                                                    vars,
+                                                    &target,
+                                                    Arc::new(ServePromptClient),
+                                                    Arc::new(PosixShell::default()),
+                                                )
+                                            }) {
+                                            Ok(run) => {
+                                                footer_message = Some(format!(
+                                                    "playbook: {}  running",
+                                                    run.name
+                                                ));
+                                                state
+                                                    .playbook_runs
+                                                    .insert(run.session_id().to_string(), run);
+                                            }
+                                            Err(error) => footer_message = Some(error),
+                                        }
+                                    }
+                                    None => footer_message = Some("no selected session".into()),
+                                }
+                            }
+                        }
+                    } else if state.playbook_picker.is_some() {
+                        let picker = state.playbook_picker.as_mut().unwrap();
+                        let action = handle_playbook_picker_key(key, picker);
+                        match action {
+                            PlaybookUiAction::Consumed => {}
+                            PlaybookUiAction::Close => {
+                                state.playbook_picker = None;
+                                footer_message = Some("playbooks canceled".into());
+                            }
+                            PlaybookUiAction::OpenForm(form) => {
+                                state.playbook_picker = None;
+                                state.playbook_form = Some(form);
+                                footer_message = None;
+                            }
+                            PlaybookUiAction::Start {
+                                playbook_name,
+                                steps,
+                                vars,
+                            } => {
+                                state.playbook_picker = None;
+                                match rows
+                                    .get(state.selected_sidebar_row)
+                                    .and_then(|row| selected_root_summary(&manager, row))
+                                {
+                                    Some(summary) => {
+                                        match prepare_playbook_target(&mut manager, &summary)
+                                            .and_then(|target| {
+                                                if should_refresh_pty_after_playbook(
+                                                    summary.serve_port,
+                                                    summary.session_id.as_deref(),
+                                                    summary.id,
+                                                    manager.active_id(),
+                                                ) {
+                                                    let (pty_rows, pty_cols) = pane_size(
+                                                        terminal
+                                                            .size()
+                                                            .map_err(|error| error.to_string())?
+                                                            .into(),
+                                                        sidebar_width,
+                                                    );
+                                                    manager
+                                                        .refresh_active(pty_rows, pty_cols)
+                                                        .map_err(|error| error.to_string())?;
+                                                }
+                                                start_playbook(
+                                                    playbook_name,
+                                                    steps,
+                                                    vars,
+                                                    &target,
+                                                    Arc::new(ServePromptClient),
+                                                    Arc::new(PosixShell::default()),
+                                                )
+                                            }) {
+                                            Ok(run) => {
+                                                footer_message = Some(format!(
+                                                    "playbook: {}  running",
+                                                    run.name
+                                                ));
+                                                state
+                                                    .playbook_runs
+                                                    .insert(run.session_id().to_string(), run);
+                                            }
+                                            Err(error) => footer_message = Some(error),
+                                        }
+                                    }
+                                    None => footer_message = Some("no selected session".into()),
+                                }
+                            }
                         }
                     } else if state.session_manager.is_some() {
                         let manager_state = state.session_manager.as_mut().unwrap();
@@ -548,7 +778,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         state.show_files.clear();
                     } else if state.confirm_quit {
                         match key.code {
-                            KeyCode::Char('y') => break,
+                            KeyCode::Char('y') => {
+                                manager.shutdown_managed_serves()?;
+                                break;
+                            }
                             KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                                 state.confirm_quit = false;
                             }
@@ -591,6 +824,37 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         if matches!(state.focus, AppFocus::Conversation) {
                             conversation.force_poll();
                         }
+                    } else if let Some(outcome) = chrome_session_cycle(
+                        key,
+                        &config.keybindings,
+                        state.focus,
+                        false,
+                        state.selected_sidebar_row,
+                        &rows,
+                    ) {
+                        let (pty_rows, pty_cols) =
+                            pane_size(terminal.size()?.into(), config.sidebar_width);
+                        state.selected_sidebar_row = outcome.selected_row;
+                        manager.select_top_level(outcome.top_level_id);
+                        match manager.activate_or_attach_selected(pty_rows, pty_cols) {
+                            Ok(_) => {
+                                save_managed_sessions(manager.managed_session_ids())?;
+                                if let Some(port) = manager
+                                    .selected_summary()
+                                    .and_then(|summary| summary.serve_port)
+                                    && subscribed_serve_ports.insert(port)
+                                {
+                                    subscribers.push(SessionEventSubscriber::start(
+                                        port,
+                                        event_tx.clone(),
+                                    ));
+                                }
+                                footer_message = None;
+                            }
+                            Err(error) => {
+                                footer_message = Some(format!("attach failed: {error}"));
+                            }
+                        }
                     } else if is_focus_toggle(key) {
                         if state.panel_hidden {
                             reduce(&mut state, Action::TogglePanelHidden);
@@ -628,13 +892,69 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 state.confirm_quit = true;
                             }
                             KeyCode::Char(c) if c == config.keybindings.down => {
-                                reduce(&mut state, Action::SelectNextRow)
+                                reduce(&mut state, Action::SelectNextRow);
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && let Some(top_level_id) =
+                                        follow_attach_id(config.follow_selection, row)
+                                {
+                                    let (pty_rows, pty_cols) =
+                                        pane_size(terminal.size()?.into(), config.sidebar_width);
+                                    manager.select_top_level(top_level_id);
+                                    if let Err(error) =
+                                        manager.activate_or_attach_selected(pty_rows, pty_cols)
+                                    {
+                                        footer_message = Some(format!("attach failed: {error}"));
+                                    }
+                                }
                             }
-                            KeyCode::Down => reduce(&mut state, Action::SelectNextRow),
+                            KeyCode::Down => {
+                                reduce(&mut state, Action::SelectNextRow);
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && let Some(top_level_id) =
+                                        follow_attach_id(config.follow_selection, row)
+                                {
+                                    let (pty_rows, pty_cols) =
+                                        pane_size(terminal.size()?.into(), config.sidebar_width);
+                                    manager.select_top_level(top_level_id);
+                                    if let Err(error) =
+                                        manager.activate_or_attach_selected(pty_rows, pty_cols)
+                                    {
+                                        footer_message = Some(format!("attach failed: {error}"));
+                                    }
+                                }
+                            }
                             KeyCode::Char(c) if c == config.keybindings.up => {
-                                reduce(&mut state, Action::SelectPrevRow)
+                                reduce(&mut state, Action::SelectPrevRow);
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && let Some(top_level_id) =
+                                        follow_attach_id(config.follow_selection, row)
+                                {
+                                    let (pty_rows, pty_cols) =
+                                        pane_size(terminal.size()?.into(), config.sidebar_width);
+                                    manager.select_top_level(top_level_id);
+                                    if let Err(error) =
+                                        manager.activate_or_attach_selected(pty_rows, pty_cols)
+                                    {
+                                        footer_message = Some(format!("attach failed: {error}"));
+                                    }
+                                }
                             }
-                            KeyCode::Up => reduce(&mut state, Action::SelectPrevRow),
+                            KeyCode::Up => {
+                                reduce(&mut state, Action::SelectPrevRow);
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && let Some(top_level_id) =
+                                        follow_attach_id(config.follow_selection, row)
+                                {
+                                    let (pty_rows, pty_cols) =
+                                        pane_size(terminal.size()?.into(), config.sidebar_width);
+                                    manager.select_top_level(top_level_id);
+                                    if let Err(error) =
+                                        manager.activate_or_attach_selected(pty_rows, pty_cols)
+                                    {
+                                        footer_message = Some(format!("attach failed: {error}"));
+                                    }
+                                }
+                            }
                             KeyCode::Enter => {
                                 let (pty_rows, pty_cols) =
                                     pane_size(terminal.size()?.into(), config.sidebar_width);
@@ -807,6 +1127,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     }
                                 }
                             }
+                            KeyCode::Char(c) if c == config.keybindings.playbook => {
+                                let selected_session_id = rows
+                                    .get(state.selected_sidebar_row)
+                                    .and_then(|row| selected_root_summary(&manager, row))
+                                    .and_then(|summary| summary.session_id);
+                                if let Some(session_id) = selected_session_id
+                                    && state.playbook_runs.contains_key(&session_id)
+                                {
+                                    state.playbook_abort_for = Some(session_id);
+                                } else {
+                                    match opencode_multiplexer::playbook::store::load_playbooks(
+                                        &opencode_multiplexer::playbook::store::default_playbooks_dir()
+                                            .unwrap_or_default(),
+                                    ) {
+                                        Ok(loaded) if !loaded.playbooks.is_empty() => {
+                                            state.playbook_picker = Some(
+                                                opencode_multiplexer::app::playbook::PlaybookPickerState::from_playbooks(
+                                                    loaded.playbooks,
+                                                ),
+                                            );
+                                            footer_message = None;
+                                        }
+                                        Ok(_) => footer_message = Some("no playbooks found".into()),
+                                        Err(error) => footer_message =
+                                            Some(format!("playbooks failed: {error}")),
+                                    }
+                                }
+                            }
                             KeyCode::Char(c) if c == config.keybindings.history => {
                                 match MessagePickerState::load() {
                                     Ok(picker) if picker.total_count() > 0 => {
@@ -861,6 +1209,91 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 "kill only supported on top-level sessions".into(),
                                             );
                                         }
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) if c == config.keybindings.move_session => {
+                                if let Some(row) = rows.get(state.selected_sidebar_row).cloned() {
+                                    if let Some(session_id) = row.session_id.clone() {
+                                        if manager.session_tree_has_busy_status(&session_id)
+                                            || matches!(
+                                                row.status,
+                                                SessionStatus::Working
+                                                    | SessionStatus::SubagentsWorking
+                                                    | SessionStatus::NeedsInput
+                                            )
+                                        {
+                                            footer_message = Some("session is busy".into());
+                                        } else {
+                                            match pick_directory_with_terminal(
+                                            terminal,
+                                            config.spawn_maxdepth,
+                                        ) {
+                                            Ok(Some(destination)) => {
+                                                match opencode_multiplexer::ops::session_move::move_session_tree(
+                                                    &session_id,
+                                                    &destination,
+                                                ) {
+                                                    Ok(moved) => {
+                                                        let (pty_rows, pty_cols) = pane_size(
+                                                            terminal.size()?.into(),
+                                                            config.sidebar_width,
+                                                        );
+                                                        match manager.reconnect_moved_session_tree(
+                                                            &moved.session_ids,
+                                                            &session_id,
+                                                            moved.destination.clone(),
+                                                            pty_rows,
+                                                            pty_cols,
+                                                        ) {
+                                                            Ok(()) => {
+                                                                if let Some(summary) = manager.active_summary()
+                                                                    && let Some(port) = summary.serve_port
+                                                                    && subscribed_serve_ports.insert(port)
+                                                                {
+                                                                    subscribers.push(
+                                                                        SessionEventSubscriber::start(
+                                                                            port,
+                                                                            event_tx.clone(),
+                                                                        ),
+                                                                    );
+                                                                }
+                                                                state.focus = AppFocus::Terminal;
+                                                                state.selected_sidebar_row = 0;
+                                                                let mut message = moved
+                                                                    .warning
+                                                                    .unwrap_or_else(|| format!("moved to {}", moved.destination.display()));
+                                                                if moved.dirty_source {
+                                                                    message.push_str(&format!(
+                                                                        " (uncommitted files left in {})",
+                                                                        row.cwd.display()
+                                                                    ));
+                                                                }
+                                                                footer_message = Some(message);
+                                                            }
+                                                            Err(error) => {
+                                                                footer_message = Some(format!(
+                                                                    "moved, but reattach failed: {error}"
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        footer_message = Some(format!(
+                                                            "move failed: {error}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            Ok(None) => footer_message = Some("move canceled".into()),
+                                            Err(error) => {
+                                                footer_message = Some(format!("picker failed: {error}"));
+                                            }
+                                        }
+                                        }
+                                    } else {
+                                        footer_message =
+                                            Some("selected row has no session ID".into());
                                     }
                                 }
                             }
@@ -1125,6 +1558,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             KeyAction::SelectionEmpty => {
                                 footer_message = Some("No valid lines in selection".to_string());
                             }
+                            KeyAction::NoDiagramInView => {
+                                footer_message = Some("no diagram in view".to_string());
+                            }
                             KeyAction::ConfirmQuit => {
                                 state.confirm_quit = true;
                             }
@@ -1155,6 +1591,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             KeyAction::SelectionEmpty => {
                                 footer_message = Some("No valid lines in selection".to_string());
                             }
+                            KeyAction::NoDiagramInView => {
+                                footer_message = Some("no diagram in view".to_string());
+                            }
                             KeyAction::ConfirmQuit => {
                                 state.confirm_quit = true;
                             }
@@ -1167,6 +1606,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             KeyCode::Char('G') => state.agents.move_bottom(),
                             KeyCode::Char('a') | KeyCode::Char('q') | KeyCode::Esc => {
                                 let return_focus = state.agents.close();
+                                state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));
                             }
                             KeyCode::Enter => {
@@ -1186,6 +1626,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     ) {
                                         footer_message = Some(format!("attach failed: {error}"));
                                     } else {
+                                        if let Some(port) = manager
+                                            .selected_summary()
+                                            .and_then(|summary| summary.serve_port)
+                                            && subscribed_serve_ports.insert(port)
+                                        {
+                                            subscribers.push(SessionEventSubscriber::start(
+                                                port,
+                                                event_tx.clone(),
+                                            ));
+                                        }
                                         reduce(&mut state, Action::SetFocus(AppFocus::Terminal));
                                     }
                                 }
@@ -1233,7 +1683,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 }
                 Event::Paste(text) => {
                     terminal_selection.clear();
-                    if matches!(state.focus, AppFocus::Conversation) && conversation.is_searching()
+                    if state.playbook_form.is_some() {
+                        if let Some(form) = state.playbook_form.as_mut() {
+                            form.insert_str(&text);
+                        }
+                    } else if matches!(state.focus, AppFocus::Conversation)
+                        && conversation.is_searching()
                     {
                         conversation.search_insert_str(&text, viewport_height);
                     } else if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() {
@@ -1247,12 +1702,56 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 }
                 Event::Mouse(mouse) => {
                     let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    let content = conversation.content_rect(inner);
                     let surface_size = manager
                         .active_session()
                         .map(|s| (s.surface.rows(), s.surface.cols()));
 
                     let mut handled = false;
-                    if let Some((rows, cols)) = surface_size {
+                    if conversation.is_active() && !conversation.is_lightbox() {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left)
+                                if state.focus == AppFocus::Conversation
+                                    && content.contains((mouse.column, mouse.row).into()) =>
+                            {
+                                if let Some(pos) =
+                                    conversation.pos_for_mouse(mouse.column, mouse.row, content)
+                                {
+                                    conversation.begin_selection(pos, (mouse.column, mouse.row));
+                                }
+                                handled = true;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left)
+                                if conversation.is_dragging() =>
+                            {
+                                if let Some(pos) =
+                                    conversation.pos_for_mouse(mouse.column, mouse.row, content)
+                                {
+                                    conversation.extend_selection(pos, (mouse.column, mouse.row));
+                                }
+                                handled = true;
+                            }
+                            // Finish the drag even if focus moved, so it can
+                            // never get stuck open.
+                            MouseEventKind::Up(MouseButton::Left) if conversation.is_dragging() => {
+                                if let Some(pos) =
+                                    conversation.pos_for_mouse(mouse.column, mouse.row, content)
+                                {
+                                    conversation.extend_selection(pos, (mouse.column, mouse.row));
+                                }
+                                if let Some(text) = conversation.end_selection()
+                                    && let Err(e) = clipboard::copy_to_clipboard(&text)
+                                {
+                                    footer_message = Some(format!("copy failed: {e}"));
+                                }
+                                handled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !state.focus.overlay_owns_main()
+                        && let Some((rows, cols)) = surface_size
+                    {
                         match terminal_selection.handle_mouse(mouse, inner, rows, cols) {
                             MouseResult::Claimed => {
                                 state.focus = AppFocus::Terminal;
@@ -1314,8 +1813,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             let clicked_row = mouse.row.saturating_sub(1) as usize;
                             if clicked_row < rows.len() {
                                 state.selected_sidebar_row = clicked_row;
+                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                    && let Some(top_level_id) =
+                                        follow_attach_id(config.follow_selection, row)
+                                {
+                                    let (pty_rows, pty_cols) =
+                                        pane_size(terminal.size()?.into(), config.sidebar_width);
+                                    manager.select_top_level(top_level_id);
+                                    if let Err(error) =
+                                        manager.activate_or_attach_selected(pty_rows, pty_cols)
+                                    {
+                                        footer_message = Some(format!("attach failed: {error}"));
+                                    }
+                                }
                             }
-                        } else if let Some((col, row)) = over_terminal
+                        } else if !state.focus.overlay_owns_main()
+                            && let Some((col, row)) = over_terminal
                             && matches!(
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Right | MouseButton::Middle)
@@ -1337,15 +1850,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         ) {
                             let scroll_amount = 3;
                             match state.focus {
-                                AppFocus::Conversation => match mouse.kind {
-                                    MouseEventKind::ScrollUp => {
-                                        conversation.scroll_up(scroll_amount);
+                                AppFocus::Conversation if !conversation.is_lightbox() => {
+                                    match mouse.kind {
+                                        MouseEventKind::ScrollUp => {
+                                            conversation.scroll_up(scroll_amount);
+                                        }
+                                        MouseEventKind::ScrollDown => {
+                                            conversation
+                                                .scroll_down(scroll_amount, viewport_height);
+                                        }
+                                        _ => {}
                                     }
-                                    MouseEventKind::ScrollDown => {
-                                        conversation.scroll_down(scroll_amount, viewport_height);
-                                    }
-                                    _ => {}
-                                },
+                                }
                                 AppFocus::Diff => match mouse.kind {
                                     MouseEventKind::ScrollUp => {
                                         diff_view.scroll_view_up(scroll_amount, viewport_height);
@@ -1425,6 +1941,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     })();
 
     manager.shutdown_local_ptys();
+    let _ = manager.shutdown_managed_serves();
     poller.stop();
     // Drop subscribers: each sends a best-effort stop and detaches its thread
     // (joining would hang on the blocking SSE read). Threads die at process exit.
@@ -1614,6 +2131,43 @@ fn selected_root_summary(
                 .any(|child| contains_child(child, session_id)),
         })?;
     Some(session.clone())
+}
+
+fn prepare_playbook_target(
+    manager: &mut PtyManager,
+    summary: &opencode_multiplexer::app::sessions::SessionSummary,
+) -> Result<SessionTarget, String> {
+    let (port, pid) = match summary.serve_port {
+        Some(port) => (port, summary.serve_pid),
+        None => {
+            let (port, pid) =
+                opencode_multiplexer::ops::opencode::ensure_serve_for_cwd(&summary.cwd)
+                    .map_err(|error| error.to_string())?;
+            (port, Some(pid))
+        }
+    };
+
+    if summary.serve_port != Some(port) {
+        if let Some(pid) = pid {
+            manager.set_session_serve(summary.id, port, pid);
+        }
+    }
+
+    let session_id = match summary.session_id.clone() {
+        Some(session_id) => session_id,
+        None => {
+            let session_id = opencode_multiplexer::playbook::http::create_session(port)
+                .map_err(|error| error.to_string())?;
+            manager.set_session_id(summary.id, session_id.clone());
+            session_id
+        }
+    };
+
+    Ok(SessionTarget {
+        session_id: Some(session_id),
+        serve_port: Some(port),
+        cwd: summary.cwd.clone(),
+    })
 }
 
 fn agent_sidebar_row(

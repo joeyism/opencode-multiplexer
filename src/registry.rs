@@ -119,6 +119,36 @@ pub fn update_serve_registry_tui_pid(port: u16, tui_pid: u32) -> anyhow::Result<
     Ok(())
 }
 
+pub fn serve_pid_for_port(port: u16) -> anyhow::Result<Option<u32>> {
+    Ok(load_serve_registry()?
+        .into_iter()
+        .find(|entry| entry.port == port)
+        .map(|entry| entry.pid))
+}
+
+pub fn unregister_serve_pid(pid: u32) -> anyhow::Result<()> {
+    let mut entries = load_serve_registry()?;
+    remove_serve_pid(&mut entries, pid);
+    save_serve_registry(&entries)
+}
+
+fn remove_serve_pid(entries: &mut Vec<ServeEntry>, pid: u32) {
+    entries.retain(|entry| entry.pid != pid);
+}
+
+pub fn kill_and_unregister_serve(pid: u32) -> anyhow::Result<()> {
+    kill_pid(pid);
+    unregister_serve_pid(pid)
+}
+
+pub fn kill_all_registered_serves() -> anyhow::Result<()> {
+    let entries = load_serve_registry()?;
+    for entry in entries {
+        kill_pid(entry.pid);
+    }
+    save_serve_registry(&[])
+}
+
 #[cfg(unix)]
 pub(crate) fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
@@ -186,4 +216,32 @@ pub fn cleanup_orphaned_serve_processes() -> anyhow::Result<usize> {
         kill_pid(*pid);
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unregister_serve_pid_removes_only_matching_entry() {
+        let entries = vec![
+            ServeEntry {
+                port: 4200,
+                pid: 10,
+                cwd: "/tmp/a".into(),
+                tui_pid: None,
+            },
+            ServeEntry {
+                port: 4201,
+                pid: 11,
+                cwd: "/tmp/b".into(),
+                tui_pid: None,
+            },
+        ];
+
+        let mut remaining = entries;
+        remove_serve_pid(&mut remaining, 10);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].pid, 11);
+    }
 }

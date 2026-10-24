@@ -213,6 +213,18 @@ pub fn find_serve_port_for_cwd_with_entries(
     best.map(|(port, _)| port)
 }
 
+pub fn resolve_serve_port_with_entries(
+    explicit: Option<u16>,
+    session_cwd: &Path,
+    entries: &[ServeEntry],
+) -> Option<u16> {
+    explicit.or_else(|| find_serve_port_for_cwd_with_entries(session_cwd, entries))
+}
+
+pub fn resolve_serve_port(explicit: Option<u16>, session_cwd: &Path) -> Option<u16> {
+    explicit.or_else(|| find_serve_port_for_cwd(session_cwd))
+}
+
 pub fn commit_and_push_files(
     cwd: &Path,
     created: &[String],

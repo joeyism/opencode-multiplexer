@@ -3,7 +3,11 @@ use std::{collections::HashSet, path::PathBuf};
 use opencode_multiplexer::{
     app::sessions::{SessionList, SessionOrigin, SessionStatus},
     data::poller::{DiscoveredSessionInfo, DiscoverySource, PollSnapshot},
-    ops::opencode::{build_managed_session_command, build_replica_command, display_title_for_cwd},
+    ops::opencode::{
+        build_managed_session_command, build_replica_command, display_title_for_cwd,
+        select_exact_serve_for_cwd,
+    },
+    registry::ServeEntry,
     terminal::{manager::PtyManager, pty::PtySession},
     ui::sidebar::flatten_sidebar_entries,
 };
@@ -220,14 +224,50 @@ fn replica_command_falls_back_when_no_serve_port() {
 }
 
 #[test]
+fn select_exact_serve_for_cwd_matches_only_exact_path() {
+    let cwd = PathBuf::from("/tmp/example-repo/worktree");
+    let entries = vec![
+        ServeEntry {
+            port: 4200,
+            pid: 10,
+            cwd: "/tmp/example-repo".into(),
+            tui_pid: None,
+        },
+        ServeEntry {
+            port: 4201,
+            pid: 11,
+            cwd: cwd.display().to_string(),
+            tui_pid: None,
+        },
+    ];
+
+    assert_eq!(select_exact_serve_for_cwd(&cwd, &entries), Some((4201, 11)));
+}
+
+#[test]
+fn select_exact_serve_for_cwd_rejects_ancestor_only() {
+    let cwd = PathBuf::from("/tmp/example-repo/worktree");
+    let entries = vec![ServeEntry {
+        port: 4200,
+        pid: 10,
+        cwd: "/tmp/example-repo".into(),
+        tui_pid: None,
+    }];
+
+    assert_eq!(select_exact_serve_for_cwd(&cwd, &entries), None);
+}
+
+#[test]
 fn manager_can_attach_arbitrary_session() {
     let mut manager = PtyManager::default();
-    let result = manager.attach_arbitrary_session(
+    let result = manager.attach_arbitrary_session_to_serve(
         "sess_xyz".into(),
         PathBuf::from("/tmp/xyz"),
         "Arbitrary".into(),
         SessionStatus::Idle,
         Some(1234567890),
+        4242,
+        99,
         24,
         80,
     );
@@ -249,6 +289,8 @@ fn manager_can_attach_arbitrary_session() {
 
     assert_eq!(summary.session_id.as_deref(), Some("sess_xyz"));
     assert_eq!(summary.title, "Arbitrary");
+    assert_eq!(summary.serve_port, Some(4242));
+    assert_eq!(summary.serve_pid, Some(99));
     assert_eq!(manager.len(), 1);
 }
 
@@ -690,12 +732,14 @@ fn manager_can_attach_arbitrary_session_reuses_existing() {
     assert_eq!(summary_before.origin, SessionOrigin::Discovered);
 
     // User tries to attach to it via the Session Picker UI
-    let result = manager.attach_arbitrary_session(
+    let result = manager.attach_arbitrary_session_to_serve(
         "sess_existing".into(),
         PathBuf::from("/tmp/existing"),
         "Existing Attached".into(),
         SessionStatus::Working,
         Some(100),
+        4242,
+        99,
         24,
         80,
     );
