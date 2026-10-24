@@ -34,6 +34,7 @@ fn init_db(path: &PathBuf) -> Connection {
             parent_id TEXT,
             title TEXT,
             directory TEXT,
+            path TEXT,
             permission TEXT,
             time_created INTEGER,
             time_updated INTEGER,
@@ -67,6 +68,83 @@ fn init_db(path: &PathBuf) -> Connection {
     )
     .unwrap();
     conn
+}
+
+#[test]
+fn move_sessions_updates_only_requested_tree_and_resets_context_epochs() {
+    let db_path = temp_db_path("move_sessions");
+    let conn = init_db(&db_path);
+    insert_project(&conn, "source", "/tmp/repo");
+    insert_project(&conn, "target", "/tmp/other");
+    insert_session(&conn, "parent", "source", None, "Parent", 10);
+    insert_session(&conn, "child", "source", Some("parent"), "Child", 11);
+    insert_session(&conn, "unrelated", "source", None, "Unrelated", 12);
+    conn.execute_batch(
+        "CREATE TABLE session_context_epoch (session_id TEXT PRIMARY KEY, epoch INTEGER);\
+         INSERT INTO session_context_epoch VALUES ('parent', 1), ('child', 1), ('unrelated', 1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut writer = DbWriter::open(&db_path).unwrap();
+    let moved = writer
+        .move_sessions(
+            &["parent".into(), "child".into()],
+            "/tmp/other",
+            "nested",
+            "target",
+            99,
+        )
+        .unwrap();
+    assert_eq!(moved, 2);
+    drop(writer);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let (directory, path, project, updated): (String, String, String, i64) = conn
+        .query_row(
+            "SELECT directory, path, project_id, time_updated FROM session WHERE id='child'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (directory.as_str(), path.as_str(), project.as_str(), updated),
+        ("/tmp/other", "nested", "target", 99)
+    );
+    let untouched: (String, String) = conn
+        .query_row(
+            "SELECT directory, project_id FROM session WHERE id='unrelated'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(untouched, ("/tmp/repo".into(), "source".into()));
+    let epochs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_context_epoch", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(epochs, 1);
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn move_sessions_works_when_context_epoch_table_is_absent() {
+    let db_path = temp_db_path("move_no_epoch");
+    let conn = init_db(&db_path);
+    insert_project(&conn, "source", "/tmp/repo");
+    insert_project(&conn, "target", "/tmp/other");
+    insert_session(&conn, "session", "source", None, "Session", 10);
+    drop(conn);
+
+    let mut writer = DbWriter::open(&db_path).unwrap();
+    assert_eq!(
+        writer
+            .move_sessions(&["session".into()], "/tmp/other", "", "target", 99)
+            .unwrap(),
+        1
+    );
+    fs::remove_file(db_path).ok();
 }
 
 fn insert_project(conn: &Connection, id: &str, worktree: &str) {

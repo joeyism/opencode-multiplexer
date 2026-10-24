@@ -10,12 +10,29 @@ use crate::ui::conversation::diagram::protocol::{
 };
 use crate::ui::conversation::diagram::scheduler::{DiagramScheduler, RenderFinished};
 use crate::ui::conversation::diagram::slot::{DiagramIndex, DiagramPhase, DiagramSlot};
-use crate::ui::conversation::document::{ConversationDocument, DocBlock};
+use crate::ui::conversation::document::{ConversationDocument, DocBlock, MessageRole};
+use crate::ui::conversation::selection::{
+    Anchor, DocPos, ScrollDir, Selection, anchor_at, edge_scroll, extract_text, hit_test,
+    resolve_anchor, scroll_rows,
+};
 use ratatui::layout::Rect;
 use std::io::Write;
 
 /// Owned Kitty paint record: hash, png bytes, dest rect, source crop x/y/w/h.
 type KittyPaintOwned = (String, Vec<u8>, Rect, u32, u32, u32, u32);
+
+/// An in-progress mouse selection over the conversation.
+struct DragState {
+    selection: Selection,
+    /// Content anchors for the endpoints, so a document rebuild mid-drag
+    /// cannot silently move the selection onto different text.
+    anchors: (Anchor, Anchor),
+    /// Latest pointer position in terminal cells, for edge auto-scroll.
+    pointer: Option<(u16, u16)>,
+    last_tick: Option<Instant>,
+    carry: f32,
+    dragging: bool,
+}
 
 pub struct ConversationViewState {
     session_id: Option<String>,
@@ -35,6 +52,10 @@ pub struct ConversationViewState {
     search_active: bool,
     match_positions: Vec<(usize, usize, usize)>, // (line_idx, byte_start, byte_len)
     current_match: usize,
+    /// Hash of the diagram shown in the lightbox overlay, if any.
+    lightbox: Option<String>,
+    /// Active mouse selection, if any.
+    drag: Option<DragState>,
 }
 
 impl Default for ConversationViewState {
@@ -56,6 +77,8 @@ impl Default for ConversationViewState {
             search_active: false,
             match_positions: Vec::new(),
             current_match: 0,
+            lightbox: None,
+            drag: None,
         }
     }
 }
@@ -66,6 +89,7 @@ impl ConversationViewState {
         self.session_title = session_title;
         self.return_focus = return_focus;
         self.document = ConversationDocument::new();
+        self.clear_diagram_state();
         self.scroll = 0;
         self.follow_tail = true;
         self.last_poll = None;
@@ -74,20 +98,34 @@ impl ConversationViewState {
         self.search_active = false;
         self.match_positions.clear();
         self.current_match = 0;
+        self.drag = None;
     }
 
     pub fn close(&mut self) -> AppFocus {
         self.session_id = None;
         self.document = ConversationDocument::new();
+        self.clear_diagram_state();
         self.scroll = 0;
         self.load_error = None;
         self.search_query.clear();
         self.search_active = false;
         self.match_positions.clear();
         self.current_match = 0;
+        self.drag = None;
         // Kitty placements are cleared by the main loop via clear_kitty_graphics
-        // when focus leaves conversation; keep placer state for next open.
+        // when focus leaves conversation.
         self.return_focus
+    }
+
+    /// Drop in-memory mermaid slots and abandon in-flight renders.
+    /// Disk cache under `~/.cache/ocmux/mermaid` is kept for reuse.
+    fn clear_diagram_state(&mut self) {
+        self.diagrams = DiagramIndex::default();
+        if let Some(sched) = self.scheduler.as_mut() {
+            sched.reset();
+        }
+        self.kitty = KittyImagePlacer::new();
+        self.lightbox = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -120,6 +158,17 @@ impl ConversationViewState {
     pub fn replace_document(&mut self, doc: ConversationDocument, viewport_height: usize) {
         let was_at_tail = self.follow_tail;
         self.document = doc;
+        if let Some(hash) = self.lightbox.as_deref() {
+            let still_ready = self.document.blocks.iter().any(|b| match b {
+                DocBlock::Diagram(s) if s.hash == hash => {
+                    matches!(s.phase, DiagramPhase::Ready { .. })
+                }
+                _ => false,
+            });
+            if !still_ready {
+                self.lightbox = None;
+            }
+        }
         if was_at_tail {
             self.scroll_to_end(viewport_height);
         } else if self.scroll >= self.document.total_rows() {
@@ -128,6 +177,7 @@ impl ConversationViewState {
         if !self.search_query.is_empty() {
             self.refresh_matches(viewport_height);
         }
+        self.rebind_selection();
     }
 
     pub fn set_error(&mut self, error: String) {
@@ -143,8 +193,21 @@ impl ConversationViewState {
             .visible_lines(self.scroll, viewport_height, self.protocol_enabled)
     }
 
+    /// Visible rows including their selection metadata, in display order.
+    pub fn visible_rows(
+        &self,
+        viewport_height: usize,
+    ) -> Vec<crate::ui::conversation::document::TextRow> {
+        self.document
+            .visible_rows(self.scroll, viewport_height, self.protocol_enabled)
+    }
+
     pub fn scroll_offset(&self) -> usize {
         self.scroll
+    }
+
+    pub fn is_following_tail(&self) -> bool {
+        self.follow_tail
     }
 
     pub fn document_len(&self) -> usize {
@@ -189,6 +252,168 @@ impl ConversationViewState {
         let max_scroll = total.saturating_sub(viewport_height);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Text selection
+    // -----------------------------------------------------------------------
+
+    /// Rect holding conversation text inside the main pane: `inner` minus the
+    /// search bar row. Shared by rendering, hit-testing and edge scrolling.
+    pub fn content_rect(&self, inner: Rect) -> Rect {
+        if self.is_searching() || !self.search_query().is_empty() {
+            let height = inner.height.saturating_sub(1);
+            Rect::new(inner.x, inner.y, inner.width, height)
+        } else {
+            inner
+        }
+    }
+
+    /// Document position under a mouse cell inside `content`.
+    ///
+    /// Positions outside the pane clamp to its nearest edge so a drag can be
+    /// tracked while the pointer leaves the conversation.
+    pub fn pos_for_mouse(&self, mouse_x: u16, mouse_y: u16, content: Rect) -> Option<DocPos> {
+        if content.height == 0 {
+            return None;
+        }
+        let rel_y = mouse_y
+            .saturating_sub(content.y)
+            .min(content.height.saturating_sub(1));
+        let rel_x = mouse_x.saturating_sub(content.x);
+        hit_test(&self.document, self.scroll + rel_y as usize, rel_x)
+    }
+
+    pub fn selection(&self) -> Option<Selection> {
+        self.drag.as_ref().map(|d| d.selection)
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.dragging)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// Start a selection at `pos`, which also disables tail-following.
+    pub fn begin_selection(&mut self, pos: DocPos, pointer: (u16, u16)) {
+        let Some(anchor) = anchor_at(&self.document, pos) else {
+            self.drag = None;
+            return;
+        };
+        self.follow_tail = false;
+        self.drag = Some(DragState {
+            selection: Selection::new(pos),
+            anchors: (anchor.clone(), anchor),
+            pointer: Some(pointer),
+            last_tick: None,
+            carry: 0.0,
+            dragging: true,
+        });
+    }
+
+    /// Move the selection head to `pos` and remember the pointer for scrolling.
+    pub fn extend_selection(&mut self, pos: DocPos, pointer: (u16, u16)) {
+        if let Some(drag) = self.drag.as_mut() {
+            drag.selection.head = pos;
+            drag.pointer = Some(pointer);
+            if let Some(anchor) = anchor_at(&self.document, pos) {
+                drag.anchors.1 = anchor;
+            }
+        }
+    }
+
+    /// Finish the drag and return the readable text to copy.
+    ///
+    /// A click with no movement produces nothing and drops the selection;
+    /// otherwise the selection stays visible so it is clear what was copied.
+    pub fn end_selection(&mut self) -> Option<String> {
+        let drag = self.drag.as_mut()?;
+        drag.dragging = false;
+        drag.pointer = None;
+        drag.carry = 0.0;
+        let selection = drag.selection;
+        if selection.is_empty() {
+            self.drag = None;
+            return None;
+        }
+        let text = extract_text(&self.document, selection);
+        if text.is_empty() {
+            self.drag = None;
+            return None;
+        }
+        Some(text)
+    }
+
+    /// Drop any selection without copying.
+    pub fn cancel_selection(&mut self) {
+        self.drag = None;
+    }
+
+    /// Scroll the viewport when a drag sits at an edge, and extend the
+    /// selection to match. Returns true when the selection changed.
+    ///
+    /// Driven by elapsed time, not mouse events, so it keeps running while the
+    /// pointer is held still.
+    pub fn tick_selection(&mut self, now: Instant, content: Rect, viewport_height: usize) -> bool {
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+        if !drag.dragging {
+            return false;
+        }
+        let Some((px, py)) = drag.pointer else {
+            return false;
+        };
+
+        let dt = now
+            .duration_since(drag.last_tick.unwrap_or(now))
+            .as_secs_f32()
+            .min(0.25);
+        drag.last_tick = Some(now);
+
+        let Some((dir, speed)) = edge_scroll(py, content) else {
+            drag.carry = 0.0;
+            return false;
+        };
+        let moved = scroll_rows(&mut drag.carry, dt, speed, 20);
+        if moved == 0 {
+            return false;
+        }
+
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
+        match dir {
+            ScrollDir::Up => self.scroll = self.scroll.saturating_sub(moved),
+            ScrollDir::Down => self.scroll = (self.scroll + moved).min(max_scroll),
+        }
+        self.follow_tail = false;
+
+        let Some(head) = self.pos_for_mouse(px, py, content) else {
+            return true;
+        };
+        self.extend_selection(head, (px, py));
+        true
+    }
+
+    /// Re-resolve selection endpoints against a rebuilt document. Cancels the
+    /// selection when its content is gone rather than silently moving it.
+    fn rebind_selection(&mut self) {
+        let resolved = self.drag.as_ref().and_then(|d| {
+            Some((
+                resolve_anchor(&self.document, &d.anchors.0)?,
+                resolve_anchor(&self.document, &d.anchors.1)?,
+            ))
+        });
+        match resolved {
+            Some((start, end)) => {
+                if let Some(drag) = self.drag.as_mut() {
+                    drag.selection = Selection::new(start).with_head(end);
+                }
+            }
+            None => self.drag = None,
         }
     }
 
@@ -297,10 +522,11 @@ impl ConversationViewState {
 
         for block in &self.document.blocks {
             match block {
-                DocBlock::Text(lines) => {
-                    for (i, line) in lines.iter().enumerate() {
+                DocBlock::Text(rows) => {
+                    for (i, row) in rows.iter().enumerate() {
                         let line_idx = current_row + i;
-                        let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                        let flat: String =
+                            row.line.spans.iter().map(|s| s.content.as_ref()).collect();
                         let flat_lower = flat.to_lowercase();
 
                         let mut start = 0;
@@ -311,7 +537,7 @@ impl ConversationViewState {
                             start = byte_start + query_lower.len();
                         }
                     }
-                    current_row += lines.len();
+                    current_row += rows.len();
                 }
                 DocBlock::Diagram(slot) => {
                     let source_lower = slot.source.to_lowercase();
@@ -337,23 +563,72 @@ impl ConversationViewState {
     /// Scroll so the current match is visible in the viewport.
     fn scroll_to_current_match(&mut self, viewport_height: usize) {
         if let Some(&(line_idx, _, _)) = self.match_positions.get(self.current_match) {
-            let total = self.document.total_rows();
-            let max_scroll = total.saturating_sub(viewport_height);
-            if line_idx < self.scroll {
-                // Match is above viewport — scroll up to show it.
-                self.scroll = line_idx;
-                self.follow_tail = false;
-            } else if line_idx >= self.scroll + viewport_height {
-                // Match is below viewport — scroll down.
-                self.scroll = line_idx.saturating_sub(viewport_height / 2).min(max_scroll);
-                self.follow_tail = self.scroll >= max_scroll;
-            }
+            self.ensure_row_visible(line_idx, viewport_height);
+        }
+    }
+
+    /// Position the viewport so `row` is visible, only scrolling when it is
+    /// currently outside the viewport.
+    fn ensure_row_visible(&mut self, row: usize, viewport_height: usize) {
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
+        if row < self.scroll {
+            // Match is above viewport — scroll up to show it.
+            self.scroll = row;
+            self.follow_tail = false;
+        } else if row >= self.scroll + viewport_height {
+            // Match is below viewport — scroll down.
+            self.scroll = row.saturating_sub(viewport_height / 2).min(max_scroll);
+            self.follow_tail = self.scroll >= max_scroll;
+        }
+    }
+
+    /// Position the viewport so `row` lands at the top (clamped to the tail).
+    fn jump_to_row(&mut self, row: usize, viewport_height: usize) {
+        let total = self.document.total_rows();
+        let max_scroll = total.saturating_sub(viewport_height);
+        self.scroll = row.min(max_scroll);
+        self.follow_tail = self.scroll >= max_scroll;
+    }
+
+    /// Jump to the next user message header at or after the current scroll.
+    pub fn next_user_header(&mut self, viewport_height: usize) {
+        if let Some(row) = self
+            .document
+            .header_rows(MessageRole::User)
+            .into_iter()
+            .find(|&r| r > self.scroll)
+        {
+            self.jump_to_row(row, viewport_height);
+        }
+    }
+
+    /// Jump to the previous user message header before the current scroll.
+    pub fn prev_user_header(&mut self, viewport_height: usize) {
+        if let Some(row) = self
+            .document
+            .header_rows(MessageRole::User)
+            .into_iter()
+            .rev()
+            .find(|&r| r < self.scroll)
+        {
+            self.jump_to_row(row, viewport_height);
         }
     }
 
     pub fn apply_diagram_update(&mut self, finished: RenderFinished, viewport_height: usize) {
+        // Ignore late completions after leave/switch so RAM cannot rebuild.
+        if !self.is_active() {
+            return;
+        }
         let hash = finished.hash;
         let phase = finished.result;
+
+        if self.lightbox.as_deref() == Some(hash.as_str())
+            && !matches!(&phase, DiagramPhase::Ready { .. })
+        {
+            self.lightbox = None;
+        }
 
         // Update index
         let mut row_height = 8;
@@ -393,6 +668,8 @@ impl ConversationViewState {
             }
         }
 
+        self.rebind_selection();
+
         if self.follow_tail {
             self.scroll_to_end(viewport_height);
         } else {
@@ -402,6 +679,53 @@ impl ConversationViewState {
 
     pub fn diagram_index(&self) -> &DiagramIndex {
         &self.diagrams
+    }
+
+    pub fn is_lightbox(&self) -> bool {
+        self.lightbox.is_some()
+    }
+
+    pub fn lightbox_hash(&self) -> Option<&str> {
+        self.lightbox.as_deref()
+    }
+
+    pub fn open_lightbox(&mut self, viewport_height: usize) -> bool {
+        let Some(info) = self
+            .document
+            .first_visible_ready_diagram(self.scroll, viewport_height)
+        else {
+            return false;
+        };
+        self.lightbox = Some(info.slot.hash.clone());
+        true
+    }
+
+    pub fn close_lightbox(&mut self) {
+        self.lightbox = None;
+    }
+
+    pub fn lightbox_halfblock_lines(&self, inner: Rect) -> Option<Vec<Line<'static>>> {
+        let hash = self.lightbox.as_deref()?;
+        let slot = self.document.blocks.iter().find_map(|b| match b {
+            DocBlock::Diagram(s) if s.hash == hash => Some(s),
+            _ => None,
+        })?;
+        let DiagramPhase::Ready {
+            png, png_w, png_h, ..
+        } = &slot.phase
+        else {
+            return None;
+        };
+        if png.is_empty() {
+            return None;
+        }
+        let layout = crate::ui::conversation::diagram::layout::compute_layout(
+            *png_w,
+            *png_h,
+            inner.width,
+            inner.height as usize,
+        );
+        crate::ui::conversation::diagram::halfblock::png_to_halfblock_lines(png, &layout).ok()
     }
 
     pub fn set_mermaid_config(&mut self, cfg: MermaidRenderConfig) {
@@ -505,5 +829,279 @@ impl ConversationViewState {
             return Ok(());
         }
         self.kitty.clear_all(out)
+    }
+
+    pub fn paint_lightbox_graphics(
+        &mut self,
+        out: &mut dyn Write,
+        inner: Rect,
+    ) -> std::io::Result<()> {
+        if !self.protocol_enabled {
+            return Ok(());
+        }
+        let Some(hash) = self.lightbox.as_deref() else {
+            return Ok(());
+        };
+        let Some(slot) = self.document.blocks.iter().find_map(|b| match b {
+            DocBlock::Diagram(s) if s.hash == hash => Some(s),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let DiagramPhase::Ready {
+            png, png_w, png_h, ..
+        } = &slot.phase
+        else {
+            return Ok(());
+        };
+
+        let layout = crate::ui::conversation::diagram::layout::compute_layout(
+            *png_w,
+            *png_h,
+            inner.width,
+            inner.height as usize,
+        );
+        let dest = Rect::new(
+            inner.x,
+            inner.y,
+            layout.col_width.min(inner.width as usize) as u16,
+            layout.row_height.min(inner.height as usize) as u16,
+        );
+
+        let (sx, sy, sw, sh) = (0, 0, *png_w, *png_h);
+        let paints = vec![DiagramPaint {
+            hash,
+            png: png.as_slice(),
+            rect: dest,
+            src_x: sx,
+            src_y: sy,
+            src_w: sw,
+            src_h: sh,
+        }];
+        self.kitty.paint_frame(out, &paints)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::text::Line;
+
+    fn ready_slot(hash: &str, rows: usize) -> DiagramSlot {
+        DiagramSlot {
+            hash: hash.to_string(),
+            source: "graph TD; A-->B".into(),
+            phase: DiagramPhase::Ready {
+                png: Arc::new(Vec::new()),
+                png_w: 100,
+                png_h: 100,
+                width: 80,
+                halfblocks: vec![],
+                row_height: rows,
+                col_width: 40,
+            },
+            row_height: rows,
+        }
+    }
+
+    fn conv_with_ready_diagram() -> ConversationViewState {
+        let mut conv = ConversationViewState::default();
+        conv.open("s".into(), "t".into(), AppFocus::Sidebar);
+        let mut doc = ConversationDocument::new();
+        doc.push_lines(vec![Line::from("hi")]);
+        doc.push_diagram(ready_slot("d1", 8));
+        conv.replace_document(doc, 20);
+        conv
+    }
+
+    #[test]
+    fn open_lightbox_succeeds_when_ready_diagram_in_view() {
+        let mut conv = conv_with_ready_diagram();
+        assert!(conv.open_lightbox(20));
+        assert!(conv.is_lightbox());
+        assert_eq!(conv.lightbox_hash(), Some("d1"));
+    }
+
+    #[test]
+    fn open_lightbox_fails_when_no_ready_diagram_in_view() {
+        let mut conv = ConversationViewState::default();
+        conv.open("s".into(), "t".into(), AppFocus::Sidebar);
+        let mut doc = ConversationDocument::new();
+        doc.push_lines(vec![Line::from("only text")]);
+        conv.replace_document(doc, 20);
+        assert!(!conv.open_lightbox(20));
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn close_lightbox_clears_mode() {
+        let mut conv = conv_with_ready_diagram();
+        conv.open_lightbox(20);
+        conv.close_lightbox();
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn replace_document_closes_lightbox_if_hash_gone() {
+        let mut conv = conv_with_ready_diagram();
+        conv.open_lightbox(20);
+        let mut doc = ConversationDocument::new();
+        doc.push_lines(vec![Line::from("rebuilt")]);
+        conv.replace_document(doc, 20);
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn replace_document_keeps_lightbox_if_hash_still_ready() {
+        let mut conv = conv_with_ready_diagram();
+        conv.open_lightbox(20);
+        let mut doc = ConversationDocument::new();
+        doc.push_diagram(ready_slot("d1", 8));
+        conv.replace_document(doc, 20);
+        assert!(conv.is_lightbox());
+    }
+
+    #[test]
+    fn close_and_open_session_clears_lightbox() {
+        let mut conv = conv_with_ready_diagram();
+        conv.open_lightbox(20);
+        conv.close();
+        assert!(!conv.is_lightbox());
+    }
+
+    use crate::ui::conversation::document::TextRow;
+    use std::time::Duration;
+
+    fn body(text: &str, continuation: bool) -> TextRow {
+        TextRow::body(
+            Line::from(text.to_string()),
+            text.to_string(),
+            0,
+            continuation,
+        )
+    }
+
+    /// A conversation whose single message renders as `rows`.
+    fn conv_with_rows(rows: Vec<TextRow>) -> ConversationViewState {
+        let mut conv = ConversationViewState::default();
+        conv.open("s".into(), "t".into(), AppFocus::Sidebar);
+        let mut doc = ConversationDocument::new();
+        let mut off = 0;
+        doc.push_text_rows(rows, "m1", &mut off);
+        conv.replace_document(doc, 20);
+        conv
+    }
+
+    #[test]
+    fn drag_copies_readable_text_and_keeps_the_selection_visible() {
+        let mut conv = conv_with_rows(vec![body("hello ", false), body("world", true)]);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 0));
+        assert!(conv.is_dragging());
+        conv.extend_selection(DocPos { row: 1, col: 5 }, (0, 1));
+
+        assert_eq!(conv.end_selection().as_deref(), Some("hello world"));
+        assert!(!conv.is_dragging(), "drag ends on release");
+        assert!(conv.has_selection(), "copied range stays highlighted");
+    }
+
+    #[test]
+    fn click_without_dragging_copies_nothing() {
+        let mut conv = conv_with_rows(vec![body("hello", false)]);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 0));
+        assert_eq!(conv.end_selection(), None);
+        assert!(!conv.has_selection());
+    }
+
+    #[test]
+    fn cancel_selection_drops_it_without_copying() {
+        let mut conv = conv_with_rows(vec![body("hello", false)]);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 0));
+        conv.extend_selection(DocPos { row: 0, col: 5 }, (0, 0));
+        conv.cancel_selection();
+        assert!(!conv.has_selection());
+    }
+
+    #[test]
+    fn selection_still_copies_the_same_text_after_a_rebuild() {
+        let mut conv = conv_with_rows(vec![body("alpha ", false), body("beta", true)]);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 0));
+        conv.extend_selection(DocPos { row: 1, col: 4 }, (0, 1));
+
+        // A poll rebuilds the document; the endpoints must not drift.
+        let mut doc = ConversationDocument::new();
+        let mut off = 0;
+        doc.push_text_rows(
+            vec![body("alpha ", false), body("beta", true)],
+            "m1",
+            &mut off,
+        );
+        doc.push_text_rows(vec![body("later", false)], "m2", &mut off);
+        conv.replace_document(doc, 20);
+
+        assert_eq!(conv.end_selection().as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn selection_is_dropped_when_its_content_disappears() {
+        let mut conv = conv_with_rows(vec![body("alpha", false)]);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 0));
+        conv.extend_selection(DocPos { row: 0, col: 5 }, (0, 0));
+
+        let mut doc = ConversationDocument::new();
+        let mut off = 0;
+        doc.push_text_rows(vec![body("other", false)], "m9", &mut off);
+        conv.replace_document(doc, 20);
+        assert!(!conv.has_selection());
+    }
+
+    #[test]
+    fn drag_below_the_viewport_auto_scrolls_and_keeps_extending() {
+        let mut doc = ConversationDocument::new();
+        let mut off = 0;
+        doc.push_text_rows(
+            (0..30).map(|_| body("line", false)).collect::<Vec<_>>(),
+            "m1",
+            &mut off,
+        );
+        let mut conv = ConversationViewState::default();
+        conv.open("s".into(), "t".into(), AppFocus::Sidebar);
+        conv.replace_document(doc, 5);
+        conv.scroll_to_top();
+
+        let content = Rect::new(0, 0, 40, 5);
+        // Pointer held below the pane: nothing moves until the tick fires.
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 9));
+        let start = Instant::now();
+        conv.tick_selection(start, content, 5);
+        assert_eq!(conv.scroll_offset(), 0, "first tick only arms the clock");
+
+        conv.tick_selection(start + Duration::from_secs(1), content, 5);
+        assert!(conv.scroll_offset() > 0, "edge drag scrolls the viewport");
+        assert!(
+            conv.selection().is_some_and(|s| s.head.row > 0),
+            "selection extends as the document moves under the pointer"
+        );
+    }
+
+    #[test]
+    fn drag_in_the_middle_of_the_viewport_does_not_scroll() {
+        let mut doc = ConversationDocument::new();
+        let mut off = 0;
+        doc.push_text_rows(
+            (0..30).map(|_| body("line", false)).collect::<Vec<_>>(),
+            "m1",
+            &mut off,
+        );
+        let mut conv = ConversationViewState::default();
+        conv.open("s".into(), "t".into(), AppFocus::Sidebar);
+        conv.replace_document(doc, 5);
+        conv.scroll_to_top();
+
+        let content = Rect::new(0, 0, 40, 10);
+        conv.begin_selection(DocPos { row: 0, col: 0 }, (0, 5));
+        let start = Instant::now();
+        conv.tick_selection(start, content, 5);
+        conv.tick_selection(start + Duration::from_secs(1), content, 5);
+        assert_eq!(conv.scroll_offset(), 0);
     }
 }

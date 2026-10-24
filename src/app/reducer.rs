@@ -54,3 +54,34 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::AppState;
+
+    #[test]
+    fn test_focus_behavior() {
+        let mut state = AppState::default();
+
+        // Initial state
+        assert_eq!(state.focus, AppFocus::Sidebar);
+        assert_eq!(state.last_main_focus, AppFocus::Terminal);
+
+        // Open path: SetFocus(Agents) -> last_main_focus is Agents
+        reduce(&mut state, Action::SetFocus(AppFocus::Agents));
+        assert_eq!(state.focus, AppFocus::Agents);
+        assert_eq!(state.last_main_focus, AppFocus::Agents);
+
+        // Close path simulation: last_main_focus = Terminal, SetFocus(Sidebar)
+        // This simulates what happens in main.rs when closing an overlay mode
+        state.last_main_focus = AppFocus::Terminal;
+        reduce(&mut state, Action::SetFocus(AppFocus::Sidebar));
+        assert_eq!(state.focus, AppFocus::Sidebar);
+        assert_eq!(state.last_main_focus, AppFocus::Terminal);
+
+        // ToggleFocus from Sidebar -> goes to Terminal (not Agents)
+        reduce(&mut state, Action::ToggleFocus);
+        assert_eq!(state.focus, AppFocus::Terminal);
+    }
+}

@@ -35,6 +35,44 @@ impl DbWriter {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?)
     }
 
+    /// Reassigns the listed session tree to another OpenCode project atomically.
+    pub fn move_sessions(
+        &mut self,
+        ids: &[String],
+        directory: &str,
+        path: &str,
+        project_id: &str,
+        time_updated: i64,
+    ) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut moved = 0;
+        for id in ids {
+            moved += tx.execute(
+                "UPDATE session SET directory = ?1, path = ?2, project_id = ?3, time_updated = ?4 WHERE id = ?5",
+                rusqlite::params![directory, path, project_id, time_updated, id],
+            )?;
+        }
+
+        let has_epoch_table: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_context_epoch')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_epoch_table {
+            for id in ids {
+                tx.execute(
+                    "DELETE FROM session_context_epoch WHERE session_id = ?1",
+                    [id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
     pub fn delete_sessions(
         &mut self,
         ids: &[String],

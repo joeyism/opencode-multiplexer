@@ -4,6 +4,7 @@ pub mod diff;
 pub mod hints;
 pub mod layout;
 pub mod message_picker;
+pub mod playbook;
 pub mod root;
 pub mod session_manager;
 pub mod session_picker;

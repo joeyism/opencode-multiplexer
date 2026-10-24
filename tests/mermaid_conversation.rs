@@ -1,4 +1,5 @@
 use opencode_multiplexer::app::conversation::ConversationViewState;
+use opencode_multiplexer::app::focus::AppFocus;
 use opencode_multiplexer::data::db::models::{DbConversationMessage, DbConversationPart};
 use opencode_multiplexer::ui::conversation::build_conversation_document;
 use opencode_multiplexer::ui::conversation::diagram::cache::MermaidCache;
@@ -11,7 +12,9 @@ use opencode_multiplexer::ui::conversation::diagram::mmdc::{
 use opencode_multiplexer::ui::conversation::diagram::scheduler::{
     DiagramScheduler, RenderFinished,
 };
-use opencode_multiplexer::ui::conversation::diagram::slot::{DiagramIndex, DiagramSlot};
+use opencode_multiplexer::ui::conversation::diagram::slot::{
+    DiagramIndex, DiagramPhase, DiagramSlot,
+};
 use opencode_multiplexer::ui::conversation::document::ConversationDocument;
 use ratatui::text::Line;
 use std::fs;
@@ -21,6 +24,23 @@ use std::time::Duration;
 
 use opencode_multiplexer::ui::conversation::diagram::protocol::screen_rect_for_slot;
 use ratatui::layout::Rect;
+
+fn ready_slot(hash: &str, rows: usize) -> DiagramSlot {
+    DiagramSlot {
+        hash: hash.to_string(),
+        source: "graph TD; A-->B".into(),
+        phase: DiagramPhase::Ready {
+            png: Arc::new(Vec::new()),
+            png_w: 100,
+            png_h: 100,
+            width: 80,
+            halfblocks: vec![],
+            row_height: rows,
+            col_width: 40,
+        },
+        row_height: rows,
+    }
+}
 
 #[allow(dead_code)]
 fn test_fixtures_dir() -> PathBuf {
@@ -103,6 +123,17 @@ fn mermaid_hash_changes_when_source_changes() {
     let a = hash_source("graph TD; A-->B");
     let b = hash_source("graph TD; A-->C");
     assert_ne!(a, b);
+}
+
+#[test]
+fn mermaid_hash_uses_original_source_not_sanitized() {
+    let source = "sequenceDiagram\n    A->>B: a; b\n";
+    let sanitized =
+        opencode_multiplexer::ui::conversation::diagram::sanitize::sanitize_mermaid_source(source);
+
+    assert_ne!(source, sanitized);
+    assert_eq!(hash_source(source), hash_source(source));
+    assert_ne!(hash_source(source), hash_source(&sanitized));
 }
 
 #[test]
@@ -295,6 +326,49 @@ fn document_slot_at_row_finds_diagram() {
     let slot_info = doc.diagram_covering_row(3).unwrap();
     assert_eq!(slot_info.start_row, 2);
     assert_eq!(slot_info.slot.source, "graph TD; A-->B");
+}
+
+#[test]
+fn first_visible_ready_diagram_skips_pending_and_text() {
+    let mut doc = ConversationDocument::new();
+    doc.push_lines(vec![Line::from("a"), Line::from("b")]);
+    doc.push_diagram(DiagramSlot::placeholder("pending", "x", 5));
+    doc.push_diagram(ready_slot("ready", 4));
+
+    assert!(doc.first_visible_ready_diagram(0, 3).is_none());
+    assert!(doc.first_visible_ready_diagram(2, 5).is_none());
+    assert_eq!(
+        doc.first_visible_ready_diagram(6, 4)
+            .map(|slot| slot.slot.hash.as_str()),
+        Some("ready")
+    );
+}
+
+#[test]
+fn first_visible_ready_diagram_picks_topmost_when_two_visible() {
+    let mut doc = ConversationDocument::new();
+    doc.push_diagram(ready_slot("first", 3));
+    doc.push_lines(vec![Line::from("gap")]);
+    doc.push_diagram(ready_slot("second", 3));
+
+    assert_eq!(
+        doc.first_visible_ready_diagram(0, 8)
+            .map(|slot| slot.slot.hash.as_str()),
+        Some("first")
+    );
+}
+
+#[test]
+fn first_visible_ready_diagram_intersects_partial_slot() {
+    let mut doc = ConversationDocument::new();
+    doc.push_lines(vec![Line::from("text")]);
+    doc.push_diagram(ready_slot("diagram", 10));
+
+    assert_eq!(
+        doc.first_visible_ready_diagram(0, 3)
+            .map(|slot| slot.slot.hash.as_str()),
+        Some("diagram")
+    );
 }
 
 #[test]
@@ -577,4 +651,64 @@ fn scheduler_timeout_marks_failed_not_hang() {
         opencode_multiplexer::ui::conversation::diagram::slot::DiagramPhase::Failed { .. }
     ));
     fs::remove_dir_all(cfg.cache_dir).unwrap();
+}
+
+#[test]
+fn leaving_conversation_clears_in_memory_diagram_index() {
+    let mut conv = ConversationViewState::default();
+    conv.open("sess".into(), "title".into(), AppFocus::Sidebar);
+
+    // Simulate a ready diagram living in the index (as after a successful render).
+    let source = "graph TD; A-->B";
+    let h = hash_source(source);
+    let png = Arc::new(tiny_png_bytes());
+    let slot = Arc::new(DiagramSlot {
+        hash: h.clone(),
+        source: source.to_string(),
+        phase: opencode_multiplexer::ui::conversation::diagram::slot::DiagramPhase::Ready {
+            png,
+            png_w: 1,
+            png_h: 1,
+            width: 80,
+            halfblocks: vec![Line::from("Ready")],
+            row_height: 1,
+            col_width: 80,
+        },
+        row_height: 1,
+    });
+    // diagram_index is & only — use apply path via rebuild isn't available.
+    // Insert through replace_document + apply_diagram_update instead.
+    let mut doc = ConversationDocument::new();
+    doc.push_diagram((*slot).clone());
+    conv.replace_document(doc, 20);
+    conv.apply_diagram_update(
+        opencode_multiplexer::ui::conversation::diagram::scheduler::RenderFinished {
+            hash: h.clone(),
+            result: slot.phase.clone(),
+        },
+        20,
+    );
+    assert!(
+        conv.diagram_index().get(&h).is_some(),
+        "diagram should be indexed while conversation is open"
+    );
+
+    let _ = conv.close();
+    assert!(
+        conv.diagram_index().slots.is_empty(),
+        "leaving conversation must drop in-memory mermaid slots"
+    );
+
+    // Late completion after close must not repopulate the index.
+    conv.apply_diagram_update(
+        opencode_multiplexer::ui::conversation::diagram::scheduler::RenderFinished {
+            hash: h,
+            result: slot.phase.clone(),
+        },
+        20,
+    );
+    assert!(
+        conv.diagram_index().slots.is_empty(),
+        "late diagram completions after close must be ignored"
+    );
 }

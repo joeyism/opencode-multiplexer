@@ -11,6 +11,7 @@ pub enum KeyAction {
     PasteSelection(String),
     SelectionEmpty,
     ConfirmQuit,
+    NoDiagramInView,
 }
 
 pub fn handle_diff_key(
@@ -156,6 +157,15 @@ pub fn handle_conversation_key(
             _ => KeyAction::Consumed,
         }
     } else {
+        if conv.is_lightbox() {
+            return match key.code {
+                KeyCode::Char('z') | KeyCode::Esc => {
+                    conv.close_lightbox();
+                    KeyAction::Consumed
+                }
+                _ => KeyAction::Consumed,
+            };
+        }
         match key.code {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 conv.scroll_up(vp);
@@ -174,7 +184,14 @@ pub fn handle_conversation_key(
                 KeyAction::Consumed
             }
             KeyCode::Char(c) if c == keys.quit => KeyAction::Close,
-            KeyCode::Esc => KeyAction::Close,
+            KeyCode::Esc => {
+                if conv.has_selection() {
+                    conv.cancel_selection();
+                    KeyAction::Consumed
+                } else {
+                    KeyAction::Close
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 conv.scroll_down(1, vp);
                 KeyAction::Consumed
@@ -191,6 +208,14 @@ pub fn handle_conversation_key(
                 conv.scroll_to_end(vp);
                 KeyAction::Consumed
             }
+            KeyCode::Char('J') => {
+                conv.next_user_header(vp);
+                KeyAction::Consumed
+            }
+            KeyCode::Char('K') => {
+                conv.prev_user_header(vp);
+                KeyAction::Consumed
+            }
             KeyCode::Char('n') => {
                 conv.next_match(vp);
                 KeyAction::Consumed
@@ -202,6 +227,13 @@ pub fn handle_conversation_key(
             KeyCode::Char('/') => {
                 conv.start_search();
                 KeyAction::Consumed
+            }
+            KeyCode::Char('z') => {
+                if conv.open_lightbox(vp) {
+                    KeyAction::Consumed
+                } else {
+                    KeyAction::NoDiagramInView
+                }
             }
             _ => KeyAction::Consumed,
         }
@@ -257,6 +289,37 @@ mod tests {
         let mut doc = crate::ui::conversation::document::ConversationDocument::new();
         doc.push_lines(make_document(texts));
         c.replace_document(doc, 100);
+        c
+    }
+
+    fn ready_slot(hash: &str, rows: usize) -> crate::ui::conversation::diagram::slot::DiagramSlot {
+        crate::ui::conversation::diagram::slot::DiagramSlot {
+            hash: hash.to_string(),
+            source: "graph TD; A-->B".into(),
+            phase: crate::ui::conversation::diagram::slot::DiagramPhase::Ready {
+                png: std::sync::Arc::new(Vec::new()),
+                png_w: 100,
+                png_h: 100,
+                width: 80,
+                halfblocks: vec![],
+                row_height: rows,
+                col_width: 40,
+            },
+            row_height: rows,
+        }
+    }
+
+    fn conv_with_diagram() -> ConversationViewState {
+        let mut c = ConversationViewState::default();
+        c.open(
+            "test".into(),
+            "Test".into(),
+            crate::app::focus::AppFocus::Sidebar,
+        );
+        let mut doc = crate::ui::conversation::document::ConversationDocument::new();
+        doc.push_lines(vec![Line::from("text")]);
+        doc.push_diagram(ready_slot("d1", 8));
+        c.replace_document(doc, 20);
         c
     }
 
@@ -723,5 +786,158 @@ mod tests {
             100,
         );
         assert_eq!(action, KeyAction::Close);
+    }
+
+    fn real_conv_doc() -> crate::ui::conversation::document::ConversationDocument {
+        use crate::data::db::models::{DbConversationMessage, DbConversationPart};
+        let part = |i: usize| DbConversationPart {
+            id: "p".into(),
+            part_type: "text".into(),
+            text: Some(
+                (0..30)
+                    .map(|j| format!("{i}:line{j}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            tool: None,
+            tool_status: None,
+            tool_title: None,
+            tool_input: None,
+        };
+        let msg = |role: &str, i: usize| DbConversationMessage {
+            id: "m".into(),
+            role: role.into(),
+            time_created: 1_700_000_000_000,
+            completed: None,
+            model_id: None,
+            agent: None,
+            parts: vec![part(i)],
+        };
+        let messages = vec![
+            msg("assistant", 0),
+            msg("user", 1),
+            msg("assistant", 2),
+            msg("user", 3),
+        ];
+        crate::ui::conversation::build_conversation_document(
+            &messages,
+            80,
+            &crate::ui::conversation::diagram::slot::DiagramIndex::default(),
+        )
+    }
+
+    #[test]
+    fn conversation_caps_j_jumps_to_next_user_header() {
+        let mut conv = ConversationViewState::default();
+        conv.open(
+            "test".into(),
+            "Test".into(),
+            crate::app::focus::AppFocus::Sidebar,
+        );
+        conv.replace_document(real_conv_doc(), 10);
+        conv.scroll_to_top();
+        handle_conversation_key(key(KeyCode::Char('J')), &mut conv, &default_keys(), 10);
+        assert!(
+            conv.scroll_offset() > 0,
+            "J should jump past the assistant preamble"
+        );
+        let first = conv.scroll_offset();
+        handle_conversation_key(key(KeyCode::Char('J')), &mut conv, &default_keys(), 10);
+        assert!(
+            conv.scroll_offset() > first,
+            "J on a user header should advance to the next one"
+        );
+    }
+
+    #[test]
+    fn conversation_caps_k_jumps_to_prev_user_header() {
+        let mut conv = ConversationViewState::default();
+        conv.open(
+            "test".into(),
+            "Test".into(),
+            crate::app::focus::AppFocus::Sidebar,
+        );
+        conv.replace_document(real_conv_doc(), 10);
+        conv.scroll_to_end(10);
+        let tail = conv.scroll_offset();
+        handle_conversation_key(key(KeyCode::Char('K')), &mut conv, &default_keys(), 10);
+        assert!(
+            conv.scroll_offset() < tail,
+            "K should jump up out of the tail"
+        );
+        let last = conv.scroll_offset();
+        handle_conversation_key(key(KeyCode::Char('K')), &mut conv, &default_keys(), 10);
+        assert!(
+            conv.scroll_offset() < last,
+            "K on a user header should move to the previous one"
+        );
+    }
+
+    #[test]
+    fn conversation_z_opens_lightbox_when_diagram_in_view() {
+        let mut conv = conv_with_diagram();
+        let action =
+            handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        assert_eq!(action, KeyAction::Consumed);
+        assert!(conv.is_lightbox());
+    }
+
+    #[test]
+    fn conversation_z_reports_empty_when_no_diagram() {
+        let mut conv = conv_with_doc(&["only text"]);
+        let action =
+            handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        assert_eq!(action, KeyAction::NoDiagramInView);
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn conversation_z_toggles_lightbox_closed() {
+        let mut conv = conv_with_diagram();
+        handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        let action =
+            handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        assert_eq!(action, KeyAction::Consumed);
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn conversation_esc_closes_lightbox_before_view() {
+        let mut conv = conv_with_diagram();
+        handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        let action = handle_conversation_key(key(KeyCode::Esc), &mut conv, &default_keys(), 20);
+        assert_eq!(action, KeyAction::Consumed);
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn conversation_esc_still_closes_view_without_lightbox() {
+        let mut conv = conv_with_doc(&["a"]);
+        let action = handle_conversation_key(key(KeyCode::Esc), &mut conv, &default_keys(), 20);
+        assert_eq!(action, KeyAction::Close);
+    }
+
+    #[test]
+    fn conversation_j_does_not_scroll_while_lightbox_open() {
+        let mut conv = conv_with_diagram();
+        // Ensure there's room to scroll before opening lightbox
+        conv.scroll_down(1, 20);
+        let before = conv.scroll_offset();
+        assert!(
+            conv.open_lightbox(20),
+            "diagram must be in view to open lightbox"
+        );
+        handle_conversation_key(key(KeyCode::Char('j')), &mut conv, &default_keys(), 20);
+        assert_eq!(conv.scroll_offset(), before);
+        assert!(conv.is_lightbox());
+    }
+
+    #[test]
+    fn conversation_search_mode_z_is_a_search_character() {
+        let mut conv = conv_with_doc(&["zebra"]);
+        conv.start_search();
+        handle_conversation_key(key(KeyCode::Char('z')), &mut conv, &default_keys(), 20);
+        assert_eq!(conv.search_query(), "z");
+        assert!(!conv.is_lightbox());
     }
 }

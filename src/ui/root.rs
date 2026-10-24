@@ -8,13 +8,19 @@ use ratatui::{
 
 use crate::{
     app::{
-        agents::AgentsViewState, conversation::ConversationViewState, diff::DiffViewState,
-        focus::AppFocus, message_picker::MessagePickerState, session_manager::SessionManagerState,
+        agents::AgentsViewState,
+        conversation::ConversationViewState,
+        diff::DiffViewState,
+        focus::AppFocus,
+        message_picker::MessagePickerState,
+        playbook::{ParamFormState, PlaybookPickerState},
+        session_manager::SessionManagerState,
         session_picker::SessionPickerState,
     },
     config::Keybindings,
     terminal::{manager::PtyManager, renderer::TerminalWidget, selection::SelectionRange},
     ui::{
+        conversation::selection::highlight_rows,
         diff::apply_cursor_and_selection,
         diff::highlight_search_matches,
         hints::footer_line,
@@ -46,6 +52,9 @@ pub fn render(
     session_picker: Option<&mut SessionPickerState>,
     session_manager: Option<&mut SessionManagerState>,
     message_picker: Option<&mut MessagePickerState>,
+    playbook_picker: Option<&PlaybookPickerState>,
+    playbook_form: Option<&ParamFormState>,
+    playbook_abort: bool,
     confirm_quit: bool,
     terminal_selection: Option<SelectionRange>,
 ) {
@@ -56,10 +65,28 @@ pub fn render(
             layout.sidebar,
         );
     }
-    frame.render_widget(
-        footer_line(focus, footer_message, keys, diff.is_visual()),
-        layout.footer,
+    let footer = footer_line(
+        focus,
+        footer_message,
+        keys,
+        diff.is_visual(),
+        conversation.is_lightbox(),
     );
+    let footer = if matches!(focus, AppFocus::Conversation)
+        && conversation.is_active()
+        && footer_message.is_none()
+    {
+        let status = crate::ui::conversation::conversation_status_line(
+            conversation.scroll_offset(),
+            conversation.document_len(),
+            conversation.is_following_tail(),
+            conversation.match_status(),
+        );
+        crate::ui::hints::compose_footer(footer, Some(status), layout.footer.width)
+    } else {
+        footer
+    };
+    frame.render_widget(footer, layout.footer);
 
     let main_border_style = if !app_focused {
         Style::default().fg(Color::DarkGray)
@@ -122,35 +149,29 @@ pub fn render(
         } else {
             let has_search = conversation.is_searching() || !conversation.search_query().is_empty();
 
-            let (content_area, search_bar_area) = if has_search {
-                let bar_height = 1u16;
-                let content_h = inner.height.saturating_sub(bar_height);
-                (
-                    Rect::new(inner.x, inner.y, inner.width, content_h),
-                    Some(Rect::new(
-                        inner.x,
-                        inner.y + content_h,
-                        inner.width,
-                        bar_height,
-                    )),
-                )
-            } else {
-                (inner, None)
-            };
+            let content_area = conversation.content_rect(inner);
+            let search_bar_area = has_search
+                .then(|| Rect::new(inner.x, inner.y + content_area.height, inner.width, 1));
 
             let content_vp = content_area.height as usize;
-            let visible = conversation.visible_lines(content_vp);
+            let mut rows = conversation.visible_rows(content_vp);
 
-            let visible = if !conversation.search_query().is_empty() {
-                highlight_search_matches(
-                    &visible,
+            if !conversation.search_query().is_empty() {
+                let lines: Vec<Line<'static>> = rows.iter().map(|r| r.line.clone()).collect();
+                let highlighted = highlight_search_matches(
+                    &lines,
                     conversation.scroll_offset(),
                     conversation.matches(),
                     conversation.current_match_index(),
-                )
-            } else {
-                visible
-            };
+                );
+                for (row, line) in rows.iter_mut().zip(highlighted) {
+                    row.line = line;
+                }
+            }
+            if let Some(selection) = conversation.selection() {
+                highlight_rows(&mut rows, conversation.scroll_offset(), selection);
+            }
+            let visible: Vec<Line<'static>> = rows.into_iter().map(|r| r.line).collect();
 
             frame.render_widget(Paragraph::new(visible), content_area);
 
@@ -332,6 +353,26 @@ pub fn render(
         );
     }
 
+    // Lightbox overlay for mermaid diagrams.
+    if matches!(focus, AppFocus::Conversation) && conversation.is_lightbox() {
+        let body = ratatui::layout::Rect::new(
+            frame.area().x,
+            frame.area().y,
+            frame.area().width,
+            frame.area().height.saturating_sub(1),
+        );
+        let popup = centered_rect(body, 96, 96);
+        frame.render_widget(Clear, popup);
+        let block = Block::bordered().title(" mermaid ");
+        let block_inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        if !conversation.protocol_enabled()
+            && let Some(lines) = conversation.lightbox_halfblock_lines(block_inner)
+        {
+            frame.render_widget(Paragraph::new(lines), block_inner);
+        }
+    }
+
     if show_help {
         let help = Paragraph::new(help_text(keys)).block(Block::bordered().title("help"));
         let popup = centered_rect(frame.area(), 62, 78);
@@ -360,14 +401,27 @@ pub fn render(
         let popup = centered_rect(frame.area(), 80, 70);
         frame.render_widget(Clear, popup);
         render_message_picker(frame, picker, popup);
+    } else if let Some(picker) = playbook_picker {
+        let popup = centered_rect(frame.area(), 70, 60);
+        frame.render_widget(Clear, popup);
+        crate::ui::playbook::render_playbook_picker(frame, picker, popup);
+    } else if let Some(form) = playbook_form {
+        let popup = centered_rect(frame.area(), 60, 50);
+        frame.render_widget(Clear, popup);
+        crate::ui::playbook::render_param_form(frame, form, popup);
     }
 
     if confirm_quit {
-        let quit_msg = Paragraph::new("Quit ocmux?\ny confirm\nn cancel")
+        let quit_msg = Paragraph::new("Quit ocmux and stop managed serves?\ny confirm\nn cancel")
             .block(Block::bordered().title("quit"));
         let popup = centered_rect(frame.area(), 30, 20);
         frame.render_widget(Clear, popup);
         frame.render_widget(quit_msg, popup);
+    }
+
+    if playbook_abort {
+        let popup = centered_rect(frame.area(), 40, 25);
+        crate::ui::playbook::render_abort_panel(frame, popup);
     }
 }
 
@@ -377,10 +431,19 @@ fn help_text(keys: &Keybindings) -> String {
         "  Ctrl-\\           focus sidebar/terminal".into(),
         "  Ctrl-h           hide/show sidebar".into(),
         format!("  {}/{} · ↑/↓     move selection", keys.down, keys.up),
+        format!(
+            "  {:<16} cycle session (keep focus)",
+            keys.session_next.display()
+        ),
+        format!(
+            "  {:<16} cycle session (keep focus)",
+            keys.session_prev.display()
+        ),
         "  Enter            attach / open session".into(),
         "  Tab              expand/collapse children".into(),
         format!("  {:<16} spawn new session", keys.spawn),
         format!("  {:<16} worktree + spawn", keys.worktree),
+        format!("  {:<16} move session directory", keys.move_session),
         format!("  {:<16} agents relationship view", keys.agents),
         format!("  {:<16} conversation view", keys.view),
         format!("  {:<16} diff view", keys.diff),
@@ -393,7 +456,7 @@ fn help_text(keys: &Keybindings) -> String {
         "  c                commit/push modified files".into(),
         format!("  {:<16} kill session (y confirm)", keys.kill),
         format!("  {:<16} toggle this help", keys.help),
-        format!("  {:<16} quit (y confirm)", keys.quit),
+        format!("  {:<16} quit + stop serves (y confirm)", keys.quit),
         String::new(),
         "Agents view".into(),
         "  j/k · ↑/↓        move  ·  g/G top/end".into(),
@@ -405,6 +468,7 @@ fn help_text(keys: &Keybindings) -> String {
         "  j/k · ↑/↓        scroll  ·  g/G top/end".into(),
         "  Ctrl-u/d         page up/down".into(),
         "  /                search  ·  n/N next/prev".into(),
+        "  z                enlarge mermaid diagram".into(),
         format!("  {}/q/Esc          close", keys.view),
         String::new(),
         "Diff view".into(),

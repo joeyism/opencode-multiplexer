@@ -1,6 +1,6 @@
 use opencode_multiplexer::ops::git::{
     diff_worktree, find_serve_port_for_cwd_with_entries, get_file_statuses,
-    repo_relative_session_files,
+    repo_relative_session_files, resolve_serve_port_with_entries,
 };
 use opencode_multiplexer::registry::ServeEntry;
 use std::{
@@ -398,5 +398,43 @@ fn find_serve_port_trailing_slash() {
     let port = find_serve_port_for_cwd_with_entries(&dir, &entries);
     assert_eq!(port, Some(4205));
 
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resolve_serve_port_prefers_explicit_port() {
+    let dir = temp_repo_dir("serve-resolve-explicit");
+    fs::create_dir_all(&dir).unwrap();
+    let dir = fs::canonicalize(&dir).unwrap();
+    let entries = vec![ServeEntry {
+        port: 4201,
+        pid: 1,
+        cwd: dir.display().to_string(),
+        tui_pid: None,
+    }];
+
+    assert_eq!(
+        resolve_serve_port_with_entries(Some(4300), &dir, &entries),
+        Some(4300)
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn resolve_serve_port_falls_back_to_matching_entry() {
+    let dir = temp_repo_dir("serve-resolve-fallback");
+    fs::create_dir_all(&dir).unwrap();
+    let dir = fs::canonicalize(&dir).unwrap();
+    let entries = vec![ServeEntry {
+        port: 4202,
+        pid: 1,
+        cwd: dir.display().to_string(),
+        tui_pid: None,
+    }];
+
+    assert_eq!(
+        resolve_serve_port_with_entries(None, &dir, &entries),
+        Some(4202)
+    );
     fs::remove_dir_all(dir).ok();
 }

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
+use super::sanitize::sanitize_mermaid_source;
+
 /// Bump when render flags change so stale cache entries are ignored.
 pub const RENDER_CACHE_VERSION: &str = "v2-dark";
 
@@ -96,10 +98,11 @@ fn render_inline_fake(source: &str, cfg: &MermaidRenderConfig) -> Result<Vec<u8>
 }
 
 pub fn render_with_mmdc(source: &str, cfg: &MermaidRenderConfig) -> Result<Vec<u8>, MermaidError> {
+    let source = sanitize_mermaid_source(source);
     let _ = fs::create_dir_all(&cfg.cache_dir);
 
     if is_inline_fake(&cfg.mmdc_path) {
-        return render_inline_fake(source, cfg);
+        return render_inline_fake(&source, cfg);
     }
 
     let temp_id = uuid::Uuid::new_v4();

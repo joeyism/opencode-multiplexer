@@ -4,5 +4,6 @@ pub mod hash;
 pub mod layout;
 pub mod mmdc;
 pub mod protocol;
+pub mod sanitize;
 pub mod scheduler;
 pub mod slot;
