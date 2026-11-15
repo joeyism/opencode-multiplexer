@@ -20,8 +20,10 @@ use opencode_multiplexer::{
         conversation::ConversationViewState,
         diff::DiffViewState,
         focus::AppFocus,
+        help::{HelpAction, handle_help_key},
         key_handler::{KeyAction, handle_conversation_key, handle_diff_key},
         message_picker::MessagePickerState,
+        pane_cycle::{is_pane_cycle_chord, pane_cycle_direction},
         playbook::{
             PlaybookUiAction, SessionTarget, abort_playbook,
             handle_form_key as handle_playbook_form_key,
@@ -29,10 +31,11 @@ use opencode_multiplexer::{
             should_refresh_pty_after_playbook, start_playbook,
         },
         reducer::reduce,
-        session_cycle::{chrome_session_cycle, follow_attach_id},
+        session_cycle::follow_attach_id,
         session_manager::{ManagerCommand, SessionManagerState, manager_key_to_command},
         session_picker::SessionPickerState,
         sessions::SessionStatus,
+        split_picker::{SplitChoice, SplitPickerState, build_split_choices},
         state::AppState,
     },
     config::load_config,
@@ -40,6 +43,7 @@ use opencode_multiplexer::{
         db::{reader::DbReader, writer::DbWriter},
         parallel_builds::load_snapshot,
         poller::start_poller,
+        vitals::{VitalsRequest, VitalsWorker},
     },
     notify::Notifier,
     ops::git::{diff_worktree, fetch_session_diff_from_serve},
@@ -49,13 +53,14 @@ use opencode_multiplexer::{
     playbook::{http::ServePromptClient, shell::PosixShell},
     registry::{load_serve_registry, save_managed_sessions},
     terminal::{
-        clipboard, input, manager::PtyManager, selection::MouseResult, selection::TerminalSelection,
+        clipboard, input, manager::PtyManager, selection::MouseResult,
+        selection::TerminalSelection, shells::ShellManager,
     },
     ui::{
         conversation::build_conversation_document,
         conversation::diagram::mmdc::MermaidRenderConfig,
         diff as ui_diff,
-        layout::{centered_rect, terminal_inner_rect},
+        layout::{layout_workspace, pane_at, pane_content_rects, terminal_inner_rect},
         root,
         sidebar::{SidebarRowKind, flatten_sidebar_entries},
     },
@@ -98,6 +103,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     let _ = opencode_multiplexer::registry::cleanup_orphaned_serve_processes();
     let mut state = AppState::default();
     let mut manager = PtyManager::default();
+    let mut shells = ShellManager::default();
     let mut footer_message: Option<String> = None;
     let mut conversation = ConversationViewState::default();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -114,10 +120,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     };
     conversation.set_mermaid_config(mermaid_config);
     let mut diff_view = DiffViewState::default();
+    let mut diff_document_width: Option<u16> = None;
     let mut open_requests = opencode_multiplexer::ops::open_requests::OpenRequestTracker::default();
     let mut terminal_selection = TerminalSelection::default();
     let (poll_tx, poll_rx) = std::sync::mpsc::channel();
     let poller = start_poller(poll_tx);
+    let vitals_worker = opencode_multiplexer::data::db::default_db_path()
+        .map(VitalsWorker::spawn)
+        .ok();
+    let mut last_vitals_target: Option<String> = None;
+    let mut last_vitals_poll = Instant::now() - Duration::from_secs(10);
 
     // SSE event channel — receives session.created events from serve subscribers
     let (event_tx, event_rx) = std::sync::mpsc::channel::<(u16, ServeEvent)>();
@@ -193,6 +205,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             }
 
             manager.drain_all_output();
+            shells.drain_all_output();
+            for shell_id in shells.reap_exited() {
+                state.workspaces.remove_shell_pane(shell_id);
+            }
+            if let Some(active_id) = manager.active_id() {
+                state.activate_workspace(active_id);
+            }
             let entries = manager.sidebar_entries();
             let rows = flatten_sidebar_entries(&entries, &state.expanded_session_ids);
             if !rows.is_empty() {
@@ -211,11 +230,74 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 config.sidebar_width
             };
 
-            let content_width = terminal.size()?.width.saturating_sub(sidebar_width);
-            let viewport_height = terminal
+            let full_content_width = terminal.size()?.width.saturating_sub(sidebar_width);
+            let full_viewport_height = terminal
                 .size()
                 .map(|s| s.height.saturating_sub(FOOTER_HEIGHT + 1))
                 .unwrap_or(24) as usize;
+            let pane_view_area = if state.focus.overlay_owns_main() {
+                workspace_target_inner_rect(&state, terminal.size()?.into(), sidebar_width)
+            } else {
+                None
+            };
+            let content_width = pane_view_area
+                .map(|area| area.width)
+                .unwrap_or(full_content_width);
+            let viewport_height = pane_view_area
+                .map(|area| area.height as usize)
+                .unwrap_or(full_viewport_height);
+
+            if state.focus == AppFocus::Diff
+                && diff_view.is_active()
+                && diff_document_width != Some(content_width)
+            {
+                let (doc, meta) = ui_diff::build_diff_document(diff_view.raw_diff(), content_width);
+                diff_view.replace_document(doc, meta, viewport_height);
+                diff_document_width = Some(content_width);
+            }
+
+            if let Some(workspace_id) = state.active_workspace
+                && let Some(workspace) = state.workspaces.workspace(workspace_id)
+            {
+                let area = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                let outer_areas = layout_workspace(workspace, area);
+                if outer_areas.len() < workspace.pane_count() {
+                    footer_message = Some("window too small: showing target pane only".into());
+                } else if footer_message.as_deref()
+                    == Some("window too small: showing target pane only")
+                {
+                    footer_message = None;
+                }
+                let pane_areas = pane_content_rects(workspace, area);
+                for (pane_id, pane_area) in pane_areas {
+                    let Some(content) = workspace.content(pane_id) else {
+                        continue;
+                    };
+                    let rows = pane_area.height.max(1);
+                    let cols = pane_area.width.max(1);
+                    match content {
+                        opencode_multiplexer::app::workspace::PaneContent::Session(id) => {
+                            if let Some(pty) = manager.session_by_entry_id_mut(id)
+                                && (pty.surface.rows() != rows as usize
+                                    || pty.surface.cols() != cols as usize)
+                                && let Err(error) = pty.resize(rows, cols)
+                            {
+                                footer_message = Some(format!("session resize failed: {error}"));
+                            }
+                        }
+                        opencode_multiplexer::app::workspace::PaneContent::Shell(id) => {
+                            if let Some(shell) = shells.terminal(id)
+                                && (shell.surface.rows() != rows as usize
+                                    || shell.surface.cols() != cols as usize)
+                                && let Err(error) = shells.resize(id, rows, cols)
+                            {
+                                footer_message = Some(format!("shell resize failed: {error}"));
+                            }
+                        }
+                        opencode_multiplexer::app::workspace::PaneContent::Empty => {}
+                    }
+                }
+            }
 
             if state.focus == AppFocus::Conversation
                 && conversation.should_poll(Instant::now())
@@ -246,7 +328,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 // Edge auto-scroll runs on elapsed time, not mouse events, so
                 // a drag held still at a viewport edge keeps extending.
                 if conversation.is_dragging() {
-                    let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    let screen: ratatui::layout::Rect = terminal.size()?.into();
+                    let inner = workspace_target_inner_rect(&state, screen, sidebar_width)
+                        .unwrap_or_else(|| terminal_inner_rect(screen, sidebar_width, 1));
                     let content = conversation.content_rect(inner);
                     conversation.tick_selection(Instant::now(), content, viewport_height);
                 }
@@ -322,6 +406,64 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 last_reconcile = Instant::now();
             }
 
+            // Session vitals: track the active session (or inspected
+            // conversation session). Re-request immediately on target change,
+            // then every 2s for live turns.
+            {
+                let conv_sid =
+                    if matches!(state.focus, AppFocus::Conversation) && conversation.is_active() {
+                        conversation.session_id().map(str::to_string)
+                    } else {
+                        None
+                    };
+                let target_entry = match state.target_pane_content() {
+                    Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) => {
+                        Some(id)
+                    }
+                    _ => None,
+                };
+                let req: Option<VitalsRequest> =
+                    opencode_multiplexer::app::state::resolve_vitals_target_from(
+                        manager.sessions().items(),
+                        target_entry,
+                        conv_sid.as_deref(),
+                    );
+                match &req {
+                    Some(r)
+                        if last_vitals_target.as_deref() != Some(r.primary_session_id.as_str()) =>
+                    {
+                        if let Some(w) = &vitals_worker {
+                            w.request(r.clone());
+                        }
+                        last_vitals_target = Some(r.primary_session_id.clone());
+                        last_vitals_poll = Instant::now();
+                    }
+                    Some(r) if last_vitals_poll.elapsed() >= Duration::from_secs(2) => {
+                        if let Some(w) = &vitals_worker {
+                            w.request(r.clone());
+                        }
+                        last_vitals_poll = Instant::now();
+                    }
+                    None => {
+                        last_vitals_target = None;
+                        state.vitals = None;
+                    }
+                    _ => {}
+                }
+                if let Some(w) = &vitals_worker
+                    && let Some(v) = w.try_recv()
+                {
+                    let current = last_vitals_target.as_deref();
+                    if current == Some(v.session_id.as_str())
+                        || req
+                            .as_ref()
+                            .is_some_and(|r| r.primary_session_id == v.session_id)
+                    {
+                        state.vitals = Some(v);
+                    }
+                }
+            }
+
             terminal.draw(|frame| {
                 root::render(
                     frame,
@@ -331,7 +473,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     &manager,
                     footer_message.as_deref(),
                     &config.keybindings,
-                    state.show_help,
+                    state.help.as_ref(),
                     &state.show_files,
                     sidebar_width,
                     state.panel_hidden,
@@ -347,6 +489,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     state.playbook_abort_for.is_some(),
                     state.confirm_quit,
                     terminal_selection.range(),
+                    state
+                        .active_workspace
+                        .and_then(|id| state.workspaces.workspace(id)),
+                    &shells,
+                    state.split_picker.as_ref(),
+                    state.close_shell_for.is_some(),
+                    state.vitals.as_ref(),
+                    state.vitals_mode,
                 )
             })?;
 
@@ -360,7 +510,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 || state.playbook_picker.is_some()
                 || state.playbook_form.is_some()
                 || state.playbook_abort_for.is_some()
-                || state.show_help
+                || state.help.is_some()
                 || state.confirm_quit;
             let show_kitty = matches!(state.focus, AppFocus::Conversation)
                 && conversation.is_active()
@@ -373,22 +523,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 && conversation.protocol_enabled();
             if show_lightbox_kitty {
                 let area: ratatui::layout::Rect = terminal.size()?.into();
-                let body = ratatui::layout::Rect::new(
-                    area.x,
-                    area.y,
-                    area.width,
-                    area.height.saturating_sub(1),
-                );
-                let popup = centered_rect(body, 96, 96);
-                let block_inner = ratatui::layout::Rect {
-                    x: popup.x.saturating_add(1),
-                    y: popup.y.saturating_add(1),
-                    width: popup.width.saturating_sub(2),
-                    height: popup.height.saturating_sub(2),
-                };
+                let block_inner = opencode_multiplexer::ui::layout::lightbox_inner_rect(area);
                 let _ = conversation.paint_lightbox_graphics(terminal.backend_mut(), block_inner);
             } else if show_kitty {
-                let area = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                let full_area = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                let area = state
+                    .active_workspace
+                    .and_then(|id| state.workspaces.workspace(id))
+                    .and_then(|workspace| {
+                        pane_content_rects(workspace, full_area)
+                            .get(&workspace.target_pane())
+                            .copied()
+                    })
+                    .unwrap_or(full_area);
                 // Shrink for search bar if active (mirror root.rs).
                 let area = if conversation.is_searching() || !conversation.search_query().is_empty()
                 {
@@ -413,7 +560,48 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
             match event::read()? {
                 Event::Key(key) => {
                     terminal_selection.clear();
-                    if state.playbook_abort_for.is_some() {
+                    let pane_cycle_chord = is_pane_cycle_chord(key, &config.keybindings);
+                    let modal_open = state.close_shell_for.is_some()
+                        || state.playbook_abort_for.is_some()
+                        || state.split_picker.is_some()
+                        || state.message_picker.is_some()
+                        || state.session_picker.is_some()
+                        || state.session_manager.is_some()
+                        || state.playbook_picker.is_some()
+                        || state.playbook_form.is_some()
+                        || state.help.is_some()
+                        || state.confirm_quit
+                        || !state.show_files.is_empty()
+                        || manager.pending_kill().is_some();
+                    if pane_cycle_chord {
+                        if let Some(direction) =
+                            pane_cycle_direction(key, &config.keybindings, state.focus, modal_open)
+                            && let Some(workspace) = state.active_workspace
+                            && state.workspaces.cycle_pane(workspace, direction).is_some()
+                        {
+                            state.focus = AppFocus::Terminal;
+                            state.last_main_focus = AppFocus::Terminal;
+                            terminal_selection.clear();
+                        }
+                    } else if let Some(shell_id) = state.close_shell_for {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                state.close_shell_for = None;
+                                match shells.close(shell_id) {
+                                    Ok(()) => {
+                                        state.workspaces.remove_shell_pane(shell_id);
+                                        footer_message = Some("shell pane closed".into());
+                                    }
+                                    Err(error) => {
+                                        footer_message =
+                                            Some(format!("shell close failed: {error}"));
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => state.close_shell_for = None,
+                            _ => {}
+                        }
+                    } else if state.playbook_abort_for.is_some() {
                         match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
                                 if let Some(session_id) = state.playbook_abort_for.take()
@@ -425,6 +613,94 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             }
                             KeyCode::Esc | KeyCode::Char('n') => {
                                 state.playbook_abort_for = None;
+                            }
+                            _ => {}
+                        }
+                    } else if state.split_picker.is_some() {
+                        match key.code {
+                            KeyCode::Esc => state.split_picker = None,
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if let Some(picker) = state.split_picker.as_mut() {
+                                    picker.move_up();
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(picker) = state.split_picker.as_mut() {
+                                    picker.move_down();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let picked = state.split_picker.as_ref().and_then(|picker| {
+                                    Some((
+                                        picker.workspace_id(),
+                                        picker.target_pane(),
+                                        picker.horizontal(),
+                                        picker.selected()?.clone(),
+                                    ))
+                                });
+                                state.split_picker = None;
+                                if let Some((workspace, target, horizontal, choice)) = picked {
+                                    match choice {
+                                        SplitChoice::Session { entry_id, .. } => {
+                                            let (rows, cols) =
+                                                pane_size(terminal.size()?.into(), sidebar_width);
+                                            match manager.ensure_attached_by_entry_id(entry_id, rows, cols).and_then(|()| {
+                                                state.workspaces.split_with_content(
+                                                    workspace,
+                                                    target,
+                                                    opencode_multiplexer::app::workspace::PaneContent::Session(entry_id),
+                                                    horizontal,
+                                                ).map(|_| ()).map_err(anyhow::Error::msg)
+                                            }) {
+                                                Ok(_) => {
+                                                    state.focus = AppFocus::Terminal;
+                                                    state.last_main_focus = AppFocus::Terminal;
+                                                    footer_message = None;
+                                                }
+                                                Err(error) => footer_message = Some(format!("session attach failed: {error}")),
+                                            }
+                                        }
+                                        SplitChoice::Shell => {
+                                            let cwd = state.workspaces.workspace(workspace).and_then(|layout| {
+                                                let owner = layout.owner_session();
+                                                match layout.content(target) {
+                                                    Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) => manager.summary_by_entry_id(id).map(|s| s.cwd.clone()),
+                                                    _ => manager.summary_by_entry_id(owner).map(|s| s.cwd.clone()),
+                                                }
+                                            });
+                                            if let Some(cwd) = cwd {
+                                                let (rows, cols) = pane_size(
+                                                    terminal.size()?.into(),
+                                                    sidebar_width,
+                                                );
+                                                match shells.spawn(&cwd, rows, cols) {
+                                                    Ok(shell_id) => match state.workspaces.split_with_content(
+                                                        workspace,
+                                                        target,
+                                                        opencode_multiplexer::app::workspace::PaneContent::Shell(shell_id),
+                                                        horizontal,
+                                                    ) {
+                                                        Ok(_) => {
+                                                            state.focus = AppFocus::Terminal;
+                                                            state.last_main_focus = AppFocus::Terminal;
+                                                            footer_message = None;
+                                                        }
+                                                        Err(error) => {
+                                                            let _ = shells.close(shell_id);
+                                                            footer_message = Some(error.into());
+                                                        }
+                                                    },
+                                                    Err(error) => footer_message = Some(format!("shell spawn failed: {error}")),
+                                                }
+                                            } else {
+                                                footer_message = Some(
+                                                    "cannot determine shell working directory"
+                                                        .into(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -721,6 +997,28 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         w.delete_sessions(&pending.session_ids, &live_ids)
                                     }) {
                                         Ok(result) => {
+                                            let deleted_entries = manager
+                                                .sessions()
+                                                .items()
+                                                .iter()
+                                                .filter(|session| {
+                                                    session.session_id.as_ref().is_some_and(|id| {
+                                                        result.deleted_session_ids.contains(id)
+                                                    })
+                                                })
+                                                .map(|session| session.id)
+                                                .collect::<Vec<_>>();
+                                            for entry_id in deleted_entries {
+                                                for shell_id in
+                                                    state.workspaces.remove_session(entry_id)
+                                                {
+                                                    if let Err(error) = shells.close(shell_id) {
+                                                        footer_message = Some(format!(
+                                                            "shell cleanup failed: {error}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             manager_state
                                                 .apply_local_removal(&result.deleted_session_ids);
                                             manager_state.pending_delete = None;
@@ -769,9 +1067,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         && !matches!(state.focus, AppFocus::Terminal)
                     {
                         reduce(&mut state, Action::ToggleHelp)
-                    } else if state.show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char(_))
-                    {
-                        state.show_help = false;
+                    } else if let Some(help) = state.help.as_mut() {
+                        let screen: ratatui::layout::Rect = terminal.size()?.into();
+                        let total = root::help_line_count(&config.keybindings);
+                        let viewport = root::help_viewport_height(screen);
+                        let action =
+                            handle_help_key(key, help, config.keybindings.help, total, viewport);
+                        if action == HelpAction::Close {
+                            state.help = None;
+                        }
                     } else if !state.show_files.is_empty()
                         && matches!(key.code, KeyCode::Esc | KeyCode::Char(_))
                     {
@@ -824,37 +1128,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         if matches!(state.focus, AppFocus::Conversation) {
                             conversation.force_poll();
                         }
-                    } else if let Some(outcome) = chrome_session_cycle(
-                        key,
-                        &config.keybindings,
-                        state.focus,
-                        false,
-                        state.selected_sidebar_row,
-                        &rows,
-                    ) {
-                        let (pty_rows, pty_cols) =
-                            pane_size(terminal.size()?.into(), config.sidebar_width);
-                        state.selected_sidebar_row = outcome.selected_row;
-                        manager.select_top_level(outcome.top_level_id);
-                        match manager.activate_or_attach_selected(pty_rows, pty_cols) {
-                            Ok(_) => {
-                                save_managed_sessions(manager.managed_session_ids())?;
-                                if let Some(port) = manager
-                                    .selected_summary()
-                                    .and_then(|summary| summary.serve_port)
-                                    && subscribed_serve_ports.insert(port)
-                                {
-                                    subscribers.push(SessionEventSubscriber::start(
-                                        port,
-                                        event_tx.clone(),
-                                    ));
-                                }
-                                footer_message = None;
-                            }
-                            Err(error) => {
-                                footer_message = Some(format!("attach failed: {error}"));
-                            }
-                        }
                     } else if is_focus_toggle(key) {
                         if state.panel_hidden {
                             reduce(&mut state, Action::TogglePanelHidden);
@@ -876,9 +1149,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     {
                         match key.code {
                             KeyCode::Char('y') => {
-                                let _ = manager.kill_selected()?;
+                                if let Some(killed_id) = manager.kill_selected()? {
+                                    for shell_id in state.workspaces.remove_session(killed_id) {
+                                        if let Err(error) = shells.close(shell_id) {
+                                            footer_message =
+                                                Some(format!("shell cleanup failed: {error}"));
+                                        }
+                                    }
+                                }
                                 save_managed_sessions(manager.managed_session_ids())?;
-                                footer_message = Some("killed session".into());
+                                if footer_message.is_none() {
+                                    footer_message = Some("killed session".into());
+                                }
                             }
                             KeyCode::Char('n') | KeyCode::Esc => {
                                 manager.cancel_kill();
@@ -888,6 +1170,70 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                         }
                     } else if matches!(state.focus, AppFocus::Sidebar) {
                         match key.code {
+                            KeyCode::Char('|') | KeyCode::Char('-') => {
+                                let horizontal = key.code == KeyCode::Char('-');
+                                let workspace_id = state.active_workspace.or_else(|| {
+                                    manager.active_id().map(|id| state.activate_workspace(id))
+                                });
+                                if let Some(workspace_id) = workspace_id {
+                                    let target = state
+                                        .workspaces
+                                        .workspace(workspace_id)
+                                        .map(|workspace| {
+                                            (workspace.target_pane(), workspace.panes())
+                                        })
+                                        .unwrap();
+                                    let excluded = target
+                                        .1
+                                        .iter()
+                                        .filter_map(|(_, content)| match content {
+                                            opencode_multiplexer::app::workspace::PaneContent::Session(id) => Some(*id),
+                                            _ => None,
+                                        })
+                                        .collect::<HashSet<_>>();
+                                    let candidates = manager
+                                        .sessions()
+                                        .items()
+                                        .iter()
+                                        .filter(|session| {
+                                            manager.session_by_entry_id(session.id).is_some()
+                                                || session.session_id.is_some()
+                                        })
+                                        .map(|session| (session.id, session.title.clone()));
+                                    let choices = build_split_choices(candidates, &excluded);
+                                    state.split_picker = Some(SplitPickerState::new(
+                                        workspace_id,
+                                        target.0,
+                                        horizontal,
+                                        choices,
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('w') => {
+                                let workspace_id = state.active_workspace.or_else(|| {
+                                    manager.active_id().map(|id| state.activate_workspace(id))
+                                });
+                                match workspace_id
+                                    .map(|id| (id, state.workspaces.close_request(id)))
+                                {
+                                    Some((workspace, opencode_multiplexer::app::workspace::CloseRequest::ClosePane(pane))) => {
+                                        if state.workspaces.close_pane(workspace, pane) {
+                                            footer_message = Some("pane closed".into());
+                                        } else {
+                                            footer_message = Some("pane could not be closed".into());
+                                        }
+                                    }
+                                    Some((_, opencode_multiplexer::app::workspace::CloseRequest::ConfirmShell(id))) => {
+                                        state.close_shell_for = Some(id);
+                                    }
+                                    Some((_, opencode_multiplexer::app::workspace::CloseRequest::Ambiguous)) => {
+                                        footer_message = Some("target the pane to close (Ctrl-Alt-j/k or click), then w".into());
+                                    }
+                                    Some((_, opencode_multiplexer::app::workspace::CloseRequest::NothingToClose)) | None => {
+                                        footer_message = Some("nothing to close".into());
+                                    }
+                                }
+                            }
                             KeyCode::Char(c) if c == config.keybindings.quit => {
                                 state.confirm_quit = true;
                             }
@@ -988,44 +1334,39 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.view => {
-                                if let Some(row) = rows.get(state.selected_sidebar_row) {
-                                    match &row.kind {
-                                        SidebarRowKind::TopLevel {
-                                            session_id: Some(sid),
-                                            ..
-                                        } => {
-                                            let title = row.title.clone();
-                                            conversation.open(
-                                                sid.clone(),
-                                                title,
-                                                AppFocus::Sidebar,
-                                            );
-                                            reduce(
-                                                &mut state,
-                                                Action::SetFocus(AppFocus::Conversation),
-                                            );
-                                            footer_message = None;
-                                        }
-                                        SidebarRowKind::Child { session_id } => {
-                                            let title = row.title.clone();
-                                            conversation.open(
-                                                session_id.clone(),
-                                                title,
-                                                AppFocus::Sidebar,
-                                            );
-                                            reduce(
-                                                &mut state,
-                                                Action::SetFocus(AppFocus::Conversation),
-                                            );
-                                            footer_message = None;
-                                        }
-                                        _ => {
-                                            footer_message = Some(
-                                                "conversation view requires a session with a DB ID"
-                                                    .into(),
-                                            );
-                                        }
+                                let child_subject =
+                                    rows.get(state.selected_sidebar_row)
+                                        .and_then(|row| match &row.kind {
+                                            SidebarRowKind::Child { session_id } => {
+                                                Some((session_id.clone(), row.title.clone()))
+                                            }
+                                            _ => None,
+                                        });
+                                let target_subject = match state.target_pane_content() {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => manager.summary_by_entry_id(id).and_then(|summary| {
+                                        Some((summary.session_id.clone()?, summary.title.clone()))
+                                    }),
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(_),
+                                    ) => {
+                                        footer_message = Some(
+                                            "conversation view requires an OpenCode pane".into(),
+                                        );
+                                        None
                                     }
+                                    _ => None,
+                                };
+                                if let Some((sid, title)) = child_subject.or(target_subject) {
+                                    conversation.open(sid, title, AppFocus::Sidebar);
+                                    reduce(&mut state, Action::SetFocus(AppFocus::Conversation));
+                                    footer_message = None;
+                                } else if footer_message.is_none() {
+                                    footer_message =
+                                        Some("target pane has no OpenCode session".into());
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.files => {
@@ -1053,14 +1394,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.diff => {
-                                if let Some(row) = rows.get(state.selected_sidebar_row) {
+                                let target_row = match state.target_pane_content() {
+                                    Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) => {
+                                        rows.iter().find(|row| matches!(
+                                            row.kind,
+                                            SidebarRowKind::TopLevel { top_level_id, .. } if top_level_id == id
+                                        ))
+                                    }
+                                    Some(opencode_multiplexer::app::workspace::PaneContent::Shell(_)) => {
+                                        footer_message = Some("diff view requires an OpenCode pane".into());
+                                        None
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(row) = target_row {
                                     if let Some(sid) = row.session_id.as_deref() {
                                         match resolve_session_diff(row, sid) {
                                             Ok(diff) => {
-                                                let title = row.title.clone();
                                                 diff_view.open(
                                                     sid.to_string(),
-                                                    title,
+                                                    row.title.clone(),
                                                     diff,
                                                     AppFocus::Sidebar,
                                                 );
@@ -1079,20 +1432,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                                 );
                                                 footer_message = None;
                                             }
-                                            Err(msg) => {
-                                                footer_message = Some(msg);
-                                            }
+                                            Err(msg) => footer_message = Some(msg),
                                         }
                                     } else {
-                                        footer_message = Some("no session ID for this row".into());
+                                        footer_message = Some("target session has no DB ID".into());
                                     }
+                                } else if footer_message.is_none() {
+                                    footer_message =
+                                        Some("target pane has no OpenCode session".into());
                                 }
                             }
                             KeyCode::Char(c) if c == config.keybindings.agents => {
-                                if let Some(row) = rows.get(state.selected_sidebar_row)
+                                let target_row = state.target_pane_content().and_then(|content| {
+                                    match content {
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(id) => rows.iter().find(|row| matches!(
+                                            row.kind,
+                                            SidebarRowKind::TopLevel { top_level_id, .. } if top_level_id == id
+                                        )),
+                                        _ => None,
+                                    }
+                                });
+                                if let Some(row) = target_row
                                     && let Some(root_summary) = selected_root_summary(&manager, row)
                                 {
-                                    let selected_id = row.session_id.as_deref();
+                                    let selected_id = root_summary.session_id.as_deref();
                                     let snapshot =
                                         root_summary.session_id.as_deref().and_then(|session_id| {
                                             load_snapshot(&root_summary.cwd, session_id)
@@ -1107,6 +1470,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                     last_agents_refresh = Instant::now();
                                     reduce(&mut state, Action::SetFocus(AppFocus::Agents));
                                     footer_message = None;
+                                } else {
+                                    footer_message =
+                                        Some("agents view requires an OpenCode pane".into());
                                 }
                             }
                             KeyCode::Char('/') => {
@@ -1551,8 +1917,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));
                                 footer_message = None;
-                                if let Some(pty) = manager.active_session_mut() {
-                                    let _ = pty.send_paste(&text);
+                                match state.target_pane_content() {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = manager.session_by_entry_id_mut(id) {
+                                            let _ = pty.send_paste(&text);
+                                        }
+                                    }
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = shells.terminal_mut(id) {
+                                            let _ = pty.send_paste(&text);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             KeyAction::SelectionEmpty => {
@@ -1584,8 +1968,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 state.last_main_focus = AppFocus::Terminal;
                                 reduce(&mut state, Action::SetFocus(return_focus));
                                 footer_message = None;
-                                if let Some(pty) = manager.active_session_mut() {
-                                    let _ = pty.send_paste(&text);
+                                match state.target_pane_content() {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = manager.session_by_entry_id_mut(id) {
+                                            let _ = pty.send_paste(&text);
+                                        }
+                                    }
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = shells.terminal_mut(id) {
+                                            let _ = pty.send_paste(&text);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             KeyAction::SelectionEmpty => {
@@ -1675,7 +2077,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             _ => {}
                         }
                     } else if matches!(state.focus, AppFocus::Terminal)
-                        && let Some(pty) = manager.active_session_mut()
+                        && let Some(opencode_multiplexer::app::workspace::PaneContent::Shell(id)) =
+                            state.target_pane_content()
+                        && let Err(error) = shells.send_key(id, key)
+                    {
+                        footer_message = Some(format!("shell write failed: {error}"));
+                    } else if matches!(state.focus, AppFocus::Terminal)
+                        && let Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) =
+                            state.target_pane_content()
+                        && let Some(pty) = manager.session_by_entry_id_mut(id)
                         && let Err(error) = pty.send_key(key)
                     {
                         footer_message = Some(format!("terminal write failed: {error}"));
@@ -1694,18 +2104,121 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                     } else if matches!(state.focus, AppFocus::Diff) && diff_view.is_searching() {
                         diff_view.search_insert_str(&text, viewport_height);
                     } else if matches!(state.focus, AppFocus::Terminal)
-                        && let Some(pty) = manager.active_session_mut()
+                        && let Some(opencode_multiplexer::app::workspace::PaneContent::Shell(id)) =
+                            state.target_pane_content()
+                        && let Some(shell) = shells.terminal_mut(id)
+                        && let Err(error) = shell.send_paste(&text)
+                    {
+                        footer_message = Some(format!("paste failed: {error}"));
+                    } else if matches!(state.focus, AppFocus::Terminal)
+                        && let Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) =
+                            state.target_pane_content()
+                        && let Some(pty) = manager.session_by_entry_id_mut(id)
                         && let Err(error) = pty.send_paste(&text)
                     {
                         footer_message = Some(format!("paste failed: {error}"));
                     }
                 }
                 Event::Mouse(mouse) => {
-                    let inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    if state.help.is_some() {
+                        let screen: ratatui::layout::Rect = terminal.size()?.into();
+                        let popup = root::help_popup_rect(screen);
+                        if popup.contains((mouse.column, mouse.row).into()) {
+                            let total = root::help_line_count(&config.keybindings);
+                            let viewport = root::help_viewport_height(screen);
+                            if let Some(help) = state.help.as_mut() {
+                                match mouse.kind {
+                                    MouseEventKind::ScrollUp => {
+                                        help.scroll_by(-3, total, viewport);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        help.scroll_by(3, total, viewport);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if state.focus == AppFocus::Conversation
+                        && conversation.is_active()
+                        && conversation.is_lightbox()
+                    {
+                        let screen: ratatui::layout::Rect = terminal.size()?.into();
+                        let lightbox_inner =
+                            opencode_multiplexer::ui::layout::lightbox_inner_rect(screen);
+                        conversation.handle_lightbox_mouse(mouse, lightbox_inner);
+                        continue;
+                    }
+                    let main_inner = terminal_inner_rect(terminal.size()?.into(), sidebar_width, 1);
+                    let mut target_pane_rect = None;
+                    let mut target_changed = false;
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    ) && let Some(workspace_id) = state.active_workspace
+                        && let Some(workspace) = state.workspaces.workspace(workspace_id)
+                        && let Some(pane_id) =
+                            pane_at(workspace, main_inner, mouse.column, mouse.row)
+                    {
+                        let previous_target = state
+                            .workspaces
+                            .workspace(workspace_id)
+                            .map(|workspace| workspace.target_pane());
+                        state.workspaces.set_target(workspace_id, pane_id);
+                        target_changed = previous_target != Some(pane_id);
+                        target_pane_rect =
+                            state
+                                .workspaces
+                                .workspace(workspace_id)
+                                .and_then(|workspace| {
+                                    pane_content_rects(workspace, main_inner)
+                                        .get(&pane_id)
+                                        .copied()
+                                });
+                        if (target_changed && state.focus.overlay_owns_main())
+                            || matches!(mouse.kind, MouseEventKind::Down(_))
+                                && !state.focus.overlay_owns_main()
+                        {
+                            state.focus = AppFocus::Terminal;
+                        }
+                    }
+                    if target_changed {
+                        terminal_selection.clear();
+                    }
+                    if target_pane_rect.is_none()
+                        && let Some(workspace_id) = state.active_workspace
+                    {
+                        target_pane_rect =
+                            state
+                                .workspaces
+                                .workspace(workspace_id)
+                                .and_then(|workspace| {
+                                    pane_content_rects(workspace, main_inner)
+                                        .get(&workspace.target_pane())
+                                        .copied()
+                                });
+                    }
+                    let inner = target_pane_rect.unwrap_or(main_inner);
                     let content = conversation.content_rect(inner);
-                    let surface_size = manager
-                        .active_session()
-                        .map(|s| (s.surface.rows(), s.surface.cols()));
+                    let target_content = state.target_pane_content();
+                    let surface_size = match target_content {
+                        Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) => {
+                            manager
+                                .session_by_entry_id(id)
+                                .map(|s| (s.surface.rows(), s.surface.cols()))
+                        }
+                        Some(opencode_multiplexer::app::workspace::PaneContent::Shell(id)) => {
+                            shells
+                                .terminal(id)
+                                .map(|s| (s.surface.rows(), s.surface.cols()))
+                        }
+                        _ => manager
+                            .active_session()
+                            .map(|s| (s.surface.rows(), s.surface.cols())),
+                    };
 
                     let mut handled = false;
                     if conversation.is_active() && !conversation.is_lightbox() {
@@ -1733,16 +2246,25 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                             }
                             // Finish the drag even if focus moved, so it can
                             // never get stuck open.
-                            MouseEventKind::Up(MouseButton::Left) if conversation.is_dragging() => {
+                            MouseEventKind::Up(MouseButton::Left)
+                                if conversation.is_dragging()
+                                    || conversation.has_pending_press() =>
+                            {
                                 if let Some(pos) =
                                     conversation.pos_for_mouse(mouse.column, mouse.row, content)
                                 {
                                     conversation.extend_selection(pos, (mouse.column, mouse.row));
                                 }
-                                if let Some(text) = conversation.end_selection()
-                                    && let Err(e) = clipboard::copy_to_clipboard(&text)
-                                {
-                                    footer_message = Some(format!("copy failed: {e}"));
+                                match conversation.end_selection() {
+                                    Some(text) => {
+                                        if let Err(e) = clipboard::copy_to_clipboard(&text) {
+                                            footer_message = Some(format!("copy failed: {e}"));
+                                        }
+                                    }
+                                    None => {
+                                        conversation
+                                            .click_diagram((mouse.column, mouse.row), content);
+                                    }
                                 }
                                 handled = true;
                             }
@@ -1758,15 +2280,29 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 handled = true;
                             }
                             MouseResult::Finished => {
-                                let session = manager.active_session().unwrap();
-                                let snapshot = session.surface.snapshot();
-                                let wrapped = session.surface.wrapped_rows();
-                                if let Some(text) =
-                                    terminal_selection.extract_text_from(&snapshot, &wrapped)
-                                    && !text.is_empty()
-                                    && let Err(e) = clipboard::copy_to_clipboard(&text)
-                                {
-                                    footer_message = Some(format!("copy failed: {e}"));
+                                let selected_surface = match target_content {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => manager.session_by_entry_id(id).map(|s| &s.surface),
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(
+                                            id,
+                                        ),
+                                    ) => shells.terminal(id).map(|s| &s.surface),
+                                    _ => manager.active_session().map(|s| &s.surface),
+                                };
+                                if let Some(surface) = selected_surface {
+                                    let snapshot = surface.snapshot();
+                                    let wrapped = surface.wrapped_rows();
+                                    if let Some(text) =
+                                        terminal_selection.extract_text_from(&snapshot, &wrapped)
+                                        && !text.is_empty()
+                                        && let Err(e) = clipboard::copy_to_clipboard(&text)
+                                    {
+                                        footer_message = Some(format!("copy failed: {e}"));
+                                    }
                                 }
                                 state.focus = AppFocus::Terminal;
                                 handled = true;
@@ -1776,15 +2312,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 handled = true;
                                 let col1 = (col as u16).saturating_add(1);
                                 let row1 = (row as u16).saturating_add(1);
-                                if let Some(pty) = manager.active_session_mut() {
-                                    let bytes = input::mouse_click_press_release_sgr(
-                                        col1,
-                                        row1,
-                                        mouse.modifiers,
-                                    );
-                                    if let Err(e) = pty.send_bytes(&bytes) {
-                                        footer_message = Some(format!("mouse click failed: {e}"));
-                                    }
+                                let bytes = input::mouse_click_press_release_sgr(
+                                    col1,
+                                    row1,
+                                    mouse.modifiers,
+                                );
+                                let result = match target_content {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => manager
+                                        .session_by_entry_id_mut(id)
+                                        .map(|pty| pty.send_bytes(&bytes)),
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(
+                                            id,
+                                        ),
+                                    ) => shells.terminal_mut(id).map(|pty| pty.send_bytes(&bytes)),
+                                    _ => manager
+                                        .active_session_mut()
+                                        .map(|pty| pty.send_bytes(&bytes)),
+                                };
+                                if let Some(Err(e)) = result {
+                                    footer_message = Some(format!("mouse click failed: {e}"));
                                 }
                             }
                             MouseResult::Ignored => {}
@@ -1840,9 +2391,32 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                 col,
                                 row,
                                 mouse.modifiers,
-                            ) && let Some(pty) = manager.active_session_mut()
-                            {
-                                let _ = pty.send_bytes(&bytes);
+                            ) {
+                                match target_content {
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Session(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = manager.session_by_entry_id_mut(id) {
+                                            let _ = pty.send_bytes(&bytes);
+                                        }
+                                    }
+                                    Some(
+                                        opencode_multiplexer::app::workspace::PaneContent::Shell(
+                                            id,
+                                        ),
+                                    ) => {
+                                        if let Some(pty) = shells.terminal_mut(id) {
+                                            let _ = pty.send_bytes(&bytes);
+                                        }
+                                    }
+                                    _ => {
+                                        if let Some(pty) = manager.active_session_mut() {
+                                            let _ = pty.send_bytes(&bytes);
+                                        }
+                                    }
+                                }
                             }
                         } else if matches!(
                             mouse.kind,
@@ -1886,9 +2460,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                                         mouse.modifiers,
                                     ) {
                                         terminal_selection.clear();
-                                        if let Some(pty) = manager.active_session_mut()
-                                            && let Err(error) = pty.send_bytes(&bytes)
-                                        {
+                                        let result = match target_content {
+                                            Some(opencode_multiplexer::app::workspace::PaneContent::Session(id)) => manager.session_by_entry_id_mut(id).map(|pty| pty.send_bytes(&bytes)),
+                                            Some(opencode_multiplexer::app::workspace::PaneContent::Shell(id)) => shells.terminal_mut(id).map(|pty| pty.send_bytes(&bytes)),
+                                            _ => manager.active_session_mut().map(|pty| pty.send_bytes(&bytes)),
+                                        };
+                                        if let Some(Err(error)) = result {
                                             footer_message =
                                                 Some(format!("mouse scroll failed: {error}"));
                                         }
@@ -1909,10 +2486,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
                 }
                 Event::Resize(width, height) => {
                     terminal_selection.clear();
-                    let (pty_rows, pty_cols) = pane_size(
-                        ratatui::layout::Rect::new(0, 0, width, height),
-                        sidebar_width,
-                    );
+                    let screen = ratatui::layout::Rect::new(0, 0, width, height);
+                    if let Some(help) = state.help.as_mut() {
+                        help.reclamp(
+                            root::help_line_count(&config.keybindings),
+                            root::help_viewport_height(screen),
+                        );
+                    }
+                    let (pty_rows, pty_cols) = pane_size(screen, sidebar_width);
                     if let Err(error) = manager.resize_active(pty_rows, pty_cols) {
                         footer_message = Some(format!("resize failed: {error}"));
                     }
@@ -1948,6 +2529,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<(),
     subscribers.clear();
 
     result
+}
+
+fn workspace_target_inner_rect(
+    state: &AppState,
+    screen: ratatui::layout::Rect,
+    sidebar_width: u16,
+) -> Option<ratatui::layout::Rect> {
+    let workspace = state.workspaces.workspace(state.active_workspace?)?;
+    let area = terminal_inner_rect(screen, sidebar_width, 1);
+    pane_content_rects(workspace, area)
+        .get(&workspace.target_pane())
+        .copied()
 }
 
 fn pane_size(area: ratatui::layout::Rect, sidebar_width: u16) -> (u16, u16) {
@@ -2147,10 +2740,10 @@ fn prepare_playbook_target(
         }
     };
 
-    if summary.serve_port != Some(port) {
-        if let Some(pid) = pid {
-            manager.set_session_serve(summary.id, port, pid);
-        }
+    if summary.serve_port != Some(port)
+        && let Some(pid) = pid
+    {
+        manager.set_session_serve(summary.id, port, pid);
     }
 
     let session_id = match summary.session_id.clone() {
@@ -2247,4 +2840,22 @@ fn enter_tui(
     enable_raw_mode()?;
     terminal.clear()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_geometry_tests {
+    use super::{AppState, terminal_inner_rect, workspace_target_inner_rect};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn single_pane_target_rect_uses_full_main_inner() {
+        let mut state = AppState::default();
+        state.activate_workspace(1);
+        let screen = Rect::new(0, 0, 80, 30);
+
+        assert_eq!(
+            workspace_target_inner_rect(&state, screen, 30),
+            Some(terminal_inner_rect(screen, 30, 1))
+        );
+    }
 }

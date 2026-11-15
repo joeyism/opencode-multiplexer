@@ -163,6 +163,34 @@ pub fn handle_conversation_key(
                     conv.close_lightbox();
                     KeyAction::Consumed
                 }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    conv.lightbox_zoom_by(1.25);
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('-') | KeyCode::Char('_') => {
+                    conv.lightbox_zoom_by(1.0 / 1.25);
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('0') => {
+                    conv.lightbox_reset();
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    conv.lightbox_pan_step(-1, 0);
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    conv.lightbox_pan_step(1, 0);
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    conv.lightbox_pan_step(0, -1);
+                    KeyAction::Consumed
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    conv.lightbox_pan_step(0, 1);
+                    KeyAction::Consumed
+                }
                 _ => KeyAction::Consumed,
             };
         }

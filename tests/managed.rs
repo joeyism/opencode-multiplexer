@@ -346,6 +346,53 @@ fn pty_manager_kill_selected_updates_active_session() {
 }
 
 #[test]
+fn pty_manager_resolves_session_and_terminal_by_entry_id() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/project"),
+        "project".into(),
+        SessionStatus::Idle,
+        None,
+        SessionOrigin::Managed,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    assert_eq!(manager.summary_by_entry_id(id).unwrap().title, "project");
+    assert!(manager.session_by_entry_id(id).is_none());
+    assert!(manager.session_by_entry_id_mut(id).is_none());
+    assert!(manager.summary_by_entry_id(id + 1).is_none());
+}
+
+#[test]
+fn attaching_by_entry_id_rejects_placeholders_without_an_opencode_session() {
+    let mut manager = PtyManager::default();
+    let id = manager.register_placeholder(
+        PathBuf::from("/tmp/project"),
+        "project".into(),
+        SessionStatus::Idle,
+        None,
+        SessionOrigin::Discovered,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        vec![],
+    );
+
+    assert!(manager.ensure_attached_by_entry_id(id, 20, 80).is_err());
+}
+
+#[test]
 fn applying_poll_snapshot_adds_and_updates_discovered_sessions() {
     let mut manager = PtyManager::default();
 

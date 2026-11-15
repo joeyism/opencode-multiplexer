@@ -106,9 +106,7 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 |----------|---------------------------|
 | `j` / `Down` | Move down             |
 | `k` / `Up`   | Move up               |
-| `Ctrl-Alt-j` | Cycle next session (keep focus) |
-| `Ctrl-Alt-k` | Cycle prev session (keep focus) |
-| `Enter`  | Attach to session        |
+| `Enter`  | Open selected session workspace |
 | `Tab`    | Expand/collapse children |
 | `s`      | Open session manager     |
 | `Ctrl-h` | Hide/show sidebar panel  |
@@ -116,7 +114,19 @@ Run `ocmux` in your terminal. The sidebar lists active OpenCode sessions sorted 
 | `r`      | Refresh active session   |
 | `?`      | Show help overlay        |
 | `q`      | Quit (confirm with `y`) |
-| `Ctrl-4` | Toggle focus sidebar/main |
+| `Ctrl-\\` | Toggle focus sidebar / target pane |
+| `|` | Split target pane left/right (sidebar only) |
+| `-` | Split target pane top/bottom (sidebar only) |
+| `w` | Close comparison pane (shell close asks for confirmation) |
+
+### Pane navigation
+
+| Key | Action |
+|-----|--------|
+| `Ctrl-Alt-j` | Next pane (while a pane is focused) |
+| `Ctrl-Alt-k` | Previous pane (while a pane is focused) |
+
+These chords do nothing while the sidebar is focused. Use `Ctrl-\\` to focus the remembered target pane; use `Ctrl-\\` again to return to the sidebar. The sidebar marks the remembered target with a muted `target` label; the actively focused pane has a bright border and terminal cursor.
 
 ### Session actions
 
@@ -207,7 +217,7 @@ Press `v` from the sidebar to open a read-only view of the session's conversatio
 
 Turns are visually separated with a role-colored left gutter (`│`). User turns use cyan (`YOU`); assistant turns use green (agent name). Reasoning is dim italic; tool calls are indented and muted under the gutter.
 
-**Mermaid diagrams:** Fenced ` ```mermaid ` blocks are rendered as images when `mmdc` is installed (see [Optional: Mermaid diagrams](#optional-mermaid-diagrams-in-conversation-view)). In Kitty and compatible terminals, diagrams use pixel graphics and scroll with the conversation; otherwise they fall back to half-block rendering. Without `mmdc`, the fence is shown as a normal code block.
+**Mermaid diagrams:** Fenced ` ```mermaid ` blocks are rendered as images when `mmdc` is installed (see [Optional: Mermaid diagrams](#optional-mermaid-diagrams-in-conversation-view)). In Kitty and compatible terminals, diagrams use pixel graphics and scroll with the conversation; otherwise they fall back to half-block rendering. Click a diagram or press `z` to open it. In Kitty, use the wheel or `+`/`-` to zoom, drag or `h/j/k/l` to pan, and `0` to reset; press `z` or `Esc` to close. Without `mmdc`, the fence is shown as a normal code block.
 
 | Key      | Action                    |
 |----------|---------------------------|
@@ -222,7 +232,7 @@ Turns are visually separated with a role-colored left gutter (`│`). User turns
 | `N`      | Previous search match     |
 | `J`      | Jump to next user message |
 | `K`      | Jump to previous user message |
-| `z`      | Enlarge mermaid diagram (lightbox) |
+| `z` / click | Enlarge mermaid diagram (lightbox) |
 | `q` / `v` / `Esc` | Close view       |
 
 **Auto-follow:** By default, the view stays at the bottom and scrolls automatically as new messages arrive. Scrolling up manually disengages follow mode. Jump to end (`G`) or page down at the bottom (`Ctrl-d`) to resume following.
@@ -313,8 +323,10 @@ The sidebar shows your active and discovered opencode sessions. You can hide the
 | Hidden | `Ctrl-h` | Sidebar disappears entirely for maximum terminal space |
 
 - Toggle hidden with `Ctrl-h`
-- When the sidebar is hidden, `Ctrl-4` (focus toggle) will first unhide it before switching focus
+- When the sidebar is hidden, `Ctrl-\\` (focus toggle) will first unhide it before switching focus
 - The sidebar width is configurable via `sidebar_width` in config (default: 30)
+
+**Session Vitals:** The bottom of the sidebar (when visible) shows a `vitals` panel for the active session — cache hit % and warmth (how stale the prompt cache is), a per-turn context/cache sparkline (cyan/violet/indigo by weighted cache reuse, `│` marks compactions), tokens by agent, tokens by model, post-compaction context culprits, and wall-clock LLM vs. tool time with slowest tools. The `context` section includes a measured system-prompt/rules/tool-schema baseline; agent and model sections allocate only conversation content. These are estimated from visible prompt content. Sections are dropped whole, lowest priority first, when the session list fills the sidebar, with a blank row above the footer.
 
 ## Advanced workflows
 
@@ -329,6 +341,8 @@ The sidebar shows your active and discovered opencode sessions. You can hide the
 - **Move a session** — press `m` on a session to move it and its child sessions to another repo. The session must be idle; uncommitted files stay in the source directory.
 - **Spawn a session** — press `n` to pick a repo from discovered git repositories (see Configuration for search paths and depth), then spawn a new managed session in that directory.
 - **Run a playbook** — press `p` to automate prompts, shell checks, and workflow control against the selected session.
+- **Compare sessions or open a shell pane** — from the sidebar, press `|` or `-`, then choose an existing session or a shell. A single pane is shown flat like `[side | A]`; pane frames appear once split, and closing the last comparison returns to the flat layout. Existing sessions reuse their PTY (or attach to their existing session ID); no new OpenCode session is created. Each session remembers its pane layout while ocmux is running. While a pane is focused, `Ctrl-Alt-j/k` moves to the next/previous pane; clicking a pane also focuses it. Conversation, diff, and agents views occupy only the target pane. From the sidebar, `w` closes the targeted comparison; if the primary is targeted and there is only one comparison, `w` closes that pane. With several comparisons, target one first. Closing a shell prompts before terminating its process group.
+- **Scroll help** — `?` opens a scrollable help panel. Use `j/k`, `Ctrl-d/u`, PageUp/PageDown, or `g/G`; press `Esc`, `q`, or `?` to close.
 
 ## Playbooks
 
@@ -518,13 +532,13 @@ Keybindings, sidebar width, desktop notifications, and repo search depth are con
     "sessions": "s",
     "agents": "a",
     "playbook": "p",
-    "session_next": "ctrl-alt-j",
-    "session_prev": "ctrl-alt-k"
+    "pane_next": "ctrl-alt-j",
+    "pane_prev": "ctrl-alt-k"
   }
 }
 ```
 
-Keybinding values are single characters. `session_next` and `session_prev` are chord strings (`ctrl-alt-j`), not single characters. Default `sidebar_width` is `30`. Only the keys listed above are configurable; other bindings (`Enter`, `Tab`, `/`, `s`, `Ctrl-h`, `r`, `!`, `c`, `Ctrl-4`, arrows) are fixed.
+Character keybinding values are single characters. `pane_next` and `pane_prev` are chord strings, not single characters. Older `session_next` and `session_prev` config names are accepted as aliases; `pane_*` takes precedence when both are present. Default `sidebar_width` is `30`. Only the keys listed above are configurable; other bindings (`Enter`, `Tab`, `/`, `s`, `Ctrl-h`, `r`, `!`, `c`, `Ctrl-\\`, arrows) are fixed.
 
 `notifications` controls desktop alerts. Defaults to `true`.
 
@@ -534,10 +548,10 @@ Keybinding values are single characters. `session_next` and `session_prev` are c
 
 ## Notes
 
-- `Ctrl-4` is the actual focus toggle binding (hold `Ctrl` and press `4`)
+- `Ctrl-\\` toggles focus between the sidebar and remembered target pane. Terminals that report this key as `Ctrl-4` are handled internally.
 - `s` opens the session manager; `Ctrl-h` hides the sidebar entirely for maximum terminal space
 - `q` prompts for confirmation before quitting (`y` confirm, `n`/`Esc` cancel)
-- `Ctrl-Alt-j` / `Ctrl-Alt-k` cycle top-level sessions without changing focus; cycle order is current sidebar recency order; child rows are skipped
+- Sidebar `Enter` switches session workspaces. `Ctrl-Alt-j/k` switch panes only while a pane is focused; from the sidebar they are no-ops.
 - Child sessions are expandable and selectable in the sidebar, but `Enter` attach is not yet supported for child rows — use `v` to view their conversation instead
 - `c` and `!` operate on top-level sessions only
 - `r` refreshes the currently active session's PTY, not the selected sidebar row

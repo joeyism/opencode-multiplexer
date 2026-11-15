@@ -110,8 +110,8 @@ pub struct Keybindings {
     pub agents: char,
     pub playbook: char,
     pub move_session: char,
-    pub session_next: KeyChord,
-    pub session_prev: KeyChord,
+    pub pane_next: KeyChord,
+    pub pane_prev: KeyChord,
 }
 
 impl Default for Keybindings {
@@ -132,13 +132,13 @@ impl Default for Keybindings {
             agents: 'a',
             playbook: 'p',
             move_session: 'm',
-            session_next: KeyChord {
+            pane_next: KeyChord {
                 ctrl: true,
                 alt: true,
                 shift: false,
                 key: 'j',
             },
-            session_prev: KeyChord {
+            pane_prev: KeyChord {
                 ctrl: true,
                 alt: true,
                 shift: false,
@@ -176,6 +176,8 @@ struct PartialKeybindings {
     move_session: Option<String>,
     session_next: Option<String>,
     session_prev: Option<String>,
+    pane_next: Option<String>,
+    pane_prev: Option<String>,
 }
 
 pub fn load_config() -> anyhow::Result<AppConfig> {
@@ -213,10 +215,16 @@ pub fn load_config_from_path(path: &Path) -> anyhow::Result<AppConfig> {
         apply_keybinding(&mut config.keybindings.playbook, bindings.playbook);
         apply_keybinding(&mut config.keybindings.move_session, bindings.move_session);
         if let Some(raw) = bindings.session_next {
-            config.keybindings.session_next = KeyChord::parse(&raw)?;
+            config.keybindings.pane_next = KeyChord::parse(&raw)?;
         }
         if let Some(raw) = bindings.session_prev {
-            config.keybindings.session_prev = KeyChord::parse(&raw)?;
+            config.keybindings.pane_prev = KeyChord::parse(&raw)?;
+        }
+        if let Some(raw) = bindings.pane_next {
+            config.keybindings.pane_next = KeyChord::parse(&raw)?;
+        }
+        if let Some(raw) = bindings.pane_prev {
+            config.keybindings.pane_prev = KeyChord::parse(&raw)?;
         }
     }
     if let Some(notifications) = partial.notifications {
@@ -305,10 +313,70 @@ mod tests {
     }
 
     #[test]
-    fn default_session_cycle_chords_are_ctrl_alt_j_k() {
+    fn default_pane_cycle_chords_are_ctrl_alt_j_k() {
         let keys = Keybindings::default();
-        assert_eq!(keys.session_next, KeyChord::parse("ctrl-alt-j").unwrap());
-        assert_eq!(keys.session_prev, KeyChord::parse("ctrl-alt-k").unwrap());
+        assert_eq!(keys.pane_next, KeyChord::parse("ctrl-alt-j").unwrap());
+        assert_eq!(keys.pane_prev, KeyChord::parse("ctrl-alt-k").unwrap());
+    }
+
+    #[test]
+    fn config_parses_pane_cycle_chords() {
+        let dir = std::env::temp_dir().join(format!("ocmux-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"keybindings":{"pane_next":"ctrl-alt-n","pane_prev":"ctrl-alt-p"}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_from_path(&path).unwrap();
+
+        assert_eq!(
+            cfg.keybindings.pane_next,
+            KeyChord::parse("ctrl-alt-n").unwrap()
+        );
+        assert_eq!(
+            cfg.keybindings.pane_prev,
+            KeyChord::parse("ctrl-alt-p").unwrap()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_session_cycle_config_maps_to_pane_cycle() {
+        let dir = std::env::temp_dir().join(format!("ocmux-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"keybindings":{"session_next":"ctrl-alt-n","session_prev":"ctrl-alt-p"}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_from_path(&path).unwrap();
+
+        assert_eq!(cfg.keybindings.pane_next.key, 'n');
+        assert_eq!(cfg.keybindings.pane_prev.key, 'p');
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pane_cycle_config_overrides_legacy_aliases() {
+        let dir = std::env::temp_dir().join(format!("ocmux-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"keybindings":{"session_next":"ctrl-alt-n","session_prev":"ctrl-alt-p","pane_next":"ctrl-alt-x","pane_prev":"ctrl-alt-y"}}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_from_path(&path).unwrap();
+
+        assert_eq!(cfg.keybindings.pane_next.key, 'x');
+        assert_eq!(cfg.keybindings.pane_prev.key, 'y');
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -317,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_follow_selection_and_session_chords() {
+    fn config_parses_follow_selection_and_legacy_pane_chords() {
         let dir = std::env::temp_dir().join(format!("ocmux-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
@@ -331,8 +399,8 @@ mod tests {
         .unwrap();
         let cfg = load_config_from_path(&path).unwrap();
         assert!(cfg.follow_selection);
-        assert_eq!(cfg.keybindings.session_next.key, 'n');
-        assert_eq!(cfg.keybindings.session_prev.key, 'p');
+        assert_eq!(cfg.keybindings.pane_next.key, 'n');
+        assert_eq!(cfg.keybindings.pane_prev.key, 'p');
         std::fs::remove_dir_all(&dir).ok();
     }
 

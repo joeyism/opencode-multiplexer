@@ -10,11 +10,13 @@ use crate::ui::conversation::diagram::protocol::{
 };
 use crate::ui::conversation::diagram::scheduler::{DiagramScheduler, RenderFinished};
 use crate::ui::conversation::diagram::slot::{DiagramIndex, DiagramPhase, DiagramSlot};
+use crate::ui::conversation::diagram::viewport::{LightboxView, pan_cells, place, zoom_at};
 use crate::ui::conversation::document::{ConversationDocument, DocBlock, MessageRole};
 use crate::ui::conversation::selection::{
     Anchor, DocPos, ScrollDir, Selection, anchor_at, edge_scroll, extract_text, hit_test,
     resolve_anchor, scroll_rows,
 };
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::io::Write;
 
@@ -53,7 +55,10 @@ pub struct ConversationViewState {
     match_positions: Vec<(usize, usize, usize)>, // (line_idx, byte_start, byte_len)
     current_match: usize,
     /// Hash of the diagram shown in the lightbox overlay, if any.
-    lightbox: Option<String>,
+    lightbox: Option<LightboxView>,
+    lightbox_inner: Option<Rect>,
+    lightbox_pan: Option<(u16, u16)>,
+    press_cell: Option<(u16, u16)>,
     /// Active mouse selection, if any.
     drag: Option<DragState>,
 }
@@ -78,6 +83,9 @@ impl Default for ConversationViewState {
             match_positions: Vec::new(),
             current_match: 0,
             lightbox: None,
+            lightbox_inner: None,
+            lightbox_pan: None,
+            press_cell: None,
             drag: None,
         }
     }
@@ -126,6 +134,9 @@ impl ConversationViewState {
         }
         self.kitty = KittyImagePlacer::new();
         self.lightbox = None;
+        self.lightbox_inner = None;
+        self.lightbox_pan = None;
+        self.press_cell = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -158,7 +169,7 @@ impl ConversationViewState {
     pub fn replace_document(&mut self, doc: ConversationDocument, viewport_height: usize) {
         let was_at_tail = self.follow_tail;
         self.document = doc;
-        if let Some(hash) = self.lightbox.as_deref() {
+        if let Some(hash) = self.lightbox.as_ref().map(|v| v.hash.as_str()) {
             let still_ready = self.document.blocks.iter().any(|b| match b {
                 DocBlock::Diagram(s) if s.hash == hash => {
                     matches!(s.phase, DiagramPhase::Ready { .. })
@@ -167,6 +178,7 @@ impl ConversationViewState {
             });
             if !still_ready {
                 self.lightbox = None;
+                self.lightbox_pan = None;
             }
         }
         if was_at_tail {
@@ -299,6 +311,7 @@ impl ConversationViewState {
 
     /// Start a selection at `pos`, which also disables tail-following.
     pub fn begin_selection(&mut self, pos: DocPos, pointer: (u16, u16)) {
+        self.press_cell = Some(pointer);
         let Some(anchor) = anchor_at(&self.document, pos) else {
             self.drag = None;
             return;
@@ -347,9 +360,51 @@ impl ConversationViewState {
         Some(text)
     }
 
+    pub fn has_pending_press(&self) -> bool {
+        self.press_cell.is_some()
+    }
+
+    pub fn click_diagram(&mut self, cell: (u16, u16), content: Rect) -> bool {
+        let pressed = self.press_cell.take();
+        if pressed != Some(cell) {
+            return false;
+        }
+        let Some(row) = cell.1.checked_sub(content.y) else {
+            return false;
+        };
+        if row >= content.height {
+            return false;
+        }
+        let doc_row = self.scroll.saturating_add(row as usize);
+        let Some(info) = self.document.diagram_covering_row(doc_row) else {
+            return false;
+        };
+        if !matches!(&info.slot.phase, DiagramPhase::Ready { .. }) {
+            return false;
+        }
+        let DiagramPhase::Ready { col_width, .. } = &info.slot.phase else {
+            return false;
+        };
+        let Some(vis) = slot_visibility(
+            info.start_row,
+            info.slot.row_height,
+            self.scroll,
+            content,
+            *col_width,
+        ) else {
+            return false;
+        };
+        if !vis.screen_rect.contains((cell.0, cell.1).into()) {
+            return false;
+        }
+        self.lightbox = Some(LightboxView::new(info.slot.hash.clone()));
+        true
+    }
+
     /// Drop any selection without copying.
     pub fn cancel_selection(&mut self) {
         self.drag = None;
+        self.press_cell = None;
     }
 
     /// Scroll the viewport when a drag sits at an edge, and extend the
@@ -624,7 +679,7 @@ impl ConversationViewState {
         let hash = finished.hash;
         let phase = finished.result;
 
-        if self.lightbox.as_deref() == Some(hash.as_str())
+        if self.lightbox.as_ref().map(|v| v.hash.as_str()) == Some(hash.as_str())
             && !matches!(&phase, DiagramPhase::Ready { .. })
         {
             self.lightbox = None;
@@ -686,7 +741,126 @@ impl ConversationViewState {
     }
 
     pub fn lightbox_hash(&self) -> Option<&str> {
-        self.lightbox.as_deref()
+        self.lightbox.as_ref().map(|v| v.hash.as_str())
+    }
+
+    pub fn lightbox_zoom(&self) -> f32 {
+        self.lightbox.as_ref().map_or(1.0, |v| v.zoom)
+    }
+
+    fn lightbox_dimensions(&self) -> Option<(u32, u32)> {
+        let hash = &self.lightbox.as_ref()?.hash;
+        self.document.blocks.iter().find_map(|b| match b {
+            DocBlock::Diagram(s) if &s.hash == hash => match &s.phase {
+                DiagramPhase::Ready { png_w, png_h, .. } => Some((*png_w, *png_h)),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    pub fn lightbox_zoom_by(&mut self, factor: f32) {
+        if !self.protocol_enabled {
+            return;
+        }
+        let Some(inner) = self.lightbox_inner else {
+            return;
+        };
+        let Some((w, h)) = self.lightbox_dimensions() else {
+            return;
+        };
+        let Some(view) = self.lightbox.as_mut() else {
+            return;
+        };
+        zoom_at(
+            view,
+            w,
+            h,
+            inner,
+            factor,
+            (inner.x + inner.width / 2, inner.y + inner.height / 2),
+        );
+    }
+
+    pub fn lightbox_reset(&mut self) {
+        if !self.protocol_enabled {
+            return;
+        }
+        if let Some(view) = self.lightbox.as_mut() {
+            view.zoom = 1.0;
+            view.cx = 0.5;
+            view.cy = 0.5;
+        }
+    }
+
+    pub fn lightbox_pan_step(&mut self, dx: i16, dy: i16) {
+        if !self.protocol_enabled {
+            return;
+        }
+        let Some(inner) = self.lightbox_inner else {
+            return;
+        };
+        let Some((w, h)) = self.lightbox_dimensions() else {
+            return;
+        };
+        let Some(view) = self.lightbox.as_mut() else {
+            return;
+        };
+        pan_cells(
+            view,
+            w,
+            h,
+            inner,
+            dx.saturating_mul((inner.width / 8).max(1) as i16),
+            dy.saturating_mul((inner.height / 8).max(1) as i16),
+        );
+    }
+
+    pub fn handle_lightbox_mouse(&mut self, mouse: MouseEvent, inner: Rect) -> bool {
+        self.lightbox_inner = Some(inner);
+        if !self.protocol_enabled {
+            return true;
+        }
+        let Some((w, h)) = self.lightbox_dimensions() else {
+            return true;
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if inner.contains((mouse.column, mouse.row).into()) =>
+            {
+                let factor = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    1.25
+                } else {
+                    1.0 / 1.25
+                };
+                if let Some(view) = self.lightbox.as_mut() {
+                    zoom_at(view, w, h, inner, factor, (mouse.column, mouse.row));
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if inner.contains((mouse.column, mouse.row).into()) =>
+            {
+                self.lightbox_pan = Some((mouse.column, mouse.row))
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((x, y)) = self.lightbox_pan {
+                    if let Some(view) = self.lightbox.as_mut() {
+                        pan_cells(
+                            view,
+                            w,
+                            h,
+                            inner,
+                            mouse.column as i16 - x as i16,
+                            mouse.row as i16 - y as i16,
+                        );
+                    }
+                    self.lightbox_pan = Some((mouse.column, mouse.row));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.lightbox_pan = None,
+            _ => {}
+        }
+        true
     }
 
     pub fn open_lightbox(&mut self, viewport_height: usize) -> bool {
@@ -696,18 +870,20 @@ impl ConversationViewState {
         else {
             return false;
         };
-        self.lightbox = Some(info.slot.hash.clone());
+        self.lightbox = Some(LightboxView::new(info.slot.hash.clone()));
+        self.lightbox_pan = None;
         true
     }
 
     pub fn close_lightbox(&mut self) {
         self.lightbox = None;
+        self.lightbox_pan = None;
     }
 
     pub fn lightbox_halfblock_lines(&self, inner: Rect) -> Option<Vec<Line<'static>>> {
-        let hash = self.lightbox.as_deref()?;
+        let hash = &self.lightbox.as_ref()?.hash;
         let slot = self.document.blocks.iter().find_map(|b| match b {
-            DocBlock::Diagram(s) if s.hash == hash => Some(s),
+            DocBlock::Diagram(s) if s.hash == hash.as_str() => Some(s),
             _ => None,
         })?;
         let DiagramPhase::Ready {
@@ -839,9 +1015,10 @@ impl ConversationViewState {
         if !self.protocol_enabled {
             return Ok(());
         }
-        let Some(hash) = self.lightbox.as_deref() else {
+        let Some(view) = self.lightbox.as_ref() else {
             return Ok(());
         };
+        let hash = view.hash.as_str();
         let Some(slot) = self.document.blocks.iter().find_map(|b| match b {
             DocBlock::Diagram(s) if s.hash == hash => Some(s),
             _ => None,
@@ -855,28 +1032,16 @@ impl ConversationViewState {
             return Ok(());
         };
 
-        let layout = crate::ui::conversation::diagram::layout::compute_layout(
-            *png_w,
-            *png_h,
-            inner.width,
-            inner.height as usize,
-        );
-        let dest = Rect::new(
-            inner.x,
-            inner.y,
-            layout.col_width.min(inner.width as usize) as u16,
-            layout.row_height.min(inner.height as usize) as u16,
-        );
-
-        let (sx, sy, sw, sh) = (0, 0, *png_w, *png_h);
+        let placement = place(*png_w, *png_h, inner, view.zoom, view.cx, view.cy);
+        self.lightbox_inner = Some(inner);
         let paints = vec![DiagramPaint {
             hash,
             png: png.as_slice(),
-            rect: dest,
-            src_x: sx,
-            src_y: sy,
-            src_w: sw,
-            src_h: sh,
+            rect: placement.dest,
+            src_x: placement.src_x,
+            src_y: placement.src_y,
+            src_w: placement.src_w,
+            src_h: placement.src_h,
         }];
         self.kitty.paint_frame(out, &paints)
     }
@@ -967,6 +1132,94 @@ mod tests {
         conv.open_lightbox(20);
         conv.close();
         assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn clicking_ready_diagram_opens_lightbox() {
+        let mut conv = conv_with_ready_diagram();
+        let content = Rect::new(0, 0, 80, 20);
+        conv.begin_selection(DocPos { row: 1, col: 0 }, (5, 1));
+        assert!(conv.has_pending_press());
+        assert_eq!(conv.end_selection(), None);
+        assert!(conv.document.diagram_covering_row(1).is_some());
+        assert!(conv.click_diagram((5, 1), content));
+        assert_eq!(conv.lightbox_hash(), Some("d1"));
+    }
+
+    #[test]
+    fn click_requires_same_press_and_release_cell_and_inside_diagram_width() {
+        let mut conv = conv_with_ready_diagram();
+        let content = Rect::new(0, 0, 80, 20);
+        conv.begin_selection(DocPos { row: 1, col: 0 }, (5, 1));
+        conv.end_selection();
+        assert!(!conv.click_diagram((6, 1), content));
+        conv.begin_selection(DocPos { row: 1, col: 0 }, (60, 1));
+        conv.end_selection();
+        assert!(!conv.click_diagram((60, 1), content));
+        assert!(!conv.is_lightbox());
+    }
+
+    #[test]
+    fn zoom_pan_and_reset_update_lightbox_view() {
+        let mut conv = conv_with_ready_diagram();
+        conv.protocol_enabled = true;
+        conv.lightbox_inner = Some(Rect::new(0, 0, 80, 20));
+        conv.open_lightbox(20);
+        conv.lightbox_zoom_by(1.25);
+        assert!(conv.lightbox_zoom() > 1.0);
+        conv.lightbox_pan_step(1, 0);
+        conv.lightbox_reset();
+        assert_eq!(conv.lightbox_zoom(), 1.0);
+    }
+
+    #[test]
+    fn lightbox_mouse_wheel_zooms_and_drag_pans() {
+        use crossterm::event::{KeyModifiers, MouseEvent};
+        let mut conv = conv_with_ready_diagram();
+        conv.protocol_enabled = true;
+        conv.open_lightbox(20);
+        let inner = Rect::new(0, 0, 80, 20);
+        for _ in 0..4 {
+            conv.handle_lightbox_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 20,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+                inner,
+            );
+        }
+        assert!(conv.lightbox_zoom() > 1.0);
+        let before = conv.lightbox.as_ref().unwrap().cx;
+        conv.handle_lightbox_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 20,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            inner,
+        );
+        conv.handle_lightbox_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 25,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            inner,
+        );
+        assert!(conv.lightbox.as_ref().unwrap().cx < before);
+        conv.handle_lightbox_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 25,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            inner,
+        );
     }
 
     use crate::ui::conversation::document::TextRow;

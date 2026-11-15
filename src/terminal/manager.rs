@@ -421,6 +421,53 @@ impl PtyManager {
         self.ptys.get_mut(&id)?.as_mut()
     }
 
+    pub fn session_by_entry_id(&self, id: u64) -> Option<&PtySession> {
+        self.ptys.get(&id)?.as_ref()
+    }
+
+    pub fn session_by_entry_id_mut(&mut self, id: u64) -> Option<&mut PtySession> {
+        self.ptys.get_mut(&id)?.as_mut()
+    }
+
+    pub fn summary_by_entry_id(&self, id: u64) -> Option<&SessionSummary> {
+        self.sessions
+            .items()
+            .iter()
+            .find(|session| session.id == id)
+    }
+
+    pub fn ensure_attached_by_entry_id(
+        &mut self,
+        id: u64,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<()> {
+        if self.ptys.get(&id).is_some_and(Option::is_some) {
+            return Ok(());
+        }
+        let summary = self
+            .summary_by_entry_id(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("session entry not found"))?;
+        let session_id = summary
+            .session_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("session has not been created yet"))?;
+        let pty =
+            PtySession::spawn_replica(&summary.cwd, session_id, summary.serve_port, rows, cols)?;
+        let process_pid = pty.process_id();
+        let slot = self
+            .ptys
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("session terminal slot not found"))?;
+        *slot = Some(pty);
+        if let Some(summary) = self.sessions.get_mut(id) {
+            summary.origin = SessionOrigin::Managed;
+            summary.process_pid = process_pid;
+        }
+        Ok(())
+    }
+
     pub fn active_session(&self) -> Option<&PtySession> {
         let id = self.sessions.active_id()?;
         self.ptys.get(&id)?.as_ref()

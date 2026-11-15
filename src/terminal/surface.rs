@@ -142,6 +142,8 @@ impl TerminalSurface {
 fn cell_symbol(ch: char, flags: Flags) -> (String, bool) {
     if flags.contains(Flags::WIDE_CHAR_SPACER) || flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
         (" ".into(), false)
+    } else if ch.is_control() {
+        (" ".into(), true)
     } else {
         (ch.to_string(), true)
     }
@@ -207,5 +209,30 @@ mod tests {
         // row 3: p     (no wrap)
         surface.process(b"abcdefghijklmnop");
         assert_eq!(surface.wrapped_rows(), vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn tab_cell_renders_as_space_and_preserves_tab_stop() {
+        let mut surface = TerminalSurface::new(1, 20);
+        surface.process(b"\tX");
+
+        let snapshot = surface.snapshot();
+        assert_eq!(snapshot[0][0].symbol, " ");
+        assert_eq!(snapshot[0][8].symbol, "X");
+    }
+
+    #[test]
+    fn no_snapshot_symbol_contains_control_characters() {
+        let mut surface = TerminalSurface::new(4, 40);
+        surface.process(b"a\tb\tc\r\n\tmodified:   src/x.py\r\n");
+
+        let snapshot = surface.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .flatten()
+                .all(|cell| !cell.symbol.chars().any(char::is_control))
+        );
+        assert_eq!(snapshot[1][8].symbol, "m");
     }
 }

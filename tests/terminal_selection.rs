@@ -28,6 +28,22 @@ fn selection_extracts_multiline_text_from_surface() {
 }
 
 #[test]
+fn copied_tab_indented_line_uses_spaces() {
+    let mut surface = TerminalSurface::new(2, 40);
+    surface.process(b"\tmodified:   src/x.py");
+    let snapshot = surface.snapshot();
+    let range = SelectionRange::new(
+        SelectionPoint { row: 0, col: 0 },
+        SelectionPoint { row: 0, col: 27 },
+    );
+
+    assert_eq!(
+        extract_selection_text(&snapshot, range, &surface.wrapped_rows()),
+        "        modified:   src/x.py"
+    );
+}
+
+#[test]
 fn reverse_drag_extracts_same_text() {
     let mut surface = TerminalSurface::new(2, 10);
     surface.process(b"hello\r\nworld");

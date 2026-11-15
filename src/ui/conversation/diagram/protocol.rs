@@ -141,6 +141,8 @@ struct PlacementKey {
     h: u16,
     src_y: u32,
     src_h: u32,
+    src_x: u32,
+    src_w: u32,
 }
 
 impl PlacementKey {
@@ -153,6 +155,8 @@ impl PlacementKey {
             h: p.rect.height,
             src_y: p.src_y,
             src_h: p.src_h,
+            src_x: p.src_x,
+            src_w: p.src_w,
         }
     }
 }

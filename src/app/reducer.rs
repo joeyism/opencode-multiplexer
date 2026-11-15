@@ -1,4 +1,4 @@
-use crate::app::{Action, focus::AppFocus, state::AppState};
+use crate::app::{Action, focus::AppFocus, help::HelpState, state::AppState};
 
 pub fn reduce(state: &mut AppState, action: Action) {
     match action {
@@ -26,7 +26,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.focus = target;
         }
         Action::ToggleHelp => {
-            state.show_help = !state.show_help;
+            state.help = if state.help.is_some() {
+                None
+            } else {
+                Some(HelpState::default())
+            };
         }
         Action::SelectNextRow => {
             state.selected_sidebar_row = state.selected_sidebar_row.saturating_add(1);

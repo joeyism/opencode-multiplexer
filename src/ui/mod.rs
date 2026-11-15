@@ -9,3 +9,4 @@ pub mod root;
 pub mod session_manager;
 pub mod session_picker;
 pub mod sidebar;
+pub mod vitals;
