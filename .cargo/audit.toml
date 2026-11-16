@@ -1,0 +1,4 @@
+[advisories]
+# rusqlite 0.32 pins libsqlite3-sys 0.30. Bumping rusqlite far enough to
+# pick up the patched sqlite (0.41+) drops u64 FromSql and is a separate change.
+ignore = ["RUSTSEC-2026-0459"]

@@ -86,7 +86,8 @@ impl PtySession {
         });
 
         #[cfg(unix)]
-        let process_group_id = pair.master.process_group_leader();
+        let process_group_id = process_group_id_for_child(child.as_ref())
+            .or_else(|| pair.master.process_group_leader());
         #[cfg(not(unix))]
         let process_group_id = None;
 
@@ -205,6 +206,13 @@ impl PtySession {
 }
 
 #[cfg(unix)]
+fn process_group_id_for_child(child: &dyn portable_pty::Child) -> Option<i32> {
+    let pid = child.process_id()? as i32;
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid >= 0 { Some(pgid) } else { None }
+}
+
+#[cfg(unix)]
 fn signal_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
     let result = unsafe { libc::kill(-process_group, signal) };
     if result == 0 {
@@ -271,24 +279,46 @@ mod tests {
         );
     }
 
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return condition();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn killing_a_process_group_after_its_shell_exits_cleans_background_jobs() {
         let mut command = CommandBuilder::new("/bin/sh");
         command.args(["-c", "trap '' HUP; sleep 30 & exit 0"]);
         let mut pty = PtySession::spawn_test_command(command, 12, 40).unwrap();
-        let process_group = pty.process_group_id().unwrap();
-        for _ in 0..100 {
-            if !pty.is_alive() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!pty.is_alive(), "shell should have exited naturally");
-        assert!(unsafe { libc::kill(-process_group, 0) } == 0);
+        let process_group = pty
+            .process_group_id()
+            .expect("spawn should capture the process group before the shell exits");
+        assert!(
+            wait_until(Duration::from_secs(2), || !pty.is_alive()),
+            "shell should have exited naturally"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || unsafe {
+                libc::kill(-process_group, 0) == 0
+            }),
+            "background job should keep the process group alive"
+        );
 
         pty.kill_process_group().unwrap();
 
-        assert_eq!(unsafe { libc::kill(-process_group, 0) }, -1);
+        assert!(
+            wait_until(Duration::from_secs(2), || unsafe {
+                libc::kill(-process_group, 0) == -1
+            }),
+            "process group should be gone after kill"
+        );
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)

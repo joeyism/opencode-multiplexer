@@ -752,10 +752,6 @@ steps:
         let shell: Arc<dyn Shell + Send + Sync> = Arc::new(PanicShell);
         let handle = spawn_playbook(pb, ctx(HashMap::new()), http, shell);
         let mut events = Vec::new();
-        for ev in handle.rx.try_iter() {
-            events.push(ev);
-        }
-        // Wait for terminal event
         loop {
             match handle.rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(PlaybookEvent::Done) => {
@@ -763,7 +759,12 @@ steps:
                     break;
                 }
                 Ok(ev) => events.push(ev),
-                Err(_) => panic!("timeout waiting for Done"),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("timeout waiting for Done; got {events:?}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("channel disconnected before Done; got {events:?}")
+                }
             }
         }
         assert!(matches!(events.last(), Some(PlaybookEvent::Done)));
