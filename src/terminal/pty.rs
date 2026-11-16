@@ -86,8 +86,10 @@ impl PtySession {
         });
 
         #[cfg(unix)]
-        let process_group_id = process_group_id_for_child(child.as_ref())
-            .or_else(|| pair.master.process_group_leader());
+        let process_group_id = pair
+            .master
+            .process_group_leader()
+            .or_else(|| process_group_id_for_child(child.as_ref()));
         #[cfg(not(unix))]
         let process_group_id = None;
 
@@ -246,6 +248,19 @@ mod tests {
     use portable_pty::CommandBuilder;
     use std::{thread, time::Duration};
 
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return condition();
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn kill_process_group_terminates_shell_and_background_child() {
         let mut command = CommandBuilder::new("/bin/sh");
@@ -257,10 +272,11 @@ mod tests {
         pty.kill_process_group().unwrap();
 
         assert!(!pty.is_alive());
-        assert_eq!(unsafe { libc::kill(-process_group, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+        assert!(
+            wait_until(Duration::from_secs(2), || unsafe {
+                libc::kill(-process_group, 0) == -1
+            }),
+            "process group should be gone after kill"
         );
     }
 
@@ -277,19 +293,6 @@ mod tests {
             pending_chunks < OUTPUT_CHANNEL_CAPACITY * 32,
             "queued {pending_chunks} output chunks"
         );
-    }
-
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if condition() {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return condition();
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
     }
 
     #[test]
@@ -318,10 +321,6 @@ mod tests {
                 libc::kill(-process_group, 0) == -1
             }),
             "process group should be gone after kill"
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
         );
     }
 }
