@@ -195,12 +195,16 @@ fn toggle_panel_hidden_action_flips_panel_state_and_focus() {
 #[test]
 fn toggle_help_action_flips_help_overlay_state() {
     let mut state = AppState::default();
+    assert!(state.help.is_none());
 
     reduce(&mut state, Action::ToggleHelp);
-    assert!(state.show_help);
+    assert!(state.help.is_some());
 
     reduce(&mut state, Action::ToggleHelp);
-    assert!(!state.show_help);
+    assert!(state.help.is_none());
+
+    reduce(&mut state, Action::ToggleHelp);
+    assert_eq!(state.help.unwrap().scroll_offset(), 0);
 }
 
 #[test]
@@ -244,6 +248,35 @@ fn widget_renders_surface_content_into_buffer() {
 }
 
 #[test]
+fn tabbed_output_renders_control_free_and_clear_redraw_removes_text() {
+    let mut surface = TerminalSurface::new(4, 40);
+    surface.process(b"\tmodified:   src/a/very/long/name.py\r\n");
+    let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+
+    terminal
+        .draw(|frame| {
+            frame.render_widget(TerminalWidget::new(&surface), Rect::new(0, 0, 40, 4));
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(8, 0)].symbol(), "m");
+    assert!(
+        (0..4).all(|y| (0..40).all(|x| { !buffer[(x, y)].symbol().chars().any(char::is_control) }))
+    );
+
+    surface.process(b"\x1b[H\x1b[2J");
+    terminal
+        .draw(|frame| {
+            frame.render_widget(TerminalWidget::new(&surface), Rect::new(0, 0, 40, 4));
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!((0..4).all(|y| (0..40).all(|x| buffer[(x, y)].symbol() == " ")));
+}
+
+#[test]
 fn key_events_translate_into_pty_bytes() {
     assert_eq!(
         key_event_to_bytes(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)).as_deref(),
@@ -260,6 +293,28 @@ fn key_events_translate_into_pty_bytes() {
     assert_eq!(
         key_event_to_bytes(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).as_deref(),
         Some(&b"\x1b[D"[..])
+    );
+}
+
+#[test]
+fn pane_cycle_chords_are_not_forwarded_to_pty() {
+    let next = KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    let prev = KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    assert_eq!(key_event_to_bytes(next), None);
+    assert_eq!(key_event_to_bytes(prev), None);
+}
+
+#[test]
+fn plain_j_is_still_forwarded_to_pty() {
+    assert_eq!(
+        key_event_to_bytes(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)).as_deref(),
+        Some(&b"j"[..])
     );
 }
 

@@ -165,6 +165,248 @@ pub fn render_sidebar(
     )
 }
 
+/// Render the sidebar column: sessions at top, vitals bottom-docked inside
+#[allow(clippy::too_many_arguments)]
+/// the same bordered block so the right border stays unbroken.
+pub fn render_sidebar_column(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    rows: &[SidebarVisibleRow],
+    selected: usize,
+    focus: AppFocus,
+    sidebar_width: u16,
+    app_focused: bool,
+    vitals: Option<&crate::data::vitals::SessionVitals>,
+    vitals_mode: crate::ui::vitals::VitalsMode,
+) {
+    let (title_style, border_style) = if !app_focused {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else if matches!(focus, AppFocus::Sidebar) {
+        (
+            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Cyan),
+        )
+    } else {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    let block = Block::default()
+        .borders(Borders::RIGHT | Borders::TOP)
+        .border_style(border_style)
+        .title(Span::styled("sessions", title_style));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let session_h = (rows.len() as u16).min(inner.height);
+    let lines = rows
+        .iter()
+        .enumerate()
+        .take(session_h as usize)
+        .map(|(index, row)| render_row(row, index == selected, sidebar_width.saturating_sub(1)))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines),
+        ratatui::layout::Rect::new(inner.x, inner.y, inner.width, session_h),
+    );
+    // Reserve a row between the list and vitals, plus a blank row at the
+    // bottom so the panel doesn't visually collide with the footer commands.
+    let avail = inner.height.saturating_sub(session_h.saturating_add(2));
+    if avail < 2 {
+        return;
+    }
+    if let Some(v) = vitals {
+        let vlines = crate::ui::vitals::compose_vitals(v, vitals_mode, inner.width, avail);
+        let h = vlines.len() as u16;
+        if h > 0 {
+            frame.render_widget(
+                Paragraph::new(vlines),
+                ratatui::layout::Rect::new(
+                    inner.x,
+                    inner.y + inner.height.saturating_sub(h).saturating_sub(1),
+                    inner.width,
+                    h,
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sidebar_column_tests {
+    use super::*;
+    use crate::app::sessions::{SessionOrigin, SessionStatus};
+    use crate::data::vitals::{MetricBar, SparkPoint};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn row(idx: usize) -> SidebarVisibleRow {
+        SidebarVisibleRow {
+            kind: SidebarRowKind::TopLevel {
+                top_level_id: idx as u64,
+                session_id: Some(format!("s{idx}")),
+            },
+            cwd: std::path::PathBuf::from("/proj"),
+            title: format!("title-{idx}"),
+            status: SessionStatus::Idle,
+            depth: 0,
+            has_children: false,
+            expanded: false,
+            active: idx == 0,
+            origin: SessionOrigin::Managed,
+            session_id: Some(format!("s{idx}")),
+            time_updated: Some(1_700_000_000),
+        }
+    }
+
+    fn vitals() -> crate::data::vitals::SessionVitals {
+        crate::data::vitals::SessionVitals {
+            session_id: "s0".to_string(),
+            cache_hit_pct: Some(98),
+            warmth: crate::data::vitals::CacheWarmth::Warm(65),
+            uncached_input_tokens: 100,
+            latest_context_tokens: 1_000,
+            turn_count: 1,
+            sparkline: vec![SparkPoint {
+                total_context_tokens: 1_000,
+                cache_read_tokens: 900,
+                prompt_tokens: 1_000,
+                cache_hit_ratio: 0.9,
+                compacted_before: false,
+            }],
+            tokens_by_agent: vec![MetricBar {
+                label: "build".into(),
+                value: 1_000,
+                count: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn text(buf: &ratatui::buffer::Buffer, y: u16, x0: u16, x1: u16) -> String {
+        (x0..x1).map(|x| buf[(x, y)].symbol().to_string()).collect()
+    }
+
+    #[test]
+    fn column_docks_vitals_at_bottom_and_keeps_unbroken_right_border() {
+        let backend = TestBackend::new(30, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let rows: Vec<_> = (0..3).map(row).collect();
+        let v = vitals();
+        terminal
+            .draw(|f| {
+                render_sidebar_column(
+                    f,
+                    Rect::new(0, 0, 30, 32),
+                    &rows,
+                    0,
+                    AppFocus::Sidebar,
+                    30,
+                    true,
+                    Some(&v),
+                    crate::ui::vitals::VitalsMode::StackedAll,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Top border + title on row 0.
+        let top: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert!(top.contains("sessions"), "top border: {top:?}");
+        // Session rows visible at rows 1..=3.
+        assert!(text(&buf, 1, 0, 29).contains("title-0"));
+        assert!(text(&buf, 3, 0, 29).contains("title-2"));
+        // Unbroken right border on every row (corner ┐ across the top).
+        assert_eq!(buf[(29, 0)].symbol(), "┐");
+        for y in 1..32 {
+            assert_eq!(buf[(29, y)].symbol(), "│", "right border broken at row {y}");
+        }
+        // Vitals divider near the bottom, with gap between sessions and vitals.
+        let divider_row = (0..32)
+            .find(|&y| text(&buf, y, 0, 29).contains("vitals"))
+            .expect("vitals divider present");
+        assert!(
+            divider_row >= 5,
+            "vitals must dock below the sessions, got row {divider_row}"
+        );
+        assert!(divider_row + 1 < 32, "cache line must follow divider");
+        assert!(text(&buf, divider_row + 1, 0, 29).contains("cache"));
+        assert!(
+            text(&buf, 31, 0, 29).trim().is_empty(),
+            "leave one blank row before footer"
+        );
+    }
+
+    #[test]
+    fn column_hides_vitals_when_sessions_fill_height() {
+        let backend = TestBackend::new(30, 31);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let rows: Vec<_> = (0..30).map(row).collect();
+        let v = vitals();
+        terminal
+            .draw(|f| {
+                render_sidebar_column(
+                    f,
+                    Rect::new(0, 0, 30, 31),
+                    &rows,
+                    0,
+                    AppFocus::Sidebar,
+                    30,
+                    true,
+                    Some(&v),
+                    crate::ui::vitals::VitalsMode::StackedAll,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        assert!(
+            text(&buf, 30, 0, 29).contains("title-29"),
+            "last session row visible at bottom"
+        );
+        for y in 0..31 {
+            assert!(
+                !text(&buf, y, 0, 29).contains("vitals"),
+                "vitals must hide at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn vitals_leave_one_blank_row_above_footer() {
+        let backend = TestBackend::new(30, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let rows: Vec<_> = (0..3).map(row).collect();
+        let v = vitals();
+        terminal
+            .draw(|f| {
+                render_sidebar_column(
+                    f,
+                    Rect::new(0, 0, 30, 32),
+                    &rows,
+                    0,
+                    AppFocus::Sidebar,
+                    30,
+                    true,
+                    Some(&v),
+                    crate::ui::vitals::VitalsMode::StackedAll,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let last_inner_row: String = (0..29).map(|x| buf[(x, 31)].symbol().to_string()).collect();
+        assert!(
+            last_inner_row.trim().is_empty(),
+            "expected one blank row before footer, got {last_inner_row:?}"
+        );
+    }
+}
+
 pub fn sidebar_row_style(is_selected: bool, is_active: bool) -> Style {
     let _ = is_active;
     if is_selected {

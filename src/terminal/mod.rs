@@ -5,4 +5,5 @@ pub mod manager;
 pub mod pty;
 pub mod renderer;
 pub mod selection;
+pub mod shells;
 pub mod surface;

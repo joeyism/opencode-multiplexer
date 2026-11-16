@@ -1,6 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use portable_pty::CommandBuilder;
+
+use crate::registry::{ServeEntry, is_pid_alive, load_serve_registry, register_serve_process};
 
 pub fn build_managed_session_command(cwd: &Path, port: u16) -> CommandBuilder {
     let mut command = CommandBuilder::new("opencode");
@@ -35,6 +37,19 @@ pub fn display_title_for_cwd(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.display().to_string())
 }
 
+pub fn select_exact_serve_for_cwd(
+    session_cwd: &Path,
+    entries: &[ServeEntry],
+) -> Option<(u16, u32)> {
+    let canonical_cwd =
+        std::fs::canonicalize(session_cwd).unwrap_or_else(|_| PathBuf::from(session_cwd));
+    entries.iter().find_map(|entry| {
+        let entry_cwd = PathBuf::from(&entry.cwd);
+        let canonical_entry = std::fs::canonicalize(&entry_cwd).unwrap_or(entry_cwd);
+        (canonical_entry == canonical_cwd).then_some((entry.port, entry.pid))
+    })
+}
+
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
@@ -56,6 +71,23 @@ pub fn spawn_serve_daemon(cwd: &Path, port: u16) -> anyhow::Result<u32> {
         .stderr(Stdio::null())
         .spawn()?;
     Ok(child.id())
+}
+
+pub fn ensure_serve_for_cwd(cwd: &Path) -> anyhow::Result<(u16, u32)> {
+    if let Some((port, pid)) =
+        select_exact_serve_for_cwd(cwd, &load_serve_registry().unwrap_or_default())
+        && is_pid_alive(pid)
+    {
+        return Ok((port, pid));
+    }
+
+    let port = find_available_port(4200);
+    let pid = spawn_serve_daemon(cwd, port)?;
+    register_serve_process(port, pid, cwd)?;
+    if !wait_for_serve_ready(port, 10) {
+        anyhow::bail!("opencode serve did not start within 10s on port {port}");
+    }
+    Ok((port, pid))
 }
 
 pub fn wait_for_serve_ready(port: u16, timeout_secs: u64) -> bool {

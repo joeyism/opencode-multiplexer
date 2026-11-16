@@ -5,7 +5,7 @@ pub mod writer;
 use anyhow::Context;
 use std::path::PathBuf;
 
-pub(crate) fn default_db_path() -> anyhow::Result<PathBuf> {
+pub fn default_db_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".local/share/opencode/opencode.db"))
 }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod data;
 pub mod notify;
 pub mod ops;
+pub mod playbook;
 pub mod registry;
 pub mod terminal;
 pub mod ui;

@@ -41,6 +41,7 @@ wait-timeout = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
+serde_yaml = "0.9"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 notify-rust = { version = "4.16", default-features = false, features = ["z"] }

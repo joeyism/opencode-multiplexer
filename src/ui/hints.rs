@@ -5,11 +5,61 @@ use ratatui::{
 
 use crate::{app::focus::AppFocus, config::Keybindings};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LightboxHints {
+    None,
+    Fixed,
+    Zoomable,
+}
+
+/// Combine a left-aligned hints line with a right-aligned status readout,
+/// truncating hints (with an ellipsis) when the combined width exceeds `width`.
+/// If status alone is wider than `width`, the status is truncated instead.
+pub fn compose_footer(
+    hints: Line<'static>,
+    status: Option<Line<'static>>,
+    width: u16,
+) -> Line<'static> {
+    let width = width as usize;
+    let hints_w = hints.width();
+    match status {
+        None => hints,
+        Some(status) => {
+            let status_w = status.width();
+            if hints_w + status_w <= width {
+                let mut spans = hints.spans;
+                spans.push(Span::raw(" ".repeat(width - hints_w - status_w)));
+                spans.extend(status.spans);
+                Line::from(spans)
+            } else {
+                // Hints don't fit with status; truncate hints with an ellipsis.
+                let room = width.saturating_sub(status_w);
+                let t: String = hints.spans.iter().map(|s| s.content.as_ref()).collect();
+                if room == 0 {
+                    // No room for hints at all — status truncated to fit.
+                    let mut st: String = status.spans.iter().map(|s| s.content.as_ref()).collect();
+                    st = st.chars().take(width.saturating_sub(1)).collect();
+                    Line::from(vec![Span::raw(format!("{st}…"))])
+                } else {
+                    let ellipsis = 1usize;
+                    let keep = room.saturating_sub(ellipsis);
+                    let truncated: String = t.chars().take(keep).collect();
+                    let mut spans = vec![Span::raw(format!("{truncated}…"))];
+                    spans.push(Span::raw(" ".repeat(room - keep - ellipsis)));
+                    spans.extend(status.spans);
+                    Line::from(spans)
+                }
+            }
+        }
+    }
+}
+
 pub fn footer_line(
     focus: AppFocus,
     message: Option<&str>,
     keys: &Keybindings,
     diff_visual_mode: bool,
+    conversation_lightbox: LightboxHints,
 ) -> Line<'static> {
     if let Some(message) = message {
         return Line::from(vec![Span::styled(
@@ -19,6 +69,9 @@ pub fn footer_line(
     }
 
     match focus {
+        AppFocus::Conversation if conversation_lightbox != LightboxHints::None => {
+            conversation_lightbox_hints(conversation_lightbox)
+        }
         AppFocus::Conversation => conversation_hints(keys),
         AppFocus::Diff => diff_hints(keys, diff_visual_mode),
         AppFocus::Agents => agents_hints(),
@@ -54,10 +107,14 @@ fn conversation_hints(keys: &Keybindings) -> Line<'static> {
         Span::raw(" search  "),
         Span::styled("n/N", Style::default().fg(Color::Cyan)),
         Span::raw(" next/prev  "),
+        Span::styled("drag", Style::default().fg(Color::Cyan)),
+        Span::raw(" copy  "),
+        Span::styled("J/K", Style::default().fg(Color::Cyan)),
+        Span::raw(" jump  "),
+        Span::styled("z/click", Style::default().fg(Color::Cyan)),
+        Span::raw(" enlarge  "),
         Span::styled(keys.view.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" back  "),
-        Span::styled("\u{21e7}+click", Style::default().fg(Color::Cyan)),
-        Span::raw(" select  "),
         Span::styled(keys.help.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" help  "),
         Span::styled(
@@ -65,6 +122,28 @@ fn conversation_hints(keys: &Keybindings) -> Line<'static> {
             Style::default().fg(Color::Yellow),
         ),
     ])
+}
+
+fn conversation_lightbox_hints(mode: LightboxHints) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("z/Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" close  "),
+    ];
+    if mode == LightboxHints::Zoomable {
+        spans.extend([
+            Span::styled("wheel +/-", Style::default().fg(Color::Cyan)),
+            Span::raw(" zoom  "),
+            Span::styled("drag/hjkl", Style::default().fg(Color::Cyan)),
+            Span::raw(" pan  "),
+            Span::styled("0", Style::default().fg(Color::Cyan)),
+            Span::raw(" reset  "),
+        ]);
+    }
+    spans.push(Span::styled(
+        "[mermaid]".to_string(),
+        Style::default().fg(Color::Yellow),
+    ));
+    Line::from(spans)
 }
 
 fn diff_hints(keys: &Keybindings, visual_mode: bool) -> Line<'static> {
@@ -115,9 +194,27 @@ fn main_hints(focus: AppFocus, keys: &Keybindings) -> Line<'static> {
         AppFocus::Agents => "agents",
     };
 
-    Line::from(vec![
-        Span::styled("Ctrl-\\", Style::default().fg(Color::Cyan)),
-        Span::raw(" focus  "),
+    let mut spans = Vec::new();
+    match focus {
+        AppFocus::Sidebar => {
+            spans.push(Span::styled("Ctrl-\\", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" target pane  "));
+        }
+        AppFocus::Terminal => {
+            spans.push(Span::styled("Ctrl-\\", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" sidebar  "));
+            spans.push(Span::styled(
+                "Ctrl-Alt-j/k",
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::raw(" panes  "));
+        }
+        AppFocus::Conversation | AppFocus::Diff | AppFocus::Agents => {
+            spans.push(Span::styled("Ctrl-\\", Style::default().fg(Color::Cyan)));
+            spans.push(Span::raw(" focus  "));
+        }
+    }
+    spans.extend([
         Span::styled(keys.quit.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" quit  "),
         Span::styled(keys.spawn.to_string(), Style::default().fg(Color::Cyan)),
@@ -138,6 +235,8 @@ fn main_hints(focus: AppFocus, keys: &Keybindings) -> Line<'static> {
         Span::raw(" attach  "),
         Span::styled(keys.sessions.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" manage  "),
+        Span::styled(keys.playbook.to_string(), Style::default().fg(Color::Cyan)),
+        Span::raw(" playbook  "),
         Span::styled(keys.history.to_string(), Style::default().fg(Color::Cyan)),
         Span::raw(" history  "),
         Span::styled(keys.kill.to_string(), Style::default().fg(Color::Cyan)),
@@ -155,5 +254,75 @@ fn main_hints(focus: AppFocus, keys: &Keybindings) -> Line<'static> {
             format!("[{focus_label}]"),
             Style::default().fg(Color::Yellow),
         ),
-    ])
+    ]);
+    Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_hints_name_target_pane_focus() {
+        let line = footer_line(
+            AppFocus::Sidebar,
+            None,
+            &Keybindings::default(),
+            false,
+            LightboxHints::None,
+        );
+        let text: String = line.spans.iter().map(|span| span.content.clone()).collect();
+        assert!(text.contains("Ctrl-\\"));
+        assert!(text.contains("pane"));
+    }
+
+    #[test]
+    fn terminal_hints_advertise_pane_cycle_chords() {
+        let line = footer_line(
+            AppFocus::Terminal,
+            None,
+            &Keybindings::default(),
+            false,
+            LightboxHints::None,
+        );
+        let text: String = line.spans.iter().map(|span| span.content.clone()).collect();
+        assert!(text.contains("Ctrl-Alt-j/k"));
+        assert!(text.contains("panes"));
+        assert!(!text.contains("cycle session"));
+    }
+
+    #[test]
+    fn conversation_lightbox_hints_show_close() {
+        let line = footer_line(
+            AppFocus::Conversation,
+            None,
+            &Keybindings::default(),
+            false,
+            LightboxHints::Zoomable,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("Esc"));
+        assert!(text.contains("[mermaid]"));
+    }
+
+    #[test]
+    fn fixed_lightbox_hints_omit_zoom_controls() {
+        let line = conversation_lightbox_hints(LightboxHints::Fixed);
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("Esc"));
+        assert!(!text.contains("wheel"));
+    }
+
+    #[test]
+    fn conversation_hints_show_zoom_without_lightbox() {
+        let line = footer_line(
+            AppFocus::Conversation,
+            None,
+            &Keybindings::default(),
+            false,
+            LightboxHints::None,
+        );
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains("enlarge"));
+    }
 }

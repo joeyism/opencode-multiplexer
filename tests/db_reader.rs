@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -140,6 +140,56 @@ fn reads_child_sessions() {
     assert_eq!(children[0].id, "child");
     assert!(reader.has_child_sessions("parent").unwrap());
 
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn reads_unarchived_session_tree_in_parent_first_order() {
+    let db_path = temp_db_path("tree_ids");
+    let conn = init_db(&db_path);
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES
+         ('main', 'proj_1', NULL, 'main', '/tmp/repo', '{}', 1, 10, NULL),
+         ('sub', 'proj_1', 'main', 'sub', '/tmp/repo', '{}', 2, 20, NULL),
+         ('archived', 'proj_1', 'main', 'archived', '/tmp/repo', '{}', 3, 30, 40);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let reader = DbReader::open(&db_path).unwrap();
+    let ids = reader.get_session_tree_ids("main").unwrap();
+    assert_eq!(ids, vec!["main", "sub"]);
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
+fn resolves_registered_worktree_directory_to_its_project() {
+    let db_path = temp_db_path("project_directory");
+    let conn = init_db(&db_path);
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project_directory (project_id TEXT, directory TEXT, type TEXT);\
+         INSERT INTO project_directory VALUES ('proj_1', '/tmp/repo-wt', 'git_worktree');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let reader = DbReader::open(&db_path).unwrap();
+    let project = reader
+        .get_project_for_directory(Path::new("/tmp/repo-wt"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.id, "proj_1");
+    assert_eq!(project.worktree, PathBuf::from("/tmp/repo-wt"));
     fs::remove_file(db_path).ok();
 }
 
