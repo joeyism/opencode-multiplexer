@@ -2,38 +2,28 @@
 
 A terminal multiplexer for managing [OpenCode](https://opencode.ai) sessions.
 
-<p align="center" width="100%">
-<video src="https://github.com/user-attachments/assets/93669f30-bb6c-4a71-935d-29541ee073ad" width="80%" controls></video>
-</p>
+https://github.com/user-attachments/assets/93669f30-bb6c-4a71-935d-29541ee073ad
 
 ## Feature Showcase
 
 <details>
 <summary><b>Diff View</b></summary>
-<p align="center" width="100%">
-<video src="https://github.com/user-attachments/assets/70cc5f29-118c-4d96-b611-a7192d246205" width="80%" controls></video>
-</p>
+https://github.com/user-attachments/assets/70cc5f29-118c-4d96-b611-a7192d246205
 </details>
 
 <details>
 <summary><b>Visual Mode</b></summary>
-<p align="center" width="100%">
-<video src="https://github.com/user-attachments/assets/ac156ecc-e8b8-47ee-8bd0-7a0815b5b836" width="80%" controls></video>
-</p>
+https://github.com/user-attachments/assets/ac156ecc-e8b8-47ee-8bd0-7a0815b5b836
 </details>
 
 <details>
 <summary><b>Sidebar Layouts</b></summary>
-<p align="center" width="100%">
-<video src="https://github.com/user-attachments/assets/2b2b4c2e-0739-4009-99bb-62e9de0d67f7" width="80%" controls></video>
-</p>
+https://github.com/user-attachments/assets/2b2b4c2e-0739-4009-99bb-62e9de0d67f7
 </details>
 
 <details>
 <summary><b>Mermaid Diagrams</b></summary>
-<p align="center" width="100%">
-<video src="https://github.com/user-attachments/assets/927fb400-567d-4e36-a17f-64fddd23f286" width="80%" controls></video>
-</p>
+https://github.com/user-attachments/assets/927fb400-567d-4e36-a17f-64fddd23f286
 </details>
 
 ## Table of Contents
