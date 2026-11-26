@@ -292,22 +292,81 @@ fn resample_sparkline(
     if points.is_empty() || max_cols == 0 {
         return Vec::new();
     }
-    if points.len() <= max_cols {
-        return points.to_vec();
+    let all_splits: Vec<usize> = points
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(i, p)| p.compacted_before.then_some(i))
+        .collect();
+    let max_markers = max_cols / 3;
+    let split_start = all_splits.len().saturating_sub(max_markers);
+    let splits = &all_splits[split_start..];
+    let marker_count = splits.len();
+
+    if points.len() + marker_count <= max_cols && marker_count == all_splits.len() {
+        let mut out = points.to_vec();
+        out[0].compacted_before = false;
+        return out;
     }
-    let marker_count = points.iter().filter(|p| p.compacted_before).count();
-    let marker_budget = marker_count.min(max_cols / 3);
-    let bucket_count = max_cols
-        .saturating_sub(marker_budget)
+
+    let mut segments: Vec<&[crate::data::vitals::SparkPoint]> =
+        Vec::with_capacity(marker_count + 1);
+    let mut prev = 0;
+    for &split in splits {
+        segments.push(&points[prev..split]);
+        prev = split;
+    }
+    segments.push(&points[prev..]);
+
+    let bar_budget = max_cols
+        .saturating_sub(marker_count)
         .max(1)
         .min(points.len());
-    (0..bucket_count)
-        .map(|i| {
-            let start = i * points.len() / bucket_count;
-            let end = ((i + 1) * points.len() / bucket_count).max(start + 1);
-            let bucket = &points[start..end];
-            let last = bucket.last().expect("non-empty bucket");
-            crate::data::vitals::SparkPoint {
+    let mut allocations = vec![1usize; segments.len()];
+    let remaining = bar_budget.saturating_sub(segments.len());
+    let capacities: Vec<usize> = segments.iter().map(|s| s.len() - 1).collect();
+    let total_capacity: usize = capacities.iter().sum();
+    if remaining > 0 && total_capacity > 0 {
+        let mut remainders = Vec::with_capacity(segments.len());
+        let mut assigned = 0;
+        for (i, capacity) in capacities.iter().copied().enumerate() {
+            let scaled = remaining * capacity;
+            let extra = scaled / total_capacity;
+            allocations[i] += extra;
+            assigned += extra;
+            remainders.push((scaled % total_capacity, i));
+        }
+        remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        for &(_, i) in remainders.iter().take(remaining - assigned) {
+            allocations[i] += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(bar_budget);
+    for (segment_index, (segment, bucket_count)) in segments.iter().zip(allocations).enumerate() {
+        for bucket_index in 0..bucket_count {
+            let start = bucket_index * segment.len() / bucket_count;
+            let end = ((bucket_index + 1) * segment.len() / bucket_count).max(start + 1);
+            let bucket = &segment[start..end];
+            let last = bucket.last().expect("non-empty sparkline bucket");
+            let prompt: u128 = bucket.iter().map(|p| p.prompt_tokens as u128).sum();
+            let read: u128 = bucket.iter().map(|p| p.cache_read_tokens as u128).sum();
+            let cache_hit_ratio = if prompt > 0 {
+                (read as f64 / prompt as f64) as f32
+            } else {
+                let weighted_total: u128 =
+                    bucket.iter().map(|p| p.total_context_tokens as u128).sum();
+                if weighted_total > 0 {
+                    (bucket
+                        .iter()
+                        .map(|p| p.cache_hit_ratio as f64 * p.total_context_tokens as f64)
+                        .sum::<f64>()
+                        / weighted_total as f64) as f32
+                } else {
+                    0.0
+                }
+            };
+            out.push(crate::data::vitals::SparkPoint {
                 total_context_tokens: bucket
                     .iter()
                     .map(|p| p.total_context_tokens)
@@ -315,29 +374,12 @@ fn resample_sparkline(
                     .unwrap_or(last.total_context_tokens),
                 cache_read_tokens: bucket.iter().map(|p| p.cache_read_tokens).sum(),
                 prompt_tokens: bucket.iter().map(|p| p.prompt_tokens).sum(),
-                cache_hit_ratio: {
-                    let prompt: u128 = bucket.iter().map(|p| p.prompt_tokens as u128).sum();
-                    let read: u128 = bucket.iter().map(|p| p.cache_read_tokens as u128).sum();
-                    if prompt > 0 {
-                        (read as f64 / prompt as f64) as f32
-                    } else {
-                        let weighted_total: u128 =
-                            bucket.iter().map(|p| p.total_context_tokens as u128).sum();
-                        if weighted_total > 0 {
-                            (bucket
-                                .iter()
-                                .map(|p| p.cache_hit_ratio as f64 * p.total_context_tokens as f64)
-                                .sum::<f64>()
-                                / weighted_total as f64) as f32
-                        } else {
-                            0.0
-                        }
-                    }
-                },
-                compacted_before: i > 0 && bucket.iter().any(|p| p.compacted_before),
-            }
-        })
-        .collect()
+                cache_hit_ratio,
+                compacted_before: segment_index > 0 && bucket_index == 0,
+            });
+        }
+    }
+    out
 }
 
 /// Shared compact bar renderer. Labels are truncated with `…`, bars are
@@ -775,6 +817,88 @@ mod tests {
                 .any(|s| s.style.fg == Some(TERTIARY_INDIGO)),
             "cold bucket should stay visible after resampling"
         );
+    }
+
+    #[test]
+    fn sparkline_resampling_keeps_compaction_between_peak_and_reset() {
+        let mut points: Vec<SparkPoint> = (0..12)
+            .map(|i| SparkPoint {
+                total_context_tokens: 100_000 + i * 60_000,
+                cache_read_tokens: 90_000,
+                prompt_tokens: 100_000,
+                cache_hit_ratio: 0.9,
+                compacted_before: false,
+            })
+            .collect();
+        points.extend((0..10).map(|i| SparkPoint {
+            total_context_tokens: 10_000 + i * 2_000,
+            cache_read_tokens: 10_000,
+            prompt_tokens: 100_000,
+            cache_hit_ratio: 0.1,
+            compacted_before: i == 0,
+        }));
+
+        let out = resample_sparkline(&points, 8);
+        let mut glyphs = String::new();
+        for point in &out {
+            if point.compacted_before {
+                glyphs.push('│');
+            }
+            let max = out
+                .iter()
+                .map(|p| p.total_context_tokens)
+                .max()
+                .unwrap_or(0);
+            let level = ((point.total_context_tokens as f64 / max as f64) * 7.0).round() as usize;
+            glyphs.push(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'][level.min(7)]);
+        }
+        assert_eq!(glyphs.matches('│').count(), 1, "{glyphs}");
+        assert!(
+            glyphs.contains("█│"),
+            "peak must precede boundary: {glyphs}"
+        );
+        assert!(
+            glyphs.ends_with('▁'),
+            "post-compaction segment must be low: {glyphs}"
+        );
+        assert!(out.len() + out.iter().filter(|p| p.compacted_before).count() <= 8);
+    }
+
+    #[test]
+    fn sparkline_resampling_keeps_recent_markers_and_respects_column_budget() {
+        let points: Vec<SparkPoint> = (0..12)
+            .map(|i| SparkPoint {
+                total_context_tokens: (i as u64 + 1) * 10_000,
+                cache_read_tokens: 90_000,
+                prompt_tokens: 100_000,
+                cache_hit_ratio: 0.9,
+                compacted_before: matches!(i, 2 | 4 | 6 | 8 | 10),
+            })
+            .collect();
+        let out = resample_sparkline(&points, 9);
+        let marker_indices: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.compacted_before.then_some(i))
+            .collect();
+        assert_eq!(marker_indices.len(), 3);
+        assert!(marker_indices[0] > 0);
+        assert!(out.len() + marker_indices.len() <= 9);
+
+        let tight: Vec<SparkPoint> = (0..9)
+            .map(|i| SparkPoint {
+                total_context_tokens: (i as u64 + 1) * 10_000,
+                cache_read_tokens: 90_000,
+                prompt_tokens: 100_000,
+                cache_hit_ratio: 0.9,
+                compacted_before: i == 5,
+            })
+            .collect();
+        let tight_out = resample_sparkline(&tight, 9);
+        let tight_markers = tight_out.iter().filter(|p| p.compacted_before).count();
+        assert_eq!(tight_markers, 1);
+        assert!(tight_out.len() + tight_markers <= 9);
+        assert_eq!(tight_out.last().unwrap().total_context_tokens, 90_000);
     }
 
     #[test]

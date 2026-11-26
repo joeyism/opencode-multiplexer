@@ -167,6 +167,13 @@ fn marks_compactions_on_sparkline_and_scopes_context_culprits_after_tail_start()
         &assistant("build", "gpt-6-luna", 100, 10, 0, 900, 0),
         3000,
     );
+    add_msg(
+        &conn,
+        "m4",
+        "s1",
+        &assistant("build", "gpt-6-luna", 100, 10, 0, 900, 0),
+        4000,
+    );
     // Big pre-compaction read part on m1 (must be excluded from culprits).
     let pre_read = format!(
         r#"{{"type":"tool","tool":"read","state":{{"output":"{}"}}}}"#,
@@ -189,12 +196,17 @@ fn marks_compactions_on_sparkline_and_scopes_context_culprits_after_tail_start()
     );
     add_part(&conn, "p3", "s1", "m3", post_read, 3100);
 
-    let v = compute_vitals(&conn, "s1", &[], false, 4000).unwrap();
-    assert_eq!(v.sparkline.len(), 3);
+    let v = compute_vitals(&conn, "s1", &[], false, 5000).unwrap();
+    assert_eq!(v.sparkline.len(), 4);
     assert!(!v.sparkline[0].compacted_before);
+    assert!(!v.sparkline[1].compacted_before);
     assert!(
         v.sparkline[2].compacted_before,
         "first turn after tail_start must be marked"
+    );
+    assert!(
+        !v.sparkline[3].compacted_before,
+        "later turns must not repeat the compaction marker"
     );
     let read = v
         .context_culprits
@@ -206,6 +218,64 @@ fn marks_compactions_on_sparkline_and_scopes_context_culprits_after_tail_start()
         "got {}",
         read.value
     );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn excludes_compaction_summarizers_and_marks_tailless_compactions() {
+    let path = temp_db_path("compact-summarizer");
+    let conn = init_db(&path);
+    add_session(&conn, "s1", None);
+    add_msg(
+        &conn,
+        "m1",
+        "s1",
+        &assistant("build", "gpt-6-luna", 10_000, 1_000, 0, 889_000, 0),
+        1000,
+    );
+    add_msg(&conn, "u_c1", "s1", r#"{"role":"user"}"#, 2000);
+    add_part(
+        &conn,
+        "p_c1",
+        "s1",
+        "u_c1",
+        r#"{"type":"compaction","auto":true}"#.to_string(),
+        2001,
+    );
+    add_msg(
+        &conn,
+        "m_sum",
+        "s1",
+        &assistant("compaction", "gpt-6-luna", 350_000, 700, 0, 0, 0),
+        2100,
+    );
+    add_msg(
+        &conn,
+        "m2",
+        "s1",
+        &assistant("build", "gpt-6-luna", 30_000, 500, 0, 9_500, 0),
+        3000,
+    );
+    add_msg(
+        &conn,
+        "m3",
+        "s1",
+        &assistant("build", "gpt-6-luna", 5_000, 500, 0, 494_500, 0),
+        4000,
+    );
+
+    let v = compute_vitals(&conn, "s1", &[], false, 5000).unwrap();
+    assert_eq!(v.turn_count, 3);
+    assert_eq!(v.sparkline.len(), 3);
+    assert_eq!(
+        v.sparkline
+            .iter()
+            .map(|p| p.compacted_before)
+            .collect::<Vec<_>>(),
+        vec![false, true, false]
+    );
+    assert_eq!(v.latest_context_tokens, 500_000);
+    assert_eq!(v.uncached_input_tokens, 395_000);
     std::fs::remove_file(path).ok();
 }
 

@@ -877,6 +877,39 @@ fn subagent_uncompleted_message_with_newer_parent_user_message_is_idle() {
 }
 
 #[test]
+fn direct_child_status_respects_newer_parent_user_message() {
+    let db_path = temp_db_path("direct_abandoned_subagent");
+    let conn = init_db(&db_path);
+    conn.execute(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES ('proj_1', '/tmp/repo', 'repo', 1, 2)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('main', 'proj_1', NULL, 'Main', '/tmp/repo', '{}', 1, 5000, NULL)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_user', 'main', '{\"role\":\"user\"}', 5000)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO session (id, project_id, parent_id, title, directory, permission, time_created, time_updated, time_archived) VALUES ('sub', 'proj_1', 'main', 'Sub', '/tmp/repo/sub', '{}', 1000, 2000, NULL)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES ('msg_sub', 'sub', '{\"role\":\"user\"}', 2000)",
+        [],
+    ).unwrap();
+
+    let reader = DbReader::open(&db_path).unwrap();
+    assert_eq!(
+        reader.get_session_status("sub", None).unwrap(),
+        SessionStatus::Idle
+    );
+    fs::remove_file(db_path).ok();
+}
+
+#[test]
 fn pending_permission_older_than_process_start_is_stale() {
     let db_path = temp_db_path("stale_pending");
     let conn = init_db(&db_path);

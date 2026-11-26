@@ -470,7 +470,7 @@ fn rollup(
         if let Some(c) = msg.completed {
             last_completed = Some(last_completed.map_or(c, |l: i64| l.max(c)));
         }
-        if msg.total() > 0 {
+        if msg.agent != "compaction" && msg.total() > 0 {
             latest_context = msg.total();
             primary_assistants.push(msg);
         }
@@ -481,20 +481,27 @@ fn rollup(
         None
     };
 
-    // Latest compaction tail boundary on the primary session.
+    // Keep all compaction events for sparkline markers, and the latest
+    // available tail boundary for active-context attribution.
+    let mut compaction_keys: Vec<(i64, String)> = Vec::new();
     let mut tail_start: Option<(i64, String)> = None;
     for (key, msg) in primary_raw.messages.iter() {
         if let Some(parts) = primary_raw.parts_by_msg.get(&msg.id) {
+            let mut has_compaction = false;
             for p in parts {
-                if p.typ == "compaction"
-                    && let Some(tail) = p.tail_start_id.clone()
-                {
-                    let cand = (key.0, tail);
-                    tail_start = Some(match tail_start {
-                        None => cand,
-                        Some(cur) => cur.max(cand),
-                    });
+                if p.typ == "compaction" {
+                    has_compaction = true;
+                    if let Some(tail) = p.tail_start_id.clone() {
+                        let cand = (key.0, tail);
+                        tail_start = Some(match tail_start {
+                            None => cand,
+                            Some(cur) => cur.max(cand),
+                        });
+                    }
                 }
+            }
+            if has_compaction {
+                compaction_keys.push(key.clone());
             }
         }
     }
@@ -598,16 +605,22 @@ fn rollup(
     let conversation_budget = latest_context.saturating_sub(system_tokens);
     let sparkline: Vec<SparkPoint> = primary_assistants
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
             let denom = m.input + m.cache_read + m.cache_write;
             let ratio = if denom > 0 {
                 m.cache_read as f32 / denom as f32
             } else {
                 0.0
             };
-            let compacted_before = tail_start
-                .as_ref()
-                .is_some_and(|(t, id)| (m.time_created, m.id.clone()) >= (*t, id.clone()));
+            let compacted_before = i > 0 && {
+                let prev = primary_assistants[i - 1];
+                let prev_key = (prev.time_created, prev.id.as_str());
+                let cur_key = (m.time_created, m.id.as_str());
+                compaction_keys.iter().any(|(time, id)| {
+                    prev_key <= (*time, id.as_str()) && (*time, id.as_str()) < cur_key
+                })
+            };
             SparkPoint {
                 total_context_tokens: m.total(),
                 cache_read_tokens: m.cache_read,

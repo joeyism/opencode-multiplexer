@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::app::sessions::SessionStatus;
+use crate::data::discovery::ps::get_process_start_time_epoch_ms;
 use crate::data::{
     db::reader::DbReader,
     discovery::{
@@ -15,7 +16,8 @@ use crate::data::{
         ps::{scan_processes, scan_serve_processes},
     },
 };
-use crate::registry::{load_managed_sessions, load_serve_registry};
+use crate::ops::opencode::select_exact_serve_for_cwd;
+use crate::registry::{is_pid_alive, load_managed_sessions, load_serve_registry};
 use chrono::DateTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +151,9 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
     let mut sessions = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut offsets: HashMap<String, usize> = HashMap::new();
-    let managed_tui_pids: std::collections::HashSet<u32> = load_serve_registry()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|e| e.tui_pid)
-        .collect();
+    let serve_registry = load_serve_registry().unwrap_or_default();
+    let managed_tui_pids: std::collections::HashSet<u32> =
+        serve_registry.iter().filter_map(|e| e.tui_pid).collect();
 
     // TUI processes (explicit -s flag + heuristic guessing)
     for process in processes {
@@ -219,6 +219,9 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
         else {
             continue;
         };
+        let serve_start_time = select_exact_serve_for_cwd(&proj.worktree, &serve_registry)
+            .filter(|(_, pid)| is_pid_alive(*pid))
+            .and_then(|(_, pid)| get_process_start_time_epoch_ms(pid));
         if let Some(info) = hydrate_session(
             &reader,
             &managed_id,
@@ -227,7 +230,7 @@ pub fn poll_fast() -> anyhow::Result<PollSnapshot> {
             DiscoverySource::TuiExplicit,
             Some(proj.worktree.clone()),
             None,
-            None,
+            serve_start_time,
         )
         .ok()
         .flatten()

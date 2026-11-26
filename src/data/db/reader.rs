@@ -369,12 +369,75 @@ impl DbReader {
         session_id: &str,
         process_start_time: Option<i64>,
     ) -> anyhow::Result<SessionStatus> {
+        if self.is_superseded_by_ancestor_user_message(session_id)? {
+            return Ok(SessionStatus::Idle);
+        }
         self.get_session_status_recursive(
             session_id,
             process_start_time,
             None,
             &mut std::collections::HashSet::new(),
         )
+    }
+
+    /// Returns the status of this session alone, applying ancestor turn
+    /// cutoffs but not rolling up status from its child sessions.
+    pub fn get_session_own_status(
+        &self,
+        session_id: &str,
+        process_start_time: Option<i64>,
+    ) -> anyhow::Result<SessionStatus> {
+        if self.is_superseded_by_ancestor_user_message(session_id)? {
+            return Ok(SessionStatus::Idle);
+        }
+        self.get_local_session_status(session_id, process_start_time)
+    }
+
+    fn is_superseded_by_ancestor_user_message(&self, session_id: &str) -> anyhow::Result<bool> {
+        let mut child_id = session_id.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(child_id.clone());
+
+        loop {
+            let parent: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM session WHERE id = ?1",
+                    [&child_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let Some(parent_id) = parent else {
+                return Ok(false);
+            };
+            if !visited.insert(parent_id.clone()) {
+                return Ok(false);
+            }
+
+            let latest_parent_user_message: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT time_created FROM message WHERE session_id = ?1 AND json_extract(data, '$.role') = 'user' ORDER BY time_created DESC LIMIT 1",
+                    [&parent_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(cutoff) = latest_parent_user_message {
+                let child_updated: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT time_updated FROM session WHERE id = ?1",
+                        [&child_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if child_updated.is_some_and(|updated| updated < cutoff) {
+                    return Ok(true);
+                }
+            }
+            child_id = parent_id;
+        }
     }
 
     fn get_session_status_recursive(
